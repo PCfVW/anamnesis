@@ -2,7 +2,7 @@
 name = "anamnesis"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ dequantization and NPZ parsing for Rust"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/PCfVW/anamnesis"
