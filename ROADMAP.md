@@ -1,0 +1,312 @@
+# Roadmap: anamnesis — Tensor Format Transformation for Rust
+
+> *Parse any format, recover any precision.*
+
+**Date:** March 20, 2026
+**Status:** Pre-implementation. Brief and flagship example defined. Architecture designed: parsing as the foundational layer; remember/lethe/inspect built on top.
+**Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
+
+---
+
+## Table of Contents
+
+- [1. Landscape](#1-landscape)
+  - [1.1 The Problem](#11-the-problem)
+  - [1.2 Existing Solutions](#12-existing-solutions)
+- [2. Architecture](#2-architecture)
+  - [2.1 Parsing as Foundation](#21-parsing-as-foundation)
+  - [2.2 Module Structure](#22-module-structure)
+  - [2.3 Ecosystem Fit](#23-ecosystem-fit)
+- [3. Phased Development Plan](#3-phased-development-plan)
+  - [3.0 Git Workflow](#30-git-workflow)
+  - [Phase 1: FP8 Dequantization](#phase-1-fp8-dequantization)
+  - [Phase 2: Additional Quantization Schemes](#phase-2-additional-quantization-schemes)
+  - [Phase 3: NPZ/NPY Parsing](#phase-3-npznpy-parsing)
+  - [Phase 4: Quantization (Lethe)](#phase-4-quantization-lethe)
+- [4. Key Design Decisions](#4-key-design-decisions)
+- [5. Relationship to Other Projects](#5-relationship-to-other-projects)
+
+---
+
+## 1. Landscape
+
+### 1.1 The Problem
+
+Quantized models are the norm. Mistral ships Ministral 3B as FP8 safetensors. Community quantizers (TheBloke, NeuralMagic, etc.) distribute Llama and other models in GPTQ and AWQ. SAE weights (Gemma Scope) ship as NPZ archives. None of these load in any Rust ML framework:
+
+```rust
+let vb = VarBuilder::from_mmaped_safetensors(&[path], DType::BF16, &device)?;
+// → Error: unsupported safetensor dtype F8_E4M3
+```
+
+This blocks candle, candle-mi, burn, and tch. The entire Rust ML ecosystem stops at the file format boundary.
+
+### 1.2 Existing Solutions
+
+*Surveyed March 2026. No framework-agnostic tensor format transformation library exists in any language — not in Rust, not in Python, not in C++. Dequantization is universally implemented ad-hoc inside inference engines.*
+
+#### Rust ecosystem
+
+| Solution | What it does | Why it's not enough |
+|---|---|---|
+| [`float8`](https://crates.io/crates/float8) v0.7.0 | FP8 primitive types (E4M3, E5M2) with `to_f32()` / `from_f32()` conversions | Type-level only. No tensors, no safetensors, no scale factors, no block-wise dequant. A useful **building block** — anamnesis should depend on it for FP8 ↔ f32 element conversion. |
+| [candle](https://github.com/huggingface/candle) v0.9.2+ | Added `F8E4M3` DType. [DeepSeek V3 PR #2745](https://github.com/huggingface/candle/pull/2745) implements block-wise FP8 dequant with `scale_inv` | Dequant logic is **model-specific** (DeepSeek V3 only), embedded in `candle-transformers`. Not a reusable library. No E5M2. Still fails on generic FP8 safetensors: `unsupported safetensor dtype F8_E4M3`. |
+| [mistralrs-quant](https://lib.rs/crates/mistralrs-quant) | GPTQ, AWQ, HQQ, BnB, FP8 via `QuantMethod` trait with `dequantize_w()` | **CUDA-only** for GPTQ/AWQ. Tightly coupled to mistral.rs inference (742K SLoC, depends on candle-core, tokio, rayon). Not reusable as a standalone library. |
+| [pmetal-gguf](https://docs.rs/pmetal-gguf) | Standalone GGUF dequantization with SIMD (`dequant::dequantize()`) | **GGUF-specific.** Does not handle safetensors FP8, GPTQ, AWQ, or NPZ. |
+| [`npyz`](https://crates.io/crates/npyz) v0.8.4 | Mature NPY/NPZ parser (4.6M downloads). f16 support via `half` feature. Full read/write. | **No bf16.** But robust enough that anamnesis should **depend on it** for NPZ parsing rather than reimplement, adding a thin bf16 interpretation layer. See Phase 3. |
+| [`ndarray-npy`](https://crates.io/crates/ndarray-npy) v0.10.0 | Most popular NPY/NPZ crate (7.2M downloads). Actively maintained. | **No f16/bf16.** Tightly coupled to ndarray. Less suitable than `npyz` for framework-agnostic use. |
+| [safetensors](https://crates.io/crates/safetensors) | Reads/writes safetensors files | No quantization awareness. Pure format I/O. |
+| [burn](https://github.com/tracel-ai/burn) v0.14.0+ | INT8 quantization (beta) | No FP8, no GPTQ, no AWQ. Own internal format only. |
+| tch-rs | Defines FP8 variants (`Float8e4m3fn`, `Float8e5m2`) | Wraps PyTorch C++ API. Requires full libtorch installation. No Rust-native dequant. |
+| candle-mi's NPZ parser | Loads Gemma Scope SAE weights from `.npz` | Tightly coupled to candle. Not reusable outside candle-mi. |
+
+#### Python ecosystem
+
+| Solution | What it does | Why it's not enough |
+|---|---|---|
+| [compressed-tensors](https://github.com/vllm-project/compressed-tensors) (vLLM) | Safetensors extension for sparse/quantized storage. Closest conceptual competitor to anamnesis. | Python-only, vLLM-coupled, decompression-to-bf16 still immature ([users requesting basic examples](https://huggingface.co/moonshotai/Kimi-K2-Thinking/discussions/2) as of late 2025). |
+| [optimum-quanto](https://github.com/huggingface/optimum-quanto) (HuggingFace) | In-memory quantize/dequantize on PyTorch tensors | Being merged into `optimum`. In-memory only — no file-to-file conversion. PyTorch-coupled. |
+| [TorchAO](https://github.com/pytorch/ao) | INT4, INT8, FP8 quantization within PyTorch | PyTorch tensors only, not a file format tool. |
+| transformers `dequantize=True` | Loads fine-grained FP8 with dequantization during model load | Embedded in model loading pipeline. Not a standalone operation. |
+| AutoGPTQ → [GPTQModel](https://pypi.org/project/GPTQModel/) | GPTQ quantization/dequantization | Dequant happens in fused CUDA kernels during inference. No standalone API. AutoGPTQ archived April 2025. |
+| AutoAWQ, bitsandbytes | AWQ and NF4/INT8 quantization | Same pattern: dequant is implicit during inference, not exposed as a file conversion. |
+| [llm-compressor](https://github.com/vllm-project/llm-compressor) (vLLM) | "Model-free PTQ" on safetensors (FP8) | **Quantization direction only.** No dequantization. |
+
+#### C/C++ ecosystem
+
+| Solution | What it does | Why it's not enough |
+|---|---|---|
+| llama.cpp | Converts safetensors → GGUF (Python scripts); dequantizes GGUF during inference (C++) | GGUF-specific. Not a library. Conversion scripts are Python. |
+| NVIDIA TensorRT | `IQuantizeLayer` / `IDequantizeLayer` in graph IR | Operates within TensorRT's graph representation, not on raw files. NVIDIA-coupled. |
+| NVIDIA TransformerEngine | FP8 compute library (matmul kernels) | Compute library, not a format conversion tool. |
+
+#### The gap
+
+No tool in any language provides **file → transform → file** as a first-class, framework-agnostic operation for quantized tensor formats. Dequantization is always buried inside inference engines or model loading pipelines. anamnesis is the first library designed for this purpose.
+
+---
+
+## 2. Architecture
+
+### 2.1 Parsing as Foundation
+
+Every operation in anamnesis begins with parsing. You cannot remember what you have not first parsed. You cannot quantize what you have not first parsed. You cannot inspect what you have not first parsed.
+
+Parsing is the act of making contact with the weights: decoding their structure, validating their format, understanding what is present and what Lethe took. Sometimes parsing alone is enough (NPZ — nothing was forgotten). Other times, parsing reveals that precision recovery is needed (FP8 — Lethe took something), and remembering follows.
+
+### 2.2 Module Structure
+
+```
+anamnesis (library crate)
+│
+├── parse/              ← decode + validate any tensor format
+│   ├── safetensors        safetensors (including quantized metadata)
+│   ├── npz                NPZ/NPY archives (feature-gated)
+│   └── (future)           GGUF, etc.
+│
+├── remember/           ← built on parse: precision recovery (dequantize)
+│   ├── fp8                fine-grained + per-tensor FP8 (E4M3, E5M2)
+│   ├── gptq               GPTQ dequantization
+│   ├── awq                AWQ dequantization
+│   └── bnb                BitsAndBytes (NF4, INT8) dequantization
+│
+├── lethe/              ← built on parse: precision reduction (quantize)
+│
+├── inspect             ← built on parse: report without transforming
+│
+└── bin/
+    └── main.rs         ← CLI binary (feature-gated behind "cli")
+                           installed as both `anamnesis` and `amn`
+                           subcommands: parse, inspect/info, remember/dequantize, forget/quantize
+```
+
+### 2.3 Ecosystem Fit
+
+```
+safetensors / npz       ← file formats
+    ↓
+anamnesis (library)     ← parse, remember, lethe
+anamnesis / amn (CLI)   ← amn parse, amn inspect, amn remember, amn forget
+    ↓
+hf-fetch-model          ← download + transform pipeline
+                           (hf-fm --dequantize bf16, download_and_parse_npz)
+candle / candle-mi      ← load + run + interpret
+burn / tch / ...        ← any Rust ML consumer
+```
+
+hf-fetch-model depends on anamnesis for two things:
+1. `--dequantize bf16` calls `anamnesis::parse()` + `.remember()` after download.
+2. `download_and_parse_npz()` calls `download()` + `anamnesis::parse_npz()`.
+
+---
+
+## 3. Phased Development Plan
+
+### 3.0 Git Workflow
+
+Single `main` branch. Each task ends with a commit. Phases end with a push and a version tag. Same workflow as candle-mi and hf-fetch-model.
+
+Commit style: imperative mood, lowercase, no trailing period. Examples:
+- `add safetensors header parsing`
+- `implement fine-grained FP8 dequantization`
+- `validate FP8 dequantization against EXAONE-4.0-1.2B`
+
+### Phase 1: FP8 Dequantization
+
+**Goal:** The flagship use case — parse an FP8 safetensors file, dequantize to BF16, write a standard safetensors file loadable by any Rust ML framework. Proves the parse → remember architecture end-to-end.
+
+- [ ] Scaffold crate:
+  - `git init` + GitHub repo creation + remote setup
+  - `cargo init --lib`
+  - `Cargo.toml` with metadata (name, version `0.1.0`, description, license MIT OR Apache-2.0, keywords, categories), feature gates (`cli = ["dep:clap"]`, `npz = ["dep:npyz"]`), two `[[bin]]` targets (`anamnesis` and `amn`, both pointing to `src/bin/main.rs`, `required-features = ["cli"]`) following the hf-fetch-model pattern
+  - `src/lib.rs` with `#![forbid(unsafe_code)]`, `#![deny(warnings)]`
+  - `CLAUDE.md` — "Before writing or modifying any Rust code, read and follow CONVENTIONS.md." (same as hf-fetch-model)
+  - `LICENSE-MIT` + `LICENSE-APACHE` — dual license files
+  - `.gitignore` — standard Rust (`/target`, etc.)
+  - `.github/workflows/ci.yml` + `.github/workflows/publish.yml` — reused from hf-fetch-model's pattern with `actions/checkout@v5`: format check, clippy (`--all-targets` + `--all-features`), tests, doc check on publish, tag-triggered `cargo publish`
+  — **commit**
+- [ ] Safetensors parsing foundation (`src/parse/safetensors.rs`) — read header JSON, extract tensor names, shapes, dtypes, byte offsets. Identify quantized tensors (FP8) vs passthrough (BF16/F32 norms, embeddings). Detect fine-grained FP8 metadata (scale factor tensors, block structure). This is the "make contact" layer — **commit**
+- [ ] Inspect (`src/inspect.rs`) — built on parse. Report format, tensor count, quantized vs passthrough breakdown, size estimate (current and dequantized). Matches the flagship CLI output in `amn-flagship-v2.md` — **commit**
+- [ ] Fine-grained FP8 dequantization (`src/remember/fp8.rs`) — E4M3 with 128×128 block scale factors. Scalar implementation written for auto-vectorization: contiguous `&[u8]` → `&mut [u16]` slices, no branches in the hot path (bitwise select for NaN/subnormal), `chunks_exact(128)` matching block size, scale factor hoisted before inner loop. Verify with `cargo-show-asm` that the compiler emits SIMD instructions; annotate with `// VECTORIZED:`. Built on the parsed representation from `parse/safetensors` — **commit**
+- [ ] Per-tensor FP8 dequantization — single scale factor per tensor (simpler case). Same module, same SIMD-friendly loop structure, different scale broadcast — **commit**
+- [ ] Parse-first public API (`src/lib.rs`) — `parse(path)` returns a `ParsedModel` struct holding header metadata + byte data. `ParsedModel::inspect()` returns format info. `ParsedModel::remember(output_path, TargetDtype)` dequantizes and writes a standard safetensors file. No file is re-read after the initial parse. The Rust API in `amn-flagship-v2.md` should work — **commit**
+- [ ] CLI binary (`src/bin/main.rs`) — thin `clap` wrapper over the library API. Subcommands: `parse`, `inspect` (alias `info`), `remember` (alias `dequantize`). Each subcommand calls `anamnesis::parse()` then the appropriate method. Progress output via `indicatif` (optional, behind `indicatif` feature). Same binary serves both `anamnesis` and `amn` names — **commit**
+- [ ] Download FP8 test models via `hf-fetch-model`. Three models covering both FP8 code paths and two new architectures for candle-mi auto-config:
+
+  | Model | Size | FP8 type | Architecture | candle-mi status |
+  |---|---|---|---|---|
+  | `LGAI-EXAONE/EXAONE-4.0-1.2B-FP8` | 1.22 GB | **Fine-grained** (128×128 block scales) | `exaone4` | **New** — sliding window + full attention pattern, extends auto-config |
+  | `Qwen/Qwen3-1.7B-FP8` | 1.89 GB | **Fine-grained** (128×128 block scales) | `qwen3` | **New** — adds QK LayerNorm over `qwen2`, extends auto-config |
+  | `mistralai/Ministral-3-3B-Instruct-2512` | 4.35 GB | **Per-tensor** (single scale per tensor) | `mistral3` (multimodal) | Text decoder only — validates per-tensor code path |
+
+  All three fit on the 5060 Ti 16 GB after dequantization to BF16 (1.2B → ~2.4 GB, 1.7B → ~3.4 GB, 3.4B → ~6.8 GB). Total download: ~7.5 GB — **commit** (add test model references to `tests/`)
+
+- [ ] Validation against FP8 test models — dequantize each model, load in candle, confirm forward pass produces coherent logits. Compare a sample of dequantized tensor values against Python reference (`safetensors` + `torch.float8_e4m3fn` → `torch.bfloat16`) to verify bit-exact or within-tolerance output. This is the acceptance test — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.1.0 — FP8 dequantization works. — **PUSH + tag `v0.1.0`**
+
+**Dependencies:** `safetensors`, `half`, `float8` (FP8 ↔ f32 element conversion). CLI: `clap` 4 with `derive` (behind `cli` feature), `indicatif` (behind `indicatif` feature, optional progress bars).
+
+**Note on cached test assets:** The local HuggingFace cache (`~/.cache/huggingface/hub/`) contains 21 models, none with FP8/GPTQ/AWQ quantization. The one asset relevant to anamnesis is **google/gemma-scope-2b-pt-res** which contains `params.npz` (302 MB, 5 F32 arrays: `W_dec`, `W_enc`, `b_dec`, `b_enc`, `threshold`) — this will be used for Phase 3 NPZ validation.
+
+**Note on candle-mi auto-config:** Validating EXAONE-4.0 and Qwen3 after dequantization requires extending candle-mi's auto-config with `exaone4` and `qwen3` `model_type` support. These are both text-only decoder transformers close to existing supported families:
+- `exaone4` — LLaMA-like with alternating sliding window / full attention layers ("LLLG" pattern). Similar to Gemma 2's alternating window scheme.
+- `qwen3` — extends `qwen2` with QK LayerNorm (additional `q_norm` / `k_norm` tensors per layer) and thinking mode support. The core architecture is otherwise identical to `qwen2`.
+
+### Phase 2: Additional Quantization Schemes
+
+**Goal:** Extend `remember/` to cover the major quantization formats. Each scheme adds a new submodule under `remember/` and extends the parsing layer to detect its metadata.
+
+- [ ] GPTQ dequantization (`src/remember/gptq.rs`) — INT4/INT8 with group-wise scale + zero-point. Parse GPTQ metadata from safetensors, reconstruct full-precision weights — **commit**
+- [ ] AWQ dequantization (`src/remember/awq.rs`) — activation-aware quantization with per-channel scales — **commit**
+- [ ] BitsAndBytes dequantization (`src/remember/bnb.rs`) — NF4, INT8 with absmax/zeropoint — **commit**
+- [ ] Feature gates — each scheme behind its own feature flag (`gptq`, `awq`, `bnb`). Default features: `fp8` only — **commit**
+- [ ] Validation against real models for each scheme — **commits as needed** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.2.0 — all major quantization schemes supported. — **PUSH + tag `v0.2.0`**
+
+**New dependencies:** None expected (pure bit manipulation), but feature-gated if any arise.
+
+### Phase 3: NPZ/NPY Parsing
+
+**Goal:** Extend the `parse/` layer to NumPy archives. This is the case where parsing alone suffices — nothing was forgotten, the weights just need extracting from a foreign container. Migrates candle-mi's tightly-coupled NPZ parser into anamnesis as a reusable, framework-agnostic module.
+
+**Build on `npyz`, don't reimplement.** The `npyz` crate (v0.8.4, 4.6M downloads) is a mature, standalone NPY/NPZ parser with f16 support via the `half` feature. It handles header parsing, endianness, Fortran vs C order, and ZIP extraction — reimplementing this would be significant work for no benefit. The one gap is **bf16** (bfloat16): `npyz` has no bf16 support. anamnesis adds a thin interpretation layer on top: read as raw `u16` bytes via `npyz`, reinterpret as `half::bf16`.
+
+- [ ] NPZ integration module (`src/parse/npz.rs`) — wraps `npyz` to provide an anamnesis-native API. `parse_npz(path) -> HashMap<String, NpzTensor>`. Delegates format parsing to `npyz`, adds bf16 interpretation layer (read as u16, cast via `half::bf16`) — **commit**
+- [ ] `NpzTensor` type — framework-agnostic struct bridging `npyz`'s output to anamnesis consumers: `name: String`, `shape: Vec<usize>`, `dtype: NpzDtype`, `data: Vec<u8>`. The dtype enum includes `BF16` which `npyz` cannot represent natively — **commit**
+- [ ] Feature-gated behind `npz` feature (adds `npyz` with its `npz` feature, which pulls `zip` transitively) — **commit**
+- [ ] Validation against Gemma Scope SAE weights — already cached locally at `~/.cache/huggingface/hub/models--google--gemma-scope-2b-pt-res/` (`params.npz`, 302 MB, 5 F32 arrays: `W_dec` [16384×2304], `W_enc` [2304×16384], `b_dec` [2304], `b_enc` [16384], `threshold` [16384]). Parse, verify shapes and values match Python reference — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.3.0 — NPZ parsing works. candle-mi can migrate its NPZ dependency from internal to `anamnesis`. — **PUSH + tag `v0.3.0`**
+
+**New dependencies:** `npyz` with its `npz` feature enabled (pulls in `zip` transitively). Feature-gated behind anamnesis's `npz` feature.
+
+### Phase 4: Quantization (Lethe)
+
+**Goal:** The opposite direction — take full-precision weights and quantize them. Built on parse (read the source) + lethe (compress). Lower priority; the ecosystem's immediate pain is loading quantized models, not creating them.
+
+- [ ] FP8 quantization (`src/lethe/fp8.rs`) — BF16/F32 → FP8 E4M3 with fine-grained block scale factors — **commit**
+- [ ] INT8/INT4 quantization — per-channel and group-wise schemes — **commit**
+- [ ] `ParsedModel::forget()` public API + `forget` CLI subcommand (alias `quantize`) — **commit**
+- [ ] Round-trip validation — quantize then dequantize, measure lethe distance — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.4.0 — full quantize + dequantize cycle. — **PUSH + tag `v0.4.0`**
+
+---
+
+## 4. Key Design Decisions
+
+### Framework-agnostic output
+
+anamnesis outputs standard safetensors files (for dequantization) and raw byte arrays with shape/dtype metadata (for NPZ). It never depends on candle, burn, or tch. Any framework can consume its output.
+
+### Parse-first architecture
+
+Every code path begins with parsing. The `parse/` module is the foundation; `remember/`, `lethe/`, and `inspect` are built on top. This is not incidental — it reflects the design principle that you cannot remember what you have not first parsed.
+
+### Feature gates per format
+
+Each quantization scheme and container format is behind its own feature flag. Users pay only for what they need. Default: `fp8` only.
+
+### No GPU dependency
+
+All operations are pure CPU. FP8 dequantization is bit manipulation, not matrix multiplication. This keeps the crate lightweight and universally deployable.
+
+### SIMD strategy
+
+Conversion loops process billions of elements and are embarrassingly parallel
+(each element is independent). The strategy is layered:
+
+1. **Phase 1: SIMD-friendly scalar code.** Write loops that follow the
+   CONVENTIONS.md SIMD-friendly rules (contiguous slices, no branches,
+   `chunks_exact`, hoisted invariants, separate input/output buffers).
+   Verify auto-vectorization with `cargo-show-asm`. This requires **no
+   `unsafe`**, no nightly, no extra dependencies, and builds on stable Rust.
+   The compiler typically emits AVX2 on x86-64 (Intel + AMD) and NEON on ARM.
+
+2. **If benchmarks demand more: hand-written intrinsics** behind a `simd`
+   feature gate. `#[target_feature(enable = "avx2")]` + runtime
+   `is_x86_feature_detected!` dispatch, with the scalar path as fallback.
+   One dedicated module (`src/remember/simd.rs`), tested against the scalar
+   reference. Requires `unsafe` (see CONVENTIONS.md `// SAFETY:` rules).
+
+3. **Not pursued: `std::simd` (portable SIMD).** Requires nightly Rust, which
+   would virally infect downstream crates (candle-mi, hf-fetch-model). If
+   `std::simd` stabilizes, it becomes the preferred path and replaces both
+   the scalar and intrinsic implementations.
+
+Coverage: AVX2 covers all Intel + AMD CPUs since ~2015. NEON covers Apple
+Silicon and ARM servers. The scalar fallback covers everything else.
+
+### Error type
+
+A single `AnamnesisError` enum with variants per failure category:
+- `Parse { reason }` — format decoding failures
+- `Unsupported { format, detail }` — recognized but unimplemented format
+- `Io(std::io::Error)` — file system errors
+- `NpzParse { reason }` — NPZ-specific parse failures (feature-gated)
+
+---
+
+## 5. Relationship to Other Projects
+
+### hf-fetch-model
+
+Download crate. Depends on anamnesis for `--dequantize` and `download_and_parse_npz()`. anamnesis provides the format intelligence; hf-fetch-model provides the network I/O. See hf-fetch-model v0.8.0 roadmap.
+
+### candle-mi
+
+MI framework. anamnesis intersects with candle-mi in two ways:
+
+1. **NPZ migration.** candle-mi currently contains a tightly-coupled NPZ parser for Gemma Scope SAE weights. Phase 3 of anamnesis replaces it. candle-mi task: "Migrate `.npz` parsing logic from `candle-mi` to `anamnesis`."
+
+2. **Auto-config extensions.** The FP8 test models chosen for anamnesis Phase 1 validation introduce two new architectures that candle-mi should support:
+   - **`exaone4`** (`LGAI-EXAONE/EXAONE-4.0-1.2B-FP8`) — LLaMA-like with alternating sliding window / full attention ("LLLG" pattern). Close to Gemma 2's alternating scheme. Requires a new `parse_exaone4()` in `config.rs`.
+   - **`qwen3`** (`Qwen/Qwen3-1.7B-FP8`) — extends `qwen2` with QK LayerNorm (`q_norm` / `k_norm` per layer). Requires a new `parse_qwen3()` in `config.rs` and handling the extra norm tensors in the forward pass.
+
+   These extensions benefit candle-mi independently of anamnesis — both model families are mainstream and worth supporting regardless.
+
+### candle
+
+HuggingFace's Rust ML framework. anamnesis outputs standard safetensors that candle can load directly. No dependency in either direction — anamnesis reads the safetensors format, not candle's tensor types.

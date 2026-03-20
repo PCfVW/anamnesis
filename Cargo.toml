@@ -1,0 +1,76 @@
+[package]
+name = "anamnesis"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ dequantization and NPZ parsing for Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PCfVW/anamnesis"
+homepage = "https://github.com/PCfVW/anamnesis"
+documentation = "https://docs.rs/anamnesis"
+keywords = ["safetensors", "dequantization", "fp8", "quantization", "machine-learning"]
+categories = ["science", "parser-implementations"]
+
+[features]
+default = []
+cli = ["dep:clap"]
+npz = ["dep:npyz"]
+indicatif = ["dep:indicatif"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+float8 = "0.7"
+half = "2"
+indicatif = { version = "0.17", optional = true }
+npyz = { version = "0.8", features = ["npz"], optional = true }
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[[bin]]
+name = "anamnesis"
+path = "src/bin/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "amn"
+path = "src/bin/main.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+elided_lifetimes_in_paths = "deny"
+
+[lints.clippy]
+# Rule 3: No panics
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+# Rule 7: Exhaustive matching
+wildcard_enum_match_arm = "deny"
+
+# Rule 2: Explicit conversions
+as_conversions = "warn"
+
+# Rule 9: Prefer iterators
+explicit_iter_loop = "warn"
+manual_filter_map = "warn"
+manual_find_map = "warn"
+needless_range_loop = "warn"
+
+# Rule 17: #[must_use]
+must_use_candidate = "warn"
+
+# Additional strictness
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
+# Allow noisy pedantic lints
+module_name_repetitions = "allow"
+too_many_lines = "allow"
