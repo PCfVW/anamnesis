@@ -281,9 +281,7 @@ impl SafetensorsHeader {
 
     /// Returns an iterator over scale factor tensors.
     pub fn scale_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
-        self.tensors
-            .iter()
-            .filter(|e| e.role == TensorRole::Scale)
+        self.tensors.iter().filter(|e| e.role == TensorRole::Scale)
     }
 
     /// Returns an iterator over passthrough tensors.
@@ -464,8 +462,10 @@ mod tests {
 
     #[test]
     fn classify_scale_inv() {
-        let role =
-            classify_tensor("model.layers.0.self_attn.q_proj.weight_scale_inv", Dtype::F32);
+        let role = classify_tensor(
+            "model.layers.0.self_attn.q_proj.weight_scale_inv",
+            Dtype::F32,
+        );
         assert_eq!(role, TensorRole::Scale);
     }
 
@@ -581,17 +581,12 @@ mod tests {
         let data: Vec<u8> = vec![0; 4]; // 2 elements × 2 bytes
         let tensors = vec![(
             "test_tensor",
-            safetensors::tensor::TensorView::new(
-                safetensors::Dtype::BF16,
-                vec![2],
-                &data,
-            )
-            .unwrap_or_else(|e| panic!("failed to create TensorView: {e}")),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2], &data)
+                .unwrap_or_else(|e| panic!("failed to create TensorView: {e}")),
         )];
         let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
-        let header =
-            parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("parse: {e}"));
+        let header = parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("parse: {e}"));
 
         assert_eq!(header.tensors.len(), 1);
         assert_eq!(header.tensors[0].name, "test_tensor"); // INDEX: single element, bounds checked by len() assert above
@@ -630,8 +625,7 @@ mod tests {
         ];
         let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
-        let header =
-            parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("parse: {e}"));
+        let header = parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("parse: {e}"));
 
         assert_eq!(header.tensors.len(), 2);
         assert_eq!(header.quantized_count(), 1);
@@ -640,6 +634,9 @@ mod tests {
         assert_eq!(header.scheme, QuantScheme::FineGrainedFp8);
 
         let scale = header.find_scale_for("layer.weight");
-        assert_eq!(scale.map(|e| e.name.as_str()), Some("layer.weight_scale_inv"));
+        assert_eq!(
+            scale.map(|e| e.name.as_str()),
+            Some("layer.weight_scale_inv")
+        );
     }
 }
