@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Errors produced by anamnesis operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
