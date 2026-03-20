@@ -155,7 +155,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Goal:** The flagship use case — parse an FP8 safetensors file, dequantize to BF16, write a standard safetensors file loadable by any Rust ML framework. Proves the parse → remember architecture end-to-end.
 
-- [ ] Scaffold crate:
+- [x] Scaffold crate:
   - `git init` + GitHub repo creation + remote setup
   - `cargo init --lib`
   - `Cargo.toml` with metadata (name, version `0.1.0`, description, license MIT OR Apache-2.0, keywords, categories), feature gates (`cli = ["dep:clap"]`, `npz = ["dep:npyz"]`), two `[[bin]]` targets (`anamnesis` and `amn`, both pointing to `src/bin/main.rs`, `required-features = ["cli"]`) following the hf-fetch-model pattern
