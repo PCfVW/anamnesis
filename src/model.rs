@@ -178,13 +178,28 @@ impl ParsedModel {
                 ),
             }),
             2 => {
-                let rows = shape.first().copied().unwrap_or(0);
-                let cols = shape.get(1).copied().unwrap_or(0);
-                Ok((rows, cols))
+                // shape.len() == 2 guaranteed by match arm
+                let rows = shape.first().copied();
+                let cols = shape.get(1).copied();
+                match (rows, cols) {
+                    (Some(r), Some(c)) => Ok((r, c)),
+                    _ => Err(AnamnesisError::Parse {
+                        reason: "2D shape missing elements".into(),
+                    }),
+                }
             }
             _ => {
-                let cols = shape.last().copied().unwrap_or(0);
-                let rows: usize = shape.get(..shape.len() - 1).unwrap_or(&[]).iter().product();
+                // shape.len() >= 3 guaranteed by match arms above
+                let cols = shape.last().copied().ok_or_else(|| AnamnesisError::Parse {
+                    reason: "shape has no last dimension".into(),
+                })?;
+                let rows: usize = shape
+                    .get(..shape.len() - 1)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: "shape slice out of bounds".into(),
+                    })?
+                    .iter()
+                    .product();
                 Ok((rows, cols))
             }
         }

@@ -241,9 +241,9 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
                 .find(|s| s.name == expected && s.role == TensorRole::Scale)
             {
                 // 2D scale with both dims > 1 → fine-grained block scales
+                // shape.len() >= 2 guarantees .last() is Some
                 if scale.shape.len() >= 2 {
-                    let last = scale.shape.last().copied().unwrap_or(0);
-                    if last > 1 {
+                    if scale.shape.last().copied() > Some(1) {
                         return QuantScheme::FineGrainedFp8;
                     }
                     // [N, 1] → per-channel (one scale per row)
