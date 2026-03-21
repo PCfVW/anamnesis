@@ -75,6 +75,32 @@ impl Dtype {
             Self::F8E4M3 | Self::F8E5M2 | Self::BF16 | Self::F16 | Self::F32 | Self::F64
         )
     }
+
+    /// Converts this dtype to the corresponding `safetensors::Dtype`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if the dtype has no
+    /// corresponding `safetensors::Dtype` variant.
+    pub fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
+        match self {
+            Self::F8E4M3 => Ok(safetensors::Dtype::F8_E4M3),
+            Self::F8E5M2 => Ok(safetensors::Dtype::F8_E5M2),
+            Self::BF16 => Ok(safetensors::Dtype::BF16),
+            Self::F16 => Ok(safetensors::Dtype::F16),
+            Self::F32 => Ok(safetensors::Dtype::F32),
+            Self::F64 => Ok(safetensors::Dtype::F64),
+            Self::Bool => Ok(safetensors::Dtype::BOOL),
+            Self::U8 => Ok(safetensors::Dtype::U8),
+            Self::I8 => Ok(safetensors::Dtype::I8),
+            Self::U16 => Ok(safetensors::Dtype::U16),
+            Self::I16 => Ok(safetensors::Dtype::I16),
+            Self::U32 => Ok(safetensors::Dtype::U32),
+            Self::I32 => Ok(safetensors::Dtype::I32),
+            Self::U64 => Ok(safetensors::Dtype::U64),
+            Self::I64 => Ok(safetensors::Dtype::I64),
+        }
+    }
 }
 
 impl fmt::Display for Dtype {

@@ -29,5 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Per-tensor FP8 dequantization** (`src/remember/fp8.rs`) — single scale factor
   per tensor; `dequantize_per_tensor_fp8_to_bf16()` public API; reuses the same
   branchless E4M3 → BF16 pipeline
+- **Parse-first public API** (`src/model.rs`) — `parse(path)` reads a `.safetensors`
+  file and returns a `ParsedModel` holding header metadata + byte data.
+  `ParsedModel::inspect()` returns format info. `ParsedModel::remember(path, target)`
+  dequantizes all quantized tensors and writes a standard `.safetensors` file.
+  `TargetDtype` enum (`BF16`). Round-trip tested with synthetic FP8 safetensors files.
 - **README.md** with badges (CI, crates.io, docs.rs, MSRV), motto, dev warning
 - **SPDX license identifiers** on all `.rs` files
