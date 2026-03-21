@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026
-**Status:** Pre-implementation. Brief and flagship example defined. Architecture designed: parsing as the foundational layer; remember/lethe/inspect built on top.
+**Date:** March 20, 2026 (updated March 21, 2026)
+**Status:** Phase 1 complete. FP8 dequantization works end-to-end — 3 schemes (fine-grained, per-channel, per-tensor), 3 scale dtypes (F32, BF16, F16), validated against 7 real models from 5 quantizers, bit-exact against PyTorch, 2.7–9.7× faster. Ready for v0.1.0 push.
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -105,7 +105,7 @@ anamnesis (library crate)
 │   └── (future)           GGUF, etc.
 │
 ├── remember/           ← built on parse: precision recovery (dequantize)
-│   ├── fp8                fine-grained + per-tensor FP8 (E4M3, E5M2)
+│   ├── fp8                fine-grained, per-channel, per-tensor FP8 (E4M3, E5M2)
 │   ├── gptq               GPTQ dequantization
 │   ├── awq                AWQ dequantization
 │   └── bnb                BitsAndBytes (NF4, INT8) dequantization
@@ -171,17 +171,25 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [x] Per-tensor FP8 dequantization — single scale factor per tensor (simpler case). Same module, same SIMD-friendly loop structure, different scale broadcast — **commit**
 - [x] Parse-first public API (`src/lib.rs`) — `parse(path)` returns a `ParsedModel` struct holding header metadata + byte data. `ParsedModel::inspect()` returns format info. `ParsedModel::remember(output_path, TargetDtype)` dequantizes and writes a standard safetensors file. No file is re-read after the initial parse. The Rust API in `amn-flagship-v2.md` should work — **commit**
 - [x] CLI binary (`src/bin/main.rs`) — thin `clap` wrapper over the library API. Subcommands: `parse`, `inspect` (alias `info`), `remember` (alias `dequantize`). Each subcommand calls `anamnesis::parse()` then the appropriate method. Progress output via `indicatif` (optional, behind `indicatif` feature). Same binary serves both `anamnesis` and `amn` names — **commit**
-- [ ] Download FP8 test models via `hf-fetch-model`. **Blocked:** `hf-fm download-file` requires knowing exact filenames, but `hf-fm` has no `list-files` subcommand yet (tracked in hf-fetch-model v0.8.0 roadmap, dogfooding observations). Once `list-files` is available (or filenames are obtained another way), download and run the `#[ignore]` integration tests with `cargo test -- --ignored`. Three models covering both FP8 code paths and two new architectures for candle-mi auto-config:
+- [x] Download FP8 test models via `hf-fetch-model` (v0.8.1, with `list-files`). 7 models from 5 quantization tools, covering 3 FP8 schemes discovered during validation:
 
-  | Model | Size | FP8 type | Architecture | candle-mi status |
+  | Model | Size | FP8 scheme | Scale dtype | Quantizer |
   |---|---|---|---|---|
-  | `LGAI-EXAONE/EXAONE-4.0-1.2B-FP8` | 1.22 GB | **Fine-grained** (128×128 block scales) | `exaone4` | **New** — sliding window + full attention pattern, extends auto-config |
-  | `Qwen/Qwen3-1.7B-FP8` | 1.89 GB | **Fine-grained** (128×128 block scales) | `qwen3` | **New** — adds QK LayerNorm over `qwen2`, extends auto-config |
-  | `mistralai/Ministral-3-3B-Instruct-2512` | 4.35 GB | **Per-tensor** (single scale per tensor) | `mistral3` (multimodal) | Text decoder only — validates per-tensor code path |
+  | `LGAI-EXAONE/EXAONE-4.0-1.2B-FP8` | 1.39 GB | **Fine-grained** | BF16 | LG AI |
+  | `Qwen/Qwen3-1.7B-FP8` | 2.47 GB | **Fine-grained** | BF16 | Qwen |
+  | `Qwen/Qwen3-4B-Instruct-2507-FP8` | 4.83 GB | **Fine-grained** | **F16** | Qwen |
+  | `mistralai/Ministral-3-3B-Instruct-2512` | 4.35 GB | **Per-tensor** (scalar) | BF16 | Mistral |
+  | `RedHatAI/Llama-3.2-1B-Instruct-FP8` | 1.88 GB | **Per-tensor** | BF16 | RedHat |
+  | `RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic` | 1.89 GB | **Per-channel** `[N,1]` | BF16 | RedHat |
+  | `nvidia/Llama-3.1-8B-Instruct-FP8` (shard 1) | 4.65 GB | **Per-tensor** (scalar) | F32 | NVIDIA |
 
-  All three fit on the 5060 Ti 16 GB after dequantization to BF16 (1.2B → ~2.4 GB, 1.7B → ~3.4 GB, 3.4B → ~6.8 GB). Total download: ~7.5 GB — **commit** (add test model references to `tests/`)
+  Discoveries during validation:
+  - **Per-channel FP8** — a third scheme (one scale per row, shape `[N,1]`), used by RedHat/vLLM dynamic quantization. New `dequantize_per_channel_fp8_to_bf16()` and `PerChannelFp8` scheme variant.
+  - **F16 scales** exist in the wild (Qwen3-4B-Instruct-2507-FP8, Qwen/Alibaba), undocumented in the ecosystem. All three scale dtypes (F32, BF16, F16) now supported.
+  - **Scheme detection by scale shape**, not name suffix — both fine-grained and per-tensor use `_scale_inv`, distinguished by scale tensor dimensionality.
+  — **commits** (multiple: BF16 scale fix, scheme detection fix, F16 + per-channel support)
 
-- [ ] Validation against FP8 test models — dequantize each model, load in candle, confirm forward pass produces coherent logits. Compare a sample of dequantized tensor values against Python reference (`safetensors` + `torch.float8_e4m3fn` → `torch.bfloat16`) to verify bit-exact or within-tolerance output. This is the acceptance test — **commit** — **PUSH**
+- [x] Validation against FP8 test models — cross-validated against PyTorch (`torch.float8_e4m3fn` → `torch.bfloat16`) on 256×256 slices from all 7 models. **Bit-exact match** (0 ULP difference on 65,536 elements per fixture). Fixtures generated by `tests/fixtures/fp8_reference/generate.py`, Rust tests in `tests/cross_validation.rs`. Auto-vectorization verified with `cargo-show-asm`: SSE2 (default), AVX2 (`target-cpu=native`). **2.7–9.7× faster than PyTorch** (AVX2). — **commit** — **PUSH**
 
 **Deliverable:** `anamnesis` v0.1.0 — FP8 dequantization works. — **PUSH + tag `v0.1.0`**
 
