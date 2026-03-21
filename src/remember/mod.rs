@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Precision recovery (dequantization) — built on [`parse`](crate::parse).
+//! Precision recovery (dequantization) — built on [`parse`](mod@crate::parse).
 //!
 //! Each submodule handles one quantization family. All operations take raw byte
 //! slices from the parsed `.safetensors` file and produce dequantized output as
