@@ -15,7 +15,9 @@ use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
     parse_safetensors_header, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
 };
-use crate::remember::fp8::{dequantize_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16};
+use crate::remember::fp8::{
+    dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
+};
 
 /// Target dtype for dequantization output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,9 +134,20 @@ impl ParsedModel {
                 // BITWISE: BF16 → f32 by shifting into upper 16 bits of IEEE 754
                 Ok(f32::from_bits(u32::from(u16::from_le_bytes(arr)) << 16))
             }
+            Dtype::F16 => {
+                let arr: [u8; 2] =
+                    data.get(..2)
+                        .and_then(|s| s.try_into().ok())
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!(
+                                "per-tensor F16 scale for `{weight_name}` is not 2 bytes"
+                            ),
+                        })?;
+                // BITWISE: F16 → f32 via half crate's IEEE 754 conversion
+                Ok(half::f16::from_le_bytes(arr).to_f32())
+            }
             Dtype::F8E4M3
             | Dtype::F8E5M2
-            | Dtype::F16
             | Dtype::F64
             | Dtype::Bool
             | Dtype::U8
@@ -240,6 +253,29 @@ impl ParsedModel {
                             )?;
                             let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
                             dequantize_fp8_to_bf16(
+                                weight_data,
+                                scale_data,
+                                rows,
+                                cols,
+                                scale_entry.dtype,
+                            )?
+                        }
+                        QuantScheme::PerChannelFp8 => {
+                            let scale_entry =
+                                self.header.find_scale_for(&entry.name).ok_or_else(|| {
+                                    AnamnesisError::Parse {
+                                        reason: format!(
+                                            "no scale tensor found for quantized weight `{}`",
+                                            entry.name
+                                        ),
+                                    }
+                                })?;
+                            let scale_data = self.tensor_data(
+                                scale_entry.data_offsets.0,
+                                scale_entry.data_offsets.1,
+                            )?;
+                            let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
+                            dequantize_per_channel_fp8_to_bf16(
                                 weight_data,
                                 scale_data,
                                 rows,

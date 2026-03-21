@@ -128,32 +128,33 @@ fn e4m3_to_scaled_bf16(byte: u8, scale: f32) -> u16 {
 // ---------------------------------------------------------------------------
 
 /// Reads a scale factor from raw little-endian bytes at the given
-/// block position. Supports `F32` (4 bytes) and `BF16` (2 bytes) scales.
+/// block position. Supports `F32`, `BF16`, and `F16` scales.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if the byte offset is out of bounds.
+/// Returns [`AnamnesisError::Parse`] if the byte offset is out of bounds
+/// or the dtype is unsupported.
 fn load_scale(
     scale_data: &[u8],
     block_row: usize,
     block_col: usize,
     scale_cols: usize,
-    bytes_per_scale: usize,
+    scale_dtype: Dtype,
 ) -> crate::Result<f32> {
+    let bps = scale_dtype.byte_size();
     let scale_idx = block_row
         .checked_mul(scale_cols)
         .and_then(|v| v.checked_add(block_col))
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "scale index overflow".into(),
         })?;
-    let byte_offset =
-        scale_idx
-            .checked_mul(bytes_per_scale)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "scale byte offset overflow".into(),
-            })?;
+    let byte_offset = scale_idx
+        .checked_mul(bps)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "scale byte offset overflow".into(),
+        })?;
     let end = byte_offset
-        .checked_add(bytes_per_scale)
+        .checked_add(bps)
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "scale byte range overflow".into(),
         })?;
@@ -165,27 +166,46 @@ fn load_scale(
                 scale_data.len()
             ),
         })?;
-    match bytes_per_scale {
-        4 => {
+    read_scale_bytes(slice, scale_dtype)
+}
+
+/// Converts raw little-endian scale bytes to `f32` based on dtype.
+fn read_scale_bytes(slice: &[u8], dtype: Dtype) -> crate::Result<f32> {
+    match dtype {
+        Dtype::F32 => {
             let arr: [u8; 4] = slice.try_into().map_err(|_| AnamnesisError::Parse {
                 reason: "scale slice is not 4 bytes".into(),
             })?;
             Ok(f32::from_le_bytes(arr))
         }
-        2 => {
+        Dtype::BF16 => {
             let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
                 reason: "scale slice is not 2 bytes".into(),
             })?;
-            // BITWISE: interpret 2 LE bytes as BF16, expand to f32 by shifting
-            // mantissa+exponent into the upper 16 bits of an f32
-            // CAST: u16 → u32, lossless widening for BF16-to-f32 expansion
-            // BITWISE: interpret 2 LE bytes as BF16, expand to f32 by shifting
-            // mantissa+exponent into the upper 16 bits of an f32
+            // BITWISE: BF16 → f32 by shifting into upper 16 bits of IEEE 754
             let f32_bits = u32::from(u16::from_le_bytes(arr)) << 16;
             Ok(f32::from_bits(f32_bits))
         }
-        _ => Err(AnamnesisError::Parse {
-            reason: format!("unsupported scale element size: {bytes_per_scale} bytes"),
+        Dtype::F16 => {
+            let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
+                reason: "scale slice is not 2 bytes".into(),
+            })?;
+            // BITWISE: F16 → f32 via half crate's IEEE 754 conversion
+            Ok(half::f16::from_le_bytes(arr).to_f32())
+        }
+        Dtype::F8E4M3
+        | Dtype::F8E5M2
+        | Dtype::F64
+        | Dtype::Bool
+        | Dtype::U8
+        | Dtype::I8
+        | Dtype::U16
+        | Dtype::I16
+        | Dtype::U32
+        | Dtype::I32
+        | Dtype::U64
+        | Dtype::I64 => Err(AnamnesisError::Parse {
+            reason: format!("unsupported scale dtype: {dtype}"),
         }),
     }
 }
@@ -319,13 +339,7 @@ pub fn dequantize_fp8_to_bf16(
 
         // VECTORIZED: pending verification with cargo-show-asm
         for (block_col, w_chunk) in full_blocks.enumerate() {
-            let scale = load_scale(
-                scale_data,
-                block_row,
-                block_col,
-                scale_cols,
-                bytes_per_scale,
-            )?;
+            let scale = load_scale(scale_data, block_row, block_col, scale_cols, scale_dtype)?;
             let o_start = block_col * BLOCK_SIZE * 2;
             let o_chunk = row_o
                 .get_mut(o_start..o_start + BLOCK_SIZE * 2)
@@ -348,7 +362,7 @@ pub fn dequantize_fp8_to_bf16(
                 block_row,
                 last_block_col,
                 scale_cols,
-                bytes_per_scale,
+                scale_dtype,
             )?;
             let o_start = last_block_col * BLOCK_SIZE * 2;
             let o_chunk = row_o
@@ -406,6 +420,105 @@ pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> Vec<
     }
 
     output
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel dequantization (public API)
+// ---------------------------------------------------------------------------
+
+/// Dequantizes a per-channel `FP8` `E4M3` weight tensor to `BF16`.
+///
+/// Each row of the weight tensor has its own scale factor (shape `[rows, 1]`).
+/// The formula is: `BF16(FP8_to_f32(weight[r, c]) × scale[r])`.
+///
+/// # Arguments
+///
+/// * `weight_data` — raw `F8_E4M3` bytes in row-major order (1 byte per element).
+/// * `scale_data` — raw scale factor bytes in row-major order, one per row.
+/// * `rows` — number of rows in the weight tensor.
+/// * `cols` — number of columns in the weight tensor.
+/// * `scale_dtype` — dtype of the scale tensor (`F32`, `BF16`, or `F16`).
+///
+/// # Returns
+///
+/// A `Vec<u8>` of length `rows × cols × 2`, containing `BF16` values
+/// in little-endian byte order.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if dimensions or scale data are inconsistent.
+pub fn dequantize_per_channel_fp8_to_bf16(
+    weight_data: &[u8],
+    scale_data: &[u8],
+    rows: usize,
+    cols: usize,
+    scale_dtype: Dtype,
+) -> crate::Result<Vec<u8>> {
+    let bps = scale_dtype.byte_size();
+    let expected_weight_len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("rows × cols overflow: {rows} × {cols}"),
+        })?;
+    if weight_data.len() != expected_weight_len {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "weight data length {} != rows × cols {expected_weight_len}",
+                weight_data.len()
+            ),
+        });
+    }
+    let expected_scale_len = rows.checked_mul(bps).ok_or_else(|| AnamnesisError::Parse {
+        reason: "scale byte count overflow".into(),
+    })?;
+    if scale_data.len() != expected_scale_len {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "per-channel scale data length {} != expected {expected_scale_len} \
+                 (rows={rows}, {bps} bytes per scale)",
+                scale_data.len()
+            ),
+        });
+    }
+
+    let out_byte_len = expected_weight_len
+        .checked_mul(2)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "output size overflow".into(),
+        })?;
+    let mut output = vec![0u8; out_byte_len];
+
+    // VECTORIZED: pending verification with cargo-show-asm
+    // Per-row iteration: scale is hoisted per row, inner loop over cols.
+    for r in 0..rows {
+        let scale_offset = r * bps;
+        let scale_slice = scale_data
+            .get(scale_offset..scale_offset + bps)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("per-channel scale for row {r} out of bounds"),
+            })?;
+        let scale = read_scale_bytes(scale_slice, scale_dtype)?;
+
+        let row_start = r * cols;
+        let row_w = weight_data
+            .get(row_start..row_start + cols)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("weight row {r} out of bounds"),
+            })?;
+        let out_row_start = row_start * 2;
+        let row_o = output
+            .get_mut(out_row_start..out_row_start + cols * 2)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("output row {r} out of bounds"),
+            })?;
+
+        for (&byte, out_pair) in row_w.iter().zip(row_o.chunks_exact_mut(2)) {
+            let bf16 = e4m3_to_scaled_bf16(byte, scale);
+            out_pair.copy_from_slice(&bf16.to_le_bytes());
+        }
+    }
+
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------

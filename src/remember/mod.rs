@@ -8,4 +8,6 @@
 
 pub mod fp8;
 
-pub use fp8::{dequantize_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16};
+pub use fp8::{
+    dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
+};

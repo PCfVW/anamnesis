@@ -11,14 +11,14 @@
 
 ## Tested Models
 
-Validated against 7 real FP8 models from 5 different quantization tools, covering both fine-grained (128x128 block scales) and per-tensor quantization schemes.
+Cross-validated against PyTorch on 7 real FP8 models from 5 quantization tools. Bit-exact output (0 ULP difference), 2.3-6x faster than PyTorch.
 
 | Model | Quantizer | Scheme | Scales |
 |---|---|---|---|
 | EXAONE-4.0-1.2B-FP8 | LG AI | Fine-grained | BF16 |
-| Qwen3-1.7B-FP8 | Qwen | Fine-grained | F32 |
-| Qwen3-4B-Instruct-2507-FP8 | Qwen | Fine-grained | F32 |
+| Qwen3-1.7B-FP8 | Qwen | Fine-grained | BF16 |
+| Qwen3-4B-Instruct-2507-FP8 | Qwen | Fine-grained | F16 |
 | Ministral-3-3B-Instruct-2512 | Mistral | Per-tensor | BF16 |
-| Llama-3.2-1B-Instruct-FP8 | RedHat | Per-tensor | F32 |
-| Llama-3.2-1B-Instruct-FP8-dynamic | RedHat | Per-tensor | F32 |
+| Llama-3.2-1B-Instruct-FP8 | RedHat | Per-tensor | BF16 |
+| Llama-3.2-1B-Instruct-FP8-dynamic | RedHat | Per-channel | BF16 |
 | Llama-3.1-8B-Instruct-FP8 | NVIDIA | Per-tensor | F32 |

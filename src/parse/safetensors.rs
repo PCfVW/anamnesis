@@ -198,6 +198,8 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
 pub enum QuantScheme {
     /// Fine-grained `FP8` with 128×128 block scale factors (`_scale_inv` companions).
     FineGrainedFp8,
+    /// Per-channel `FP8` with one scale factor per output row (shape `[rows, 1]`).
+    PerChannelFp8,
     /// Per-tensor `FP8` with a single scale factor per tensor (or no explicit companion).
     PerTensorFp8,
     /// No quantization detected — all tensors are passthrough.
@@ -208,6 +210,7 @@ impl fmt::Display for QuantScheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::FineGrainedFp8 => "Fine-grained FP8 (E4M3), 128x128 blocks",
+            Self::PerChannelFp8 => "Per-channel FP8 (E4M3), one scale per row",
             Self::PerTensorFp8 => "Per-tensor FP8 (E4M3)",
             Self::Unquantized => "Unquantized",
         };
@@ -217,34 +220,43 @@ impl fmt::Display for QuantScheme {
 
 /// Detect the quantization scheme from a list of classified tensor entries.
 ///
-/// Both fine-grained and per-tensor `FP8` use `_scale_inv` companions.
+/// All `FP8` schemes may use `_scale_inv` or `_scale` companions.
 /// The distinction is the **scale tensor shape**:
-/// - Fine-grained: multi-dimensional (e.g., `[16, 32]` for 128×128 blocks)
-/// - Per-tensor: scalar `[]` or `[1]`
+/// - Fine-grained: 2D with both dims > 1 (e.g., `[16, 32]` for 128×128 blocks)
+/// - Per-channel: 2D with second dim = 1 (e.g., `[2048, 1]`, one scale per row)
+/// - Per-tensor: scalar `[]` or 1D `[1]`
 fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
     let has_quantized = entries.iter().any(|e| e.role == TensorRole::Quantized);
     if !has_quantized {
         return QuantScheme::Unquantized;
     }
 
-    // Check whether any quantized tensor has a matching `_scale_inv` companion
-    // with a multi-dimensional shape (≥ 2D). Scalar or 1D scale companions
-    // indicate per-tensor quantization, not fine-grained block quantization.
-    let has_fine_grained_scales = entries
-        .iter()
-        .filter(|e| e.role == TensorRole::Quantized)
-        .any(|e| {
-            let expected = format!("{}_scale_inv", e.name);
-            entries
+    // Find the first scale companion for any quantized tensor and inspect its shape.
+    // We check both `_scale_inv` and `_scale` suffixes.
+    for entry in entries.iter().filter(|e| e.role == TensorRole::Quantized) {
+        for suffix in &["_scale_inv", "_scale"] {
+            let expected = format!("{}{suffix}", entry.name);
+            if let Some(scale) = entries
                 .iter()
-                .any(|s| s.name == expected && s.role == TensorRole::Scale && s.shape.len() >= 2)
-        });
-
-    if has_fine_grained_scales {
-        QuantScheme::FineGrainedFp8
-    } else {
-        QuantScheme::PerTensorFp8
+                .find(|s| s.name == expected && s.role == TensorRole::Scale)
+            {
+                // 2D scale with both dims > 1 → fine-grained block scales
+                if scale.shape.len() >= 2 {
+                    let last = scale.shape.last().copied().unwrap_or(0);
+                    if last > 1 {
+                        return QuantScheme::FineGrainedFp8;
+                    }
+                    // [N, 1] → per-channel (one scale per row)
+                    return QuantScheme::PerChannelFp8;
+                }
+                // scalar [] or 1D [1] → per-tensor
+                return QuantScheme::PerTensorFp8;
+            }
+        }
     }
+
+    // Quantized tensors exist but no scale companions found at all
+    QuantScheme::PerTensorFp8
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +716,7 @@ mod tests {
         use safetensors::tensor::serialize;
 
         let weight_data: Vec<u8> = vec![0; 4]; // 4 FP8 elements
-        let scale_data: Vec<u8> = vec![0; 4]; // 1 F32 scale value
+        let scale_data: Vec<u8> = vec![0; 8]; // 2 F32 scale values (shape [1, 2])
 
         let tensors = vec![
             (
@@ -720,7 +732,7 @@ mod tests {
                 "layer.weight_scale_inv",
                 safetensors::tensor::TensorView::new(
                     safetensors::Dtype::F32,
-                    vec![1, 1],
+                    vec![1, 2],
                     &scale_data,
                 )
                 .unwrap_or_else(|e| panic!("scale TensorView: {e}")),
