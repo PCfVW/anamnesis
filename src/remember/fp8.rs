@@ -319,6 +319,47 @@ pub fn dequantize_fp8_to_bf16(
 }
 
 // ---------------------------------------------------------------------------
+// Per-tensor dequantization (public API)
+// ---------------------------------------------------------------------------
+
+/// Dequantizes a per-tensor `FP8` `E4M3` weight tensor to `BF16`.
+///
+/// The entire tensor shares a single `F32` scale factor. This is the simpler
+/// case compared to fine-grained (block-wise) dequantization.
+/// The formula is: `BF16(FP8_to_f32(byte) × scale)`.
+///
+/// # Arguments
+///
+/// * `weight_data` — raw `F8_E4M3` bytes (1 byte per element).
+/// * `scale` — single `F32` scale factor for the entire tensor.
+///
+/// # Returns
+///
+/// A `Vec<u8>` of length `weight_data.len() × 2`, containing `BF16` values
+/// in little-endian byte order.
+///
+/// # Memory
+///
+/// Allocates a single output buffer of `weight_data.len() × 2` bytes.
+/// Peak memory is input + output (~3× the `FP8` weight size).
+#[must_use]
+pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> Vec<u8> {
+    let out_byte_len = weight_data.len() * 2;
+    let mut output = vec![0u8; out_byte_len];
+
+    // VECTORIZED: pending verification with cargo-show-asm
+    // Scale is hoisted (single value for the entire tensor).
+    // Flat iteration over all bytes — the compiler sees a single contiguous
+    // loop with no aliasing between input (&[u8]) and output (&mut [u8]).
+    for (&byte, out_pair) in weight_data.iter().zip(output.chunks_exact_mut(2)) {
+        let bf16 = e4m3_to_scaled_bf16(byte, scale);
+        out_pair.copy_from_slice(&bf16.to_le_bytes());
+    }
+
+    output
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -617,5 +658,61 @@ mod tests {
         // 0×0 is valid: empty input, empty output
         let result = dequantize_fp8_to_bf16(&[], &[], 0, 0).unwrap();
         assert!(result.is_empty());
+    }
+
+    // -- dequantize_per_tensor_fp8_to_bf16 -----------------------------------
+
+    #[test]
+    fn per_tensor_all_ones_scale_one() {
+        // 128 elements of 1.0 in E4M3 (0x38), scale=1.0
+        let weight = vec![0x38u8; 128];
+        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 1.0);
+        assert_eq!(output.len(), 256);
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x80, 0x3F]); // BF16 1.0
+        }
+    }
+
+    #[test]
+    fn per_tensor_scale_two() {
+        // 1.0 × 2.0 = 2.0
+        let weight = vec![0x38u8; 64];
+        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 2.0);
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40]); // BF16 2.0
+        }
+    }
+
+    #[test]
+    fn per_tensor_non_aligned_length() {
+        // 130 elements — tests remainder handling (128 + 2)
+        let weight = vec![0x40u8; 130]; // 2.0 in E4M3
+        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 0.5);
+        assert_eq!(output.len(), 260);
+        // 2.0 × 0.5 = 1.0
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x80, 0x3F]); // BF16 1.0
+        }
+    }
+
+    #[test]
+    fn per_tensor_single_element() {
+        let output = dequantize_per_tensor_fp8_to_bf16(&[0x38], 3.0);
+        assert_eq!(output.len(), 2);
+        assert_eq!(&output[..], &[0x40, 0x40]); // BF16 3.0
+    }
+
+    #[test]
+    fn per_tensor_empty() {
+        let output = dequantize_per_tensor_fp8_to_bf16(&[], 1.0);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn per_tensor_nan_preserved() {
+        let output = dequantize_per_tensor_fp8_to_bf16(&[0x7F], 42.0);
+        let bf16_bits = u16::from_le_bytes([output[0], output[1]]);
+        let f = f32::from_bits(u32::from(bf16_bits) << 16);
+        assert!(f.is_nan());
     }
 }
