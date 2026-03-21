@@ -122,8 +122,9 @@ impl fmt::Display for InspectInfo {
 /// Format a byte count as a human-readable string.
 ///
 /// Examples: `"0 B"`, `"512 B"`, `"45.6 KB"`, `"302 MB"`, `"4.35 GB"`.
+#[must_use]
 #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;

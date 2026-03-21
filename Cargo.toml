@@ -10,6 +10,7 @@ homepage = "https://github.com/PCfVW/anamnesis"
 documentation = "https://docs.rs/anamnesis"
 keywords = ["safetensors", "dequantization", "fp8", "quantization", "machine-learning"]
 categories = ["science", "parser-implementations"]
+default-run = "anamnesis"
 
 [features]
 default = []

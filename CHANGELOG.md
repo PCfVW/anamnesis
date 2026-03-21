@@ -34,5 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParsedModel::inspect()` returns format info. `ParsedModel::remember(path, target)`
   dequantizes all quantized tensors and writes a standard `.safetensors` file.
   `TargetDtype` enum (`BF16`). Round-trip tested with synthetic FP8 safetensors files.
+- **CLI binary** (`src/bin/main.rs`) — `clap`-based CLI with subcommands: `parse`
+  (tensor summary), `inspect` / `info` (format, sizes, Lethe distance), `remember` /
+  `dequantize` (FP8 → BF16 conversion with auto-derived output path). Installed as
+  both `anamnesis` and `amn`. Feature-gated behind `cli`.
+- **`format_bytes`** made public for reuse by CLI and downstream consumers
 - **README.md** with badges (CI, crates.io, docs.rs, MSRV), motto, dev warning
 - **SPDX license identifiers** on all `.rs` files
