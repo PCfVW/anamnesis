@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::error::AnamnesisError;
 use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
-    parse_safetensors_header, QuantScheme, SafetensorsHeader, TensorRole,
+    parse_safetensors_header, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
 };
 use crate::remember::fp8::{dequantize_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16};
 
@@ -96,6 +96,59 @@ impl ParsedModel {
                     self.buffer.len()
                 ),
             })
+    }
+
+    /// Reads a scalar scale value from raw bytes, handling both `F32` and
+    /// `BF16` scale dtypes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the data is too short for the
+    /// given dtype.
+    /// Returns [`AnamnesisError::Unsupported`] if the scale dtype is not
+    /// `F32` or `BF16`.
+    fn read_scalar_scale(data: &[u8], dtype: Dtype, weight_name: &str) -> crate::Result<f32> {
+        match dtype {
+            Dtype::F32 => {
+                let arr: [u8; 4] =
+                    data.get(..4)
+                        .and_then(|s| s.try_into().ok())
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!(
+                                "per-tensor F32 scale for `{weight_name}` is not 4 bytes"
+                            ),
+                        })?;
+                Ok(f32::from_le_bytes(arr))
+            }
+            Dtype::BF16 => {
+                let arr: [u8; 2] =
+                    data.get(..2)
+                        .and_then(|s| s.try_into().ok())
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!(
+                                "per-tensor BF16 scale for `{weight_name}` is not 2 bytes"
+                            ),
+                        })?;
+                // BITWISE: BF16 → f32 by shifting into upper 16 bits of IEEE 754
+                Ok(f32::from_bits(u32::from(u16::from_le_bytes(arr)) << 16))
+            }
+            Dtype::F8E4M3
+            | Dtype::F8E5M2
+            | Dtype::F16
+            | Dtype::F64
+            | Dtype::Bool
+            | Dtype::U8
+            | Dtype::I8
+            | Dtype::U16
+            | Dtype::I16
+            | Dtype::U32
+            | Dtype::I32
+            | Dtype::U64
+            | Dtype::I64 => Err(AnamnesisError::Unsupported {
+                format: dtype.to_string(),
+                detail: format!("per-tensor scale for `{weight_name}` has unsupported dtype"),
+            }),
+        }
     }
 
     /// Extracts `(rows, cols)` from a tensor shape for the fine-grained
@@ -195,7 +248,7 @@ impl ParsedModel {
                             )?
                         }
                         QuantScheme::PerTensorFp8 => {
-                            // Look for a companion scale tensor; default to 1.0 if none
+                            // Look for a companion scale tensor; default to 1.0 if none.
                             let scale = if let Some(scale_entry) =
                                 self.header.find_scale_for(&entry.name)
                             {
@@ -203,17 +256,7 @@ impl ParsedModel {
                                     scale_entry.data_offsets.0,
                                     scale_entry.data_offsets.1,
                                 )?;
-                                // Read single f32 from the scale tensor
-                                let arr: [u8; 4] = scale_data
-                                    .get(..4)
-                                    .and_then(|s| s.try_into().ok())
-                                    .ok_or_else(|| AnamnesisError::Parse {
-                                        reason: format!(
-                                            "per-tensor scale for `{}` is not 4 bytes",
-                                            entry.name
-                                        ),
-                                    })?;
-                                f32::from_le_bytes(arr)
+                                Self::read_scalar_scale(scale_data, scale_entry.dtype, &entry.name)?
                             } else {
                                 1.0
                             };

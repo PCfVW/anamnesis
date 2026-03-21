@@ -50,4 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Flexible scale validation** — scale grid dimensions are derived from the actual
   scale tensor data instead of rigidly computing from weight dimensions. Handles
   models with non-standard scale layouts.
+- **Scheme detection** — `detect_scheme()` now checks scale tensor shape (≥ 2D =
+  fine-grained, scalar/1D = per-tensor) instead of relying solely on the
+  `_scale_inv` suffix. Fixes misclassification of Ministral-3-3B (per-tensor with
+  scalar BF16 `_scale_inv` was incorrectly detected as fine-grained).
+- **Per-tensor BF16 scalar scales** — `read_scalar_scale()` handles both F32 (4-byte)
+  and BF16 (2-byte) per-tensor scale factors. Ministral-3-3B uses BF16 scalar scales.
 - **SPDX license identifiers** on all `.rs` files

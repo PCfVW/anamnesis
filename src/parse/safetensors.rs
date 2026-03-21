@@ -216,25 +216,28 @@ impl fmt::Display for QuantScheme {
 }
 
 /// Detect the quantization scheme from a list of classified tensor entries.
+///
+/// Both fine-grained and per-tensor `FP8` use `_scale_inv` companions.
+/// The distinction is the **scale tensor shape**:
+/// - Fine-grained: multi-dimensional (e.g., `[16, 32]` for 128×128 blocks)
+/// - Per-tensor: scalar `[]` or `[1]`
 fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
     let has_quantized = entries.iter().any(|e| e.role == TensorRole::Quantized);
     if !has_quantized {
         return QuantScheme::Unquantized;
     }
 
-    // Check whether any quantized tensor has a matching `_scale_inv` companion.
-    let scale_names: std::collections::HashSet<&str> = entries
-        .iter()
-        .filter(|e| e.role == TensorRole::Scale)
-        .map(|e| e.name.as_str()) // BORROW: explicit .as_str() for HashSet<&str>
-        .collect();
-
+    // Check whether any quantized tensor has a matching `_scale_inv` companion
+    // with a multi-dimensional shape (≥ 2D). Scalar or 1D scale companions
+    // indicate per-tensor quantization, not fine-grained block quantization.
     let has_fine_grained_scales = entries
         .iter()
         .filter(|e| e.role == TensorRole::Quantized)
         .any(|e| {
             let expected = format!("{}_scale_inv", e.name);
-            scale_names.contains(expected.as_str()) // BORROW: explicit .as_str() for HashSet lookup
+            entries
+                .iter()
+                .any(|s| s.name == expected && s.role == TensorRole::Scale && s.shape.len() >= 2)
         });
 
     if has_fine_grained_scales {
@@ -518,11 +521,22 @@ mod tests {
     // -- Scheme detection ----------------------------------------------------
 
     fn make_entry(name: &str, dtype: Dtype, role: TensorRole) -> TensorEntry {
+        make_entry_with_shape(name, dtype, role, vec![128, 128])
+    }
+
+    fn make_entry_with_shape(
+        name: &str,
+        dtype: Dtype,
+        role: TensorRole,
+        shape: Vec<usize>,
+    ) -> TensorEntry {
+        let num_elements: usize = shape.iter().product();
+        let byte_len = num_elements * dtype.byte_size();
         TensorEntry {
             name: name.to_owned(),
             dtype,
-            shape: vec![128, 128],
-            data_offsets: (0, 128 * 128),
+            shape,
+            data_offsets: (0, byte_len),
             role,
         }
     }
@@ -553,6 +567,67 @@ mod tests {
             make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
         ];
         assert_eq!(detect_scheme(&entries), QuantScheme::PerTensorFp8);
+    }
+
+    #[test]
+    fn detect_per_tensor_fp8_with_scalar_scale_inv() {
+        // Ministral pattern: _scale_inv exists but is scalar (shape [])
+        let entries = vec![
+            make_entry("layer.0.weight", Dtype::F8E4M3, TensorRole::Quantized),
+            make_entry_with_shape(
+                "layer.0.weight_scale_inv",
+                Dtype::BF16,
+                TensorRole::Scale,
+                vec![],
+            ),
+            make_entry_with_shape(
+                "layer.0.activation_scale",
+                Dtype::BF16,
+                TensorRole::Scale,
+                vec![],
+            ),
+            make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
+        ];
+        // Scalar scale_inv → per-tensor, NOT fine-grained
+        assert_eq!(detect_scheme(&entries), QuantScheme::PerTensorFp8);
+    }
+
+    #[test]
+    fn detect_per_tensor_fp8_with_1d_scale_inv() {
+        // Compressed-tensors pattern: _scale_inv with shape [1]
+        let entries = vec![
+            make_entry("layer.0.weight", Dtype::F8E4M3, TensorRole::Quantized),
+            make_entry_with_shape(
+                "layer.0.weight_scale_inv",
+                Dtype::BF16,
+                TensorRole::Scale,
+                vec![1],
+            ),
+        ];
+        // 1D scale_inv → per-tensor, NOT fine-grained
+        assert_eq!(detect_scheme(&entries), QuantScheme::PerTensorFp8);
+    }
+
+    #[test]
+    fn detect_fine_grained_fp8_with_2d_scale_inv() {
+        // EXAONE/DeepSeek pattern: _scale_inv with shape [16, 32]
+        let entries = vec![
+            make_entry_with_shape(
+                "layer.0.weight",
+                Dtype::F8E4M3,
+                TensorRole::Quantized,
+                vec![2048, 4096],
+            ),
+            make_entry_with_shape(
+                "layer.0.weight_scale_inv",
+                Dtype::BF16,
+                TensorRole::Scale,
+                vec![16, 32],
+            ),
+            make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
+        ];
+        // 2D scale_inv → fine-grained
+        assert_eq!(detect_scheme(&entries), QuantScheme::FineGrainedFp8);
     }
 
     // -- find_scale_for ------------------------------------------------------
