@@ -186,7 +186,13 @@ impl ParsedModel {
                                 scale_entry.data_offsets.1,
                             )?;
                             let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
-                            dequantize_fp8_to_bf16(weight_data, scale_data, rows, cols)?
+                            dequantize_fp8_to_bf16(
+                                weight_data,
+                                scale_data,
+                                rows,
+                                cols,
+                                scale_entry.dtype,
+                            )?
                         }
                         QuantScheme::PerTensorFp8 => {
                             // Look for a companion scale tensor; default to 1.0 if none

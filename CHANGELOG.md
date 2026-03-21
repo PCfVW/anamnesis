@@ -40,4 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both `anamnesis` and `amn`. Feature-gated behind `cli`.
 - **`format_bytes`** made public for reuse by CLI and downstream consumers
 - **README.md** with badges (CI, crates.io, docs.rs, MSRV), motto, dev warning
+
+### Fixed
+
+- **BF16 scale support** — fine-grained FP8 dequantization now handles both F32 and
+  BF16 scale tensors. EXAONE-4.0-1.2B-FP8 uses BF16 scales, not F32 as initially
+  assumed from the DeepSeek V3 convention. Scale dtype is now passed explicitly to
+  `dequantize_fp8_to_bf16()`.
+- **Flexible scale validation** — scale grid dimensions are derived from the actual
+  scale tensor data instead of rigidly computing from weight dimensions. Handles
+  models with non-standard scale layouts.
 - **SPDX license identifiers** on all `.rs` files

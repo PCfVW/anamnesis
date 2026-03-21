@@ -7,6 +7,7 @@
 //! enable auto-vectorization.
 
 use crate::error::AnamnesisError;
+use crate::parse::safetensors::Dtype;
 
 /// Block size for fine-grained `FP8` quantization (128×128 elements per block).
 const BLOCK_SIZE: usize = 128;
@@ -126,8 +127,8 @@ fn e4m3_to_scaled_bf16(byte: u8, scale: f32) -> u16 {
 // Scale factor loading
 // ---------------------------------------------------------------------------
 
-/// Reads an `F32` scale factor from raw little-endian bytes at the given
-/// block position.
+/// Reads a scale factor from raw little-endian bytes at the given
+/// block position. Supports `F32` (4 bytes) and `BF16` (2 bytes) scales.
 ///
 /// # Errors
 ///
@@ -137,6 +138,7 @@ fn load_scale(
     block_row: usize,
     block_col: usize,
     scale_cols: usize,
+    bytes_per_scale: usize,
 ) -> crate::Result<f32> {
     let scale_idx = block_row
         .checked_mul(scale_cols)
@@ -144,13 +146,14 @@ fn load_scale(
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "scale index overflow".into(),
         })?;
-    let byte_offset = scale_idx
-        .checked_mul(4)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "scale byte offset overflow".into(),
-        })?;
+    let byte_offset =
+        scale_idx
+            .checked_mul(bytes_per_scale)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "scale byte offset overflow".into(),
+            })?;
     let end = byte_offset
-        .checked_add(4)
+        .checked_add(bytes_per_scale)
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "scale byte range overflow".into(),
         })?;
@@ -162,11 +165,29 @@ fn load_scale(
                 scale_data.len()
             ),
         })?;
-    // The slice is exactly 4 bytes; convert to a fixed-size array.
-    let arr: [u8; 4] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-        reason: "scale slice is not 4 bytes".into(),
-    })?;
-    Ok(f32::from_le_bytes(arr))
+    match bytes_per_scale {
+        4 => {
+            let arr: [u8; 4] = slice.try_into().map_err(|_| AnamnesisError::Parse {
+                reason: "scale slice is not 4 bytes".into(),
+            })?;
+            Ok(f32::from_le_bytes(arr))
+        }
+        2 => {
+            let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
+                reason: "scale slice is not 2 bytes".into(),
+            })?;
+            // BITWISE: interpret 2 LE bytes as BF16, expand to f32 by shifting
+            // mantissa+exponent into the upper 16 bits of an f32
+            // CAST: u16 → u32, lossless widening for BF16-to-f32 expansion
+            // BITWISE: interpret 2 LE bytes as BF16, expand to f32 by shifting
+            // mantissa+exponent into the upper 16 bits of an f32
+            let f32_bits = u32::from(u16::from_le_bytes(arr)) << 16;
+            Ok(f32::from_bits(f32_bits))
+        }
+        _ => Err(AnamnesisError::Parse {
+            reason: format!("unsupported scale element size: {bytes_per_scale} bytes"),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,10 +202,11 @@ fn load_scale(
 /// # Arguments
 ///
 /// * `weight_data` — raw `F8_E4M3` bytes in row-major order (1 byte per element).
-/// * `scale_data` — raw `F32` scale factors in row-major order, little-endian
-///   (4 bytes per scale element). Shape: `[⌈rows/128⌉, ⌈cols/128⌉]`.
+/// * `scale_data` — raw scale factors in row-major order, little-endian.
+///   Shape: `[⌈rows/128⌉, ⌈cols/128⌉]`.
 /// * `rows` — number of rows in the weight tensor.
 /// * `cols` — number of columns in the weight tensor.
+/// * `scale_dtype` — dtype of the scale tensor (`F32` or `BF16`).
 ///
 /// # Returns
 ///
@@ -195,8 +217,8 @@ fn load_scale(
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `weight_data` length does not match
-/// `rows × cols`, or if `scale_data` length does not match
-/// `⌈rows/128⌉ × ⌈cols/128⌉ × 4`.
+/// `rows × cols`, or if `scale_data` is incompatible with the weight
+/// dimensions and block size.
 ///
 /// # Memory
 ///
@@ -207,8 +229,16 @@ pub fn dequantize_fp8_to_bf16(
     scale_data: &[u8],
     rows: usize,
     cols: usize,
+    scale_dtype: Dtype,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
+    let bytes_per_scale = scale_dtype.byte_size();
+    if bytes_per_scale == 0 {
+        return Err(AnamnesisError::Parse {
+            reason: format!("unsupported scale dtype: {scale_dtype}"),
+        });
+    }
+
     let expected_weight_len = rows
         .checked_mul(cols)
         .ok_or_else(|| AnamnesisError::Parse {
@@ -223,25 +253,32 @@ pub fn dequantize_fp8_to_bf16(
         });
     }
 
-    let scale_rows = rows.div_ceil(BLOCK_SIZE);
-    let scale_cols = cols.div_ceil(BLOCK_SIZE);
-    let scale_elements =
-        scale_rows
-            .checked_mul(scale_cols)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "scale dimension overflow".into(),
-            })?;
-    let expected_scale_len =
-        scale_elements
-            .checked_mul(4)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "scale byte count overflow".into(),
-            })?;
-    if scale_data.len() != expected_scale_len {
+    // Derive scale grid dimensions from the actual scale tensor data.
+    // The scale tensor may be stored as 2D [scale_rows, scale_cols] or
+    // 1D [scale_rows * scale_cols] — either way, the byte count tells us
+    // the total number of scale elements.
+    if !scale_data.len().is_multiple_of(bytes_per_scale) {
         return Err(AnamnesisError::Parse {
             reason: format!(
-                "scale data length {} != expected {expected_scale_len}",
+                "scale data length {} is not a multiple of {bytes_per_scale} ({scale_dtype})",
                 scale_data.len()
+            ),
+        });
+    }
+    let scale_elements = scale_data.len() / bytes_per_scale;
+    let scale_rows = rows.div_ceil(BLOCK_SIZE);
+    if scale_rows == 0 {
+        return Err(AnamnesisError::Parse {
+            reason: "zero rows".into(),
+        });
+    }
+    let scale_cols = scale_elements / scale_rows;
+    let col_blocks_needed = cols.div_ceil(BLOCK_SIZE);
+    if scale_cols < col_blocks_needed {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "scale has {scale_cols} column blocks but weight needs {col_blocks_needed} \
+                 (cols={cols}, block_size={BLOCK_SIZE})"
             ),
         });
     }
@@ -282,7 +319,13 @@ pub fn dequantize_fp8_to_bf16(
 
         // VECTORIZED: pending verification with cargo-show-asm
         for (block_col, w_chunk) in full_blocks.enumerate() {
-            let scale = load_scale(scale_data, block_row, block_col, scale_cols)?;
+            let scale = load_scale(
+                scale_data,
+                block_row,
+                block_col,
+                scale_cols,
+                bytes_per_scale,
+            )?;
             let o_start = block_col * BLOCK_SIZE * 2;
             let o_chunk = row_o
                 .get_mut(o_start..o_start + BLOCK_SIZE * 2)
@@ -300,7 +343,13 @@ pub fn dequantize_fp8_to_bf16(
         // Edge column block (< 128 columns)
         if !remainder_w.is_empty() {
             let last_block_col = cols / BLOCK_SIZE;
-            let scale = load_scale(scale_data, block_row, last_block_col, scale_cols)?;
+            let scale = load_scale(
+                scale_data,
+                block_row,
+                last_block_col,
+                scale_cols,
+                bytes_per_scale,
+            )?;
             let o_start = last_block_col * BLOCK_SIZE * 2;
             let o_chunk = row_o
                 .get_mut(o_start..o_start + remainder_w.len() * 2)
@@ -563,7 +612,8 @@ mod tests {
         let weight_data = vec![0x38u8; rows * cols];
         let scale_data = make_scale_bytes(&[2.0]);
 
-        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols).unwrap();
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F32).unwrap();
 
         assert_eq!(output.len(), rows * cols * 2);
         // Every BF16 element should be 2.0 (0x4000 in LE = [0x00, 0x40])
@@ -581,7 +631,8 @@ mod tests {
         let scales = [1.0_f32, 2.0, 3.0, 4.0]; // 2×2 scale grid
         let scale_data = make_scale_bytes(&scales);
 
-        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols).unwrap();
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F32).unwrap();
 
         // Check a sample element from each block
         // Block (0,0) at position (0,0): scale=1.0, expect BF16(1.0)=0x3F80
@@ -605,7 +656,8 @@ mod tests {
         let scales = [1.0_f32, 2.0, 3.0, 4.0];
         let scale_data = make_scale_bytes(&scales);
 
-        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols).unwrap();
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F32).unwrap();
         assert_eq!(output.len(), rows * cols * 2);
 
         // Block (0,0): position (0,0), scale=1.0 → BF16(1.0)
@@ -621,7 +673,7 @@ mod tests {
         let weight_data = vec![0x38u8]; // 1.0
         let scale_data = make_scale_bytes(&[3.0]);
 
-        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, 1, 1).unwrap();
+        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, 1, 1, Dtype::F32).unwrap();
         assert_eq!(output.len(), 2);
         // 1.0 × 3.0 = 3.0 → BF16 0x4040 → LE [0x40, 0x40]
         assert_eq!(&output[..], &[0x40, 0x40]);
@@ -632,7 +684,7 @@ mod tests {
         let weight_data = vec![0x40u8; 128]; // all 2.0 in E4M3
         let scale_data = make_scale_bytes(&[0.5]);
 
-        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, 1, 128).unwrap();
+        let output = dequantize_fp8_to_bf16(&weight_data, &scale_data, 1, 128, Dtype::F32).unwrap();
         // 2.0 × 0.5 = 1.0 → BF16 0x3F80 → LE [0x80, 0x3F]
         for chunk in output.chunks_exact(2) {
             assert_eq!(chunk, &[0x80, 0x3F]);
@@ -643,21 +695,32 @@ mod tests {
 
     #[test]
     fn validation_weight_length_mismatch() {
-        let result = dequantize_fp8_to_bf16(&[0u8; 10], &[0u8; 4], 2, 6);
+        let result = dequantize_fp8_to_bf16(&[0u8; 10], &[0u8; 4], 2, 6, Dtype::F32);
         assert!(result.is_err());
     }
 
     #[test]
-    fn validation_scale_length_mismatch() {
-        let result = dequantize_fp8_to_bf16(&[0u8; 4], &[0u8; 8], 2, 2);
+    fn validation_scale_not_multiple_of_4() {
+        // Scale data must be a multiple of 4 bytes (f32 elements).
+        let result = dequantize_fp8_to_bf16(&[0u8; 4], &[0u8; 5], 2, 2, Dtype::F32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validation_scale_too_small() {
+        // 256×256 weight needs ceil(256/128)=2 column blocks, but scale
+        // only provides 1 column block (1 element for 1 scale_row).
+        let weight = vec![0u8; 256 * 256];
+        let scale = vec![0u8; 4]; // 1 f32 element, scale_cols = 1/2 = 0
+        let result = dequantize_fp8_to_bf16(&weight, &scale, 256, 256, Dtype::F32);
         assert!(result.is_err());
     }
 
     #[test]
     fn validation_zero_dimensions() {
-        // 0×0 is valid: empty input, empty output
-        let result = dequantize_fp8_to_bf16(&[], &[], 0, 0).unwrap();
-        assert!(result.is_empty());
+        // 0×0 triggers "zero rows" error.
+        let result = dequantize_fp8_to_bf16(&[], &[], 0, 0, Dtype::F32);
+        assert!(result.is_err());
     }
 
     // -- dequantize_per_tensor_fp8_to_bf16 -----------------------------------
