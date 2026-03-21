@@ -337,7 +337,8 @@ pub fn dequantize_fp8_to_bf16(
         let full_blocks = row_w.chunks_exact(BLOCK_SIZE);
         let remainder_w = full_blocks.remainder();
 
-        // VECTORIZED: pending verification with cargo-show-asm
+        // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
+        // (target-cpu=native) in cargo-show-asm, x86-64, opt-level=3
         for (block_col, w_chunk) in full_blocks.enumerate() {
             let scale = load_scale(scale_data, block_row, block_col, scale_cols, scale_dtype)?;
             let o_start = block_col * BLOCK_SIZE * 2;
@@ -410,7 +411,8 @@ pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> Vec<
     let out_byte_len = weight_data.len() * 2;
     let mut output = vec![0u8; out_byte_len];
 
-    // VECTORIZED: pending verification with cargo-show-asm
+    // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
+    // (target-cpu=native) in cargo-show-asm, x86-64, opt-level=3.
     // Scale is hoisted (single value for the entire tensor).
     // Flat iteration over all bytes — the compiler sees a single contiguous
     // loop with no aliasing between input (&[u8]) and output (&mut [u8]).
@@ -488,7 +490,8 @@ pub fn dequantize_per_channel_fp8_to_bf16(
         })?;
     let mut output = vec![0u8; out_byte_len];
 
-    // VECTORIZED: pending verification with cargo-show-asm
+    // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
+    // (target-cpu=native) in cargo-show-asm, x86-64, opt-level=3.
     // Per-row iteration: scale is hoisted per row, inner loop over cols.
     for r in 0..rows {
         let scale_offset = r * bps;
