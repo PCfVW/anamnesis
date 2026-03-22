@@ -16,6 +16,8 @@ use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
     parse_safetensors_header, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
 };
+#[cfg(feature = "awq")]
+use crate::remember::awq::dequantize_awq_to_bf16;
 use crate::remember::fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
@@ -445,6 +447,74 @@ impl ParsedModel {
                                 detail: "GPTQ dequantization requires the `gptq` feature".into(),
                             });
                         }
+                        #[cfg(feature = "awq")]
+                        QuantScheme::Awq => {
+                            let config =
+                                self.header
+                                    .awq_config
+                                    .ok_or_else(|| AnamnesisError::Parse {
+                                        reason: format!(
+                                            "AWQ config not available for `{}`",
+                                            entry.name
+                                        ),
+                                    })?;
+                            let companions = self
+                                .header
+                                .find_awq_companions(&entry.name)
+                                .ok_or_else(|| AnamnesisError::Parse {
+                                    reason: format!(
+                                        "AWQ companions not found for `{}`",
+                                        entry.name
+                                    ),
+                                })?;
+
+                            let scales_data = self.tensor_data(
+                                companions.scales.data_offsets.0,
+                                companions.scales.data_offsets.1,
+                            )?;
+                            let qzeros_data = self.tensor_data(
+                                companions.qzeros.data_offsets.0,
+                                companions.qzeros.data_offsets.1,
+                            )?;
+
+                            // Derive in_features and out_features from qweight + scales shapes.
+                            // AWQ qweight: [in_features, out_features/pack_factor]
+                            // scales: [num_groups, out_features]
+                            let in_features = entry.shape.first().copied().ok_or_else(|| {
+                                AnamnesisError::Parse {
+                                    reason: "AWQ qweight has no first dimension".into(),
+                                }
+                            })?;
+                            let out_features =
+                                companions.scales.shape.last().copied().ok_or_else(|| {
+                                    AnamnesisError::Parse {
+                                        reason: "AWQ scales has no last dimension".into(),
+                                    }
+                                })?;
+
+                            let bf16_data = dequantize_awq_to_bf16(
+                                weight_data,
+                                scales_data,
+                                qzeros_data,
+                                in_features,
+                                out_features,
+                                config.group_size,
+                                config.bits,
+                                companions.scales.dtype,
+                            )?;
+
+                            // Output tensor: strip ".qweight" suffix, use ".weight".
+                            let output_name = entry.name.strip_suffix(".qweight").map_or_else(
+                                || entry.name.clone(),
+                                |base| format!("{base}.weight"),
+                            );
+                            let output_shape = vec![in_features, out_features];
+
+                            dequantized_data.push((output_name, bf16_data, output_shape));
+                            on_tensor();
+                            continue;
+                        }
+                        #[cfg(not(feature = "awq"))]
                         QuantScheme::Awq => {
                             return Err(AnamnesisError::Unsupported {
                                 format: "AWQ".into(),
