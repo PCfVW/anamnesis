@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Added unit tests for `dequantize_per_channel_fp8_to_bf16` covering F32, BF16,
+  and F16 scale dtypes, single-row, NaN handling, and validation errors
+- Added fine-grained dequantization tests for all three scale dtypes (F32, BF16,
+  F16) and multi-block F32 scale path
+- Added CLI integration tests (`tests/cli.rs`) — 9 tests covering `parse`,
+  `inspect`/`info`, `remember`/`dequantize`, error handling, and `--version`
+- Documented single-scheme assumption in `detect_scheme` (all quantized tensors
+  in a file use the same scheme; early-return on first scale companion found)
+- CLI `parse` subcommand now displays the actual scale dtype (BF16, F16, F32)
+  instead of always printing "F32"
+- `inspect` Display now shows the actual scale dtype instead of hardcoded "F32"
+- `dequantize_per_tensor_fp8_to_bf16` now uses `checked_mul` for output size,
+  consistent with the other two dequantize functions (**breaking**: returns
+  `Result<Vec<u8>>` instead of `Vec<u8>`)
+- Fine-grained dequantization now validates that the scale grid is rectangular
+  (rejects `scale_elements % scale_rows != 0` instead of silently truncating)
+- `serialize_to_file` I/O errors now surface as `AnamnesisError::Io` instead of
+  being misclassified as `AnamnesisError::Parse`
+- `derive_output_path` now matches `TargetDtype` exhaustively instead of using a
+  wildcard that would silently produce broken paths for future variants
+- Simplified `shape_to_rows_cols` 2D arm: direct indexing with `// INDEX:`
+  annotation instead of redundant `Option` unwrapping
+
+### Added
+
+- `FromStr` impl for `TargetDtype` — centralizes string-to-enum parsing so new
+  variants cannot be silently missed in the CLI
+- `ParsedModel::remember_with_progress()` — dequantize with a per-tensor
+  callback, enabling progress reporting in CLI contexts
+- `indicatif` progress bar during `remember`/`dequantize` when built with the
+  `indicatif` feature (`amn remember` shows `[====================] 2.1s`)
+
 ## [0.1.0] — FP8 Dequantization
 
 ### Added

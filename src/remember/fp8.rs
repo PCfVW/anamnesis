@@ -292,6 +292,15 @@ pub fn dequantize_fp8_to_bf16(
             reason: "zero rows".into(),
         });
     }
+    if !scale_elements.is_multiple_of(scale_rows) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "scale grid is not rectangular: {scale_elements} elements / {scale_rows} rows \
+                 has remainder {}",
+                scale_elements % scale_rows
+            ),
+        });
+    }
     let scale_cols = scale_elements / scale_rows;
     let col_blocks_needed = cols.div_ceil(BLOCK_SIZE);
     if scale_cols < col_blocks_needed {
@@ -402,13 +411,21 @@ pub fn dequantize_fp8_to_bf16(
 /// A `Vec<u8>` of length `weight_data.len() × 2`, containing `BF16` values
 /// in little-endian byte order.
 ///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the output size overflows.
+///
 /// # Memory
 ///
 /// Allocates a single output buffer of `weight_data.len() × 2` bytes.
 /// Peak memory is input + output (~3× the `FP8` weight size).
-#[must_use]
-pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> Vec<u8> {
-    let out_byte_len = weight_data.len() * 2;
+pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> crate::Result<Vec<u8>> {
+    let out_byte_len = weight_data
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "output size overflow".into(),
+        })?;
     let mut output = vec![0u8; out_byte_len];
 
     // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
@@ -421,7 +438,7 @@ pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> Vec<
         out_pair.copy_from_slice(&bf16.to_le_bytes());
     }
 
-    output
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +550,9 @@ pub fn dequantize_per_channel_fp8_to_bf16(
     clippy::panic,
     clippy::indexing_slicing,
     clippy::unwrap_used,
-    clippy::float_cmp
+    clippy::float_cmp,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation
 )]
 mod tests {
     use super::*;
@@ -845,7 +864,7 @@ mod tests {
     fn per_tensor_all_ones_scale_one() {
         // 128 elements of 1.0 in E4M3 (0x38), scale=1.0
         let weight = vec![0x38u8; 128];
-        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 1.0);
+        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 1.0).unwrap();
         assert_eq!(output.len(), 256);
         for chunk in output.chunks_exact(2) {
             assert_eq!(chunk, &[0x80, 0x3F]); // BF16 1.0
@@ -856,7 +875,7 @@ mod tests {
     fn per_tensor_scale_two() {
         // 1.0 × 2.0 = 2.0
         let weight = vec![0x38u8; 64];
-        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 2.0);
+        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 2.0).unwrap();
         for chunk in output.chunks_exact(2) {
             assert_eq!(chunk, &[0x00, 0x40]); // BF16 2.0
         }
@@ -866,7 +885,7 @@ mod tests {
     fn per_tensor_non_aligned_length() {
         // 130 elements — tests remainder handling (128 + 2)
         let weight = vec![0x40u8; 130]; // 2.0 in E4M3
-        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 0.5);
+        let output = dequantize_per_tensor_fp8_to_bf16(&weight, 0.5).unwrap();
         assert_eq!(output.len(), 260);
         // 2.0 × 0.5 = 1.0
         for chunk in output.chunks_exact(2) {
@@ -876,22 +895,235 @@ mod tests {
 
     #[test]
     fn per_tensor_single_element() {
-        let output = dequantize_per_tensor_fp8_to_bf16(&[0x38], 3.0);
+        let output = dequantize_per_tensor_fp8_to_bf16(&[0x38], 3.0).unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(&output[..], &[0x40, 0x40]); // BF16 3.0
     }
 
     #[test]
     fn per_tensor_empty() {
-        let output = dequantize_per_tensor_fp8_to_bf16(&[], 1.0);
+        let output = dequantize_per_tensor_fp8_to_bf16(&[], 1.0).unwrap();
         assert!(output.is_empty());
     }
 
     #[test]
     fn per_tensor_nan_preserved() {
-        let output = dequantize_per_tensor_fp8_to_bf16(&[0x7F], 42.0);
+        let output = dequantize_per_tensor_fp8_to_bf16(&[0x7F], 42.0).unwrap();
         let bf16_bits = u16::from_le_bytes([output[0], output[1]]);
         let f = f32::from_bits(u32::from(bf16_bits) << 16);
         assert!(f.is_nan());
+    }
+
+    // -- dequantize_per_channel_fp8_to_bf16 -----------------------------------
+
+    /// Helper: build BF16 scale data from a slice of f32 values.
+    fn make_bf16_scale_bytes(scales: &[f32]) -> Vec<u8> {
+        // BITWISE: f32 → BF16 by taking upper 16 bits (no rounding for exact values)
+        scales
+            .iter()
+            .flat_map(|s| ((s.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    /// Helper: build F16 scale data from a slice of f32 values.
+    fn make_f16_scale_bytes(scales: &[f32]) -> Vec<u8> {
+        scales
+            .iter()
+            .flat_map(|s| half::f16::from_f32(*s).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn per_channel_basic_f32_scale() {
+        // 2 rows × 4 cols, each row has its own F32 scale
+        let rows = 2;
+        let cols = 4;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+                                                     // Row 0: scale=2.0, Row 1: scale=3.0
+        let scale_data = make_scale_bytes(&[2.0, 3.0]);
+
+        let output =
+            dequantize_per_channel_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F32)
+                .unwrap();
+
+        assert_eq!(output.len(), rows * cols * 2);
+        // Row 0: 1.0 × 2.0 = 2.0 → BF16 [0x00, 0x40]
+        for chunk in output[..cols * 2].chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40], "row 0: expected BF16 2.0");
+        }
+        // Row 1: 1.0 × 3.0 = 3.0 → BF16 [0x40, 0x40]
+        for chunk in output[cols * 2..].chunks_exact(2) {
+            assert_eq!(chunk, &[0x40, 0x40], "row 1: expected BF16 3.0");
+        }
+    }
+
+    #[test]
+    fn per_channel_bf16_scale() {
+        // 2 rows × 4 cols, BF16 scale factors
+        let rows = 2;
+        let cols = 4;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+        let scale_data = make_bf16_scale_bytes(&[2.0, 3.0]);
+
+        let output =
+            dequantize_per_channel_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::BF16)
+                .unwrap();
+
+        assert_eq!(output.len(), rows * cols * 2);
+        // Row 0: 1.0 × 2.0 = 2.0
+        for chunk in output[..cols * 2].chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40], "row 0: expected BF16 2.0");
+        }
+        // Row 1: 1.0 × 3.0 = 3.0
+        for chunk in output[cols * 2..].chunks_exact(2) {
+            assert_eq!(chunk, &[0x40, 0x40], "row 1: expected BF16 3.0");
+        }
+    }
+
+    #[test]
+    fn per_channel_f16_scale() {
+        // 2 rows × 4 cols, F16 scale factors
+        let rows = 2;
+        let cols = 4;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+        let scale_data = make_f16_scale_bytes(&[2.0, 3.0]);
+
+        let output =
+            dequantize_per_channel_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F16)
+                .unwrap();
+
+        assert_eq!(output.len(), rows * cols * 2);
+        // Row 0: 1.0 × 2.0 = 2.0
+        for chunk in output[..cols * 2].chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40], "row 0: expected BF16 2.0");
+        }
+        // Row 1: 1.0 × 3.0 = 3.0
+        for chunk in output[cols * 2..].chunks_exact(2) {
+            assert_eq!(chunk, &[0x40, 0x40], "row 1: expected BF16 3.0");
+        }
+    }
+
+    #[test]
+    fn per_channel_single_row() {
+        let weight_data = vec![0x40u8; 128]; // 128 elements of 2.0 in E4M3
+        let scale_data = make_scale_bytes(&[0.5]); // F32 scale = 0.5
+
+        let output =
+            dequantize_per_channel_fp8_to_bf16(&weight_data, &scale_data, 1, 128, Dtype::F32)
+                .unwrap();
+
+        // 2.0 × 0.5 = 1.0 → BF16 [0x80, 0x3F]
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x80, 0x3F]);
+        }
+    }
+
+    #[test]
+    fn per_channel_nan_preserved() {
+        // NaN element (0x7F) should stay NaN regardless of scale
+        let weight_data = vec![0x7F]; // NaN in E4M3
+        let scale_data = make_scale_bytes(&[42.0]);
+
+        let output =
+            dequantize_per_channel_fp8_to_bf16(&weight_data, &scale_data, 1, 1, Dtype::F32)
+                .unwrap();
+
+        let bf16_bits = u16::from_le_bytes([output[0], output[1]]);
+        let f = f32::from_bits(u32::from(bf16_bits) << 16);
+        assert!(f.is_nan());
+    }
+
+    #[test]
+    fn per_channel_validation_weight_mismatch() {
+        // weight length doesn't match rows × cols
+        let result = dequantize_per_channel_fp8_to_bf16(&[0u8; 10], &[0u8; 8], 2, 6, Dtype::F32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn per_channel_validation_scale_mismatch() {
+        // scale length doesn't match rows × bytes_per_scale
+        let result = dequantize_per_channel_fp8_to_bf16(&[0u8; 8], &[0u8; 2], 2, 4, Dtype::F32);
+        assert!(result.is_err());
+    }
+
+    // -- Fine-grained with non-F32 scale dtypes -------------------------------
+
+    #[test]
+    fn fine_grained_bf16_scale() {
+        // 128×128 block with BF16 scale = 2.0
+        let rows = 128;
+        let cols = 128;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+        let scale_data = make_bf16_scale_bytes(&[2.0]);
+
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::BF16).unwrap();
+
+        assert_eq!(output.len(), rows * cols * 2);
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
+        }
+    }
+
+    #[test]
+    fn fine_grained_f32_scale() {
+        // 128×128 block with F32 scale — already tested by single_block_128x128,
+        // but this explicitly names the gap: F32 scale path for fine-grained.
+        let rows = 128;
+        let cols = 128;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+        let scale_data = make_scale_bytes(&[3.0]);
+
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F32).unwrap();
+
+        assert_eq!(output.len(), rows * cols * 2);
+        // 1.0 × 3.0 = 3.0 → BF16 [0x40, 0x40]
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x40, 0x40], "expected BF16 3.0");
+        }
+    }
+
+    #[test]
+    fn fine_grained_f16_scale() {
+        // 128×128 block with F16 scale = 2.0
+        let rows = 128;
+        let cols = 128;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+        let scale_data = make_f16_scale_bytes(&[2.0]);
+
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F16).unwrap();
+
+        assert_eq!(output.len(), rows * cols * 2);
+        for chunk in output.chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
+        }
+    }
+
+    #[test]
+    fn fine_grained_f32_multi_block() {
+        // 256×256 with F32 scales — 2×2 block grid, verifying F32 scale path
+        // across multiple blocks
+        let rows = 256;
+        let cols = 256;
+        let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
+        let scales = [1.0_f32, 4.0, 2.0, 8.0];
+        let scale_data = make_scale_bytes(&scales);
+
+        let output =
+            dequantize_fp8_to_bf16(&weight_data, &scale_data, rows, cols, Dtype::F32).unwrap();
+
+        // Block (0,0): scale=1.0 → BF16(1.0)=0x3F80
+        assert_eq!(&output[0..2], &[0x80, 0x3F]);
+        // Block (0,1): scale=4.0 → BF16(4.0)=0x4080
+        assert_eq!(&output[256..258], &[0x80, 0x40]);
+        // Block (1,0): scale=2.0 → BF16(2.0)=0x4000
+        let offset_10 = 128 * 256 * 2;
+        assert_eq!(&output[offset_10..offset_10 + 2], &[0x00, 0x40]);
+        // Block (1,1): scale=8.0 → BF16(8.0)=0x4100
+        let offset_11 = offset_10 + 128 * 2;
+        assert_eq!(&output[offset_11..offset_11 + 2], &[0x00, 0x41]);
     }
 }

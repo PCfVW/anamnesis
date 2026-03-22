@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 
 use crate::error::AnamnesisError;
 use crate::inspect::InspectInfo;
@@ -31,6 +32,26 @@ impl fmt::Display for TargetDtype {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BF16 => f.write_str("BF16"),
+        }
+    }
+}
+
+impl FromStr for TargetDtype {
+    type Err = AnamnesisError;
+
+    /// Parses a target dtype from a case-insensitive string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if the string does not match
+    /// a known target dtype.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "bf16" => Ok(Self::BF16),
+            other => Err(AnamnesisError::Unsupported {
+                format: other.to_owned(),
+                detail: "supported target dtypes: bf16".to_owned(),
+            }),
         }
     }
 }
@@ -178,15 +199,9 @@ impl ParsedModel {
                 ),
             }),
             2 => {
-                // shape.len() == 2 guaranteed by match arm
-                let rows = shape.first().copied();
-                let cols = shape.get(1).copied();
-                match (rows, cols) {
-                    (Some(r), Some(c)) => Ok((r, c)),
-                    _ => Err(AnamnesisError::Parse {
-                        reason: "2D shape missing elements".into(),
-                    }),
-                }
+                // INDEX: shape.len() == 2 guaranteed by match arm
+                #[allow(clippy::indexing_slicing)]
+                Ok((shape[0], shape[1]))
             }
             _ => {
                 // shape.len() >= 3 guaranteed by match arms above
@@ -238,8 +253,45 @@ impl ParsedModel {
         }
     }
 
-    /// Internal: dequantize to `BF16` and write.
+    /// Dequantizes all quantized tensors with per-tensor progress reporting,
+    /// and writes a standard `.safetensors` file loadable by any Rust ML
+    /// framework.
+    ///
+    /// Behaves identically to [`remember`](Self::remember), but calls
+    /// `on_tensor` after each quantized tensor is dequantized. Use this to
+    /// drive a progress bar in CLI contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
+    /// shapes are inconsistent.
+    /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
+    /// is not yet implemented.
+    /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    pub fn remember_with_progress<F>(
+        &self,
+        output_path: impl AsRef<Path>,
+        target: TargetDtype,
+        on_tensor: F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(),
+    {
+        match target {
+            TargetDtype::BF16 => self.remember_bf16_inner(output_path.as_ref(), on_tensor),
+        }
+    }
+
+    /// Internal: dequantize to `BF16` and write (no progress callback).
     fn remember_bf16(&self, output_path: &Path) -> crate::Result<()> {
+        self.remember_bf16_inner(output_path, || {})
+    }
+
+    /// Internal: dequantize to `BF16` and write, with optional progress callback.
+    fn remember_bf16_inner<F>(&self, output_path: &Path, mut on_tensor: F) -> crate::Result<()>
+    where
+        F: FnMut(),
+    {
         // Collect dequantized data (owned) for quantized tensors.
         // Passthrough tensors borrow from self.buffer.
         let mut dequantized_data: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
@@ -311,7 +363,7 @@ impl ParsedModel {
                             } else {
                                 1.0
                             };
-                            dequantize_per_tensor_fp8_to_bf16(weight_data, scale)
+                            dequantize_per_tensor_fp8_to_bf16(weight_data, scale)?
                         }
                         QuantScheme::Unquantized => {
                             // Shouldn't have quantized tensors in an unquantized model,
@@ -322,6 +374,7 @@ impl ParsedModel {
                     };
 
                     dequantized_data.push((entry.name.clone(), bf16_bytes, entry.shape.clone()));
+                    on_tensor();
                 }
                 TensorRole::Scale => {
                     // Scale tensors are consumed during dequantization; skip.
@@ -367,11 +420,17 @@ impl ParsedModel {
 
         // Serialize to file.
         let metadata = self.header.metadata.clone();
-        safetensors::tensor::serialize_to_file(views, &metadata, output_path).map_err(|e| {
-            AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {e}"),
-            }
-        })?;
+        safetensors::tensor::serialize_to_file(views, &metadata, output_path).map_err(
+            // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
+            // we extract IoError and treat everything else as a parse/format error.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            |e| match e {
+                safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
+                other => AnamnesisError::Parse {
+                    reason: format!("failed to write safetensors file: {other}"),
+                },
+            },
+        )?;
 
         Ok(())
     }

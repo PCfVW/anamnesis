@@ -176,6 +176,7 @@ fn run_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         1 => {
             let scale = read_scalar_scale(&fixture.scale_data, fixture.scale_dtype);
             dequantize_per_tensor_fp8_to_bf16(&fixture.weight_data, scale)
+                .expect("per-tensor dequant failed")
         }
         2 => dequantize_per_channel_fp8_to_bf16(
             &fixture.weight_data,

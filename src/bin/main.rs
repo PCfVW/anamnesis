@@ -66,7 +66,15 @@ fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
 
     let scales = model.header.scale_count();
     if scales > 0 {
-        println!("  {scales:>3} scale       F32");
+        let mut dtypes: Vec<String> = Vec::new();
+        for entry in model.header.scale_tensors() {
+            let s = entry.dtype.to_string();
+            if !dtypes.contains(&s) {
+                dtypes.push(s);
+            }
+        }
+        let dtype_list = dtypes.join(", ");
+        println!("  {scales:>3} scale       {dtype_list}");
     }
 
     let passthrough = model.header.passthrough_count();
@@ -99,15 +107,7 @@ fn run_remember(
     to: &str,
     output: Option<&std::path::Path>,
 ) -> anamnesis::Result<()> {
-    let target = match to {
-        "bf16" => TargetDtype::BF16,
-        other => {
-            return Err(anamnesis::AnamnesisError::Unsupported {
-                format: other.to_owned(),
-                detail: "supported target dtypes: bf16".to_owned(),
-            });
-        }
-    };
+    let target: TargetDtype = to.parse()?;
 
     let model = parse(path)?;
     let info = InspectInfo::from(&model.header);
@@ -121,8 +121,27 @@ fn run_remember(
         None => derive_output_path(path, target),
     };
 
-    println!("Recalling... {quantized} tensors");
-    model.remember(&output_path, target)?;
+    #[cfg(feature = "indicatif")]
+    {
+        use indicatif::{ProgressBar, ProgressStyle};
+
+        // CAST: usize → u64, tensor count fits in u64
+        #[allow(clippy::as_conversions)]
+        let pb = ProgressBar::new(quantized as u64);
+        let style = ProgressStyle::with_template("Recalling... {pos} tensors [{bar:20}] {elapsed}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> ");
+        pb.set_style(style);
+        model.remember_with_progress(&output_path, target, || pb.inc(1))?;
+        pb.finish();
+        println!();
+    }
+
+    #[cfg(not(feature = "indicatif"))]
+    {
+        println!("Recalling... {quantized} tensors");
+        model.remember(&output_path, target)?;
+    }
 
     println!(
         "Output: {} ({})",
@@ -141,10 +160,7 @@ fn derive_output_path(input: &std::path::Path, target: TargetDtype) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
-    let suffix = match target {
-        TargetDtype::BF16 => "bf16",
-        _ => "unknown",
-    };
+    let suffix = target.to_string().to_lowercase();
 
     // Strip known quantization suffixes before appending target.
     let clean_stem = stem

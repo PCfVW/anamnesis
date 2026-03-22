@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::parse::safetensors::{QuantScheme, SafetensorsHeader, TensorRole};
+use crate::parse::safetensors::{Dtype, QuantScheme, SafetensorsHeader, TensorRole};
 
 /// Summary information produced by inspecting a parsed `.safetensors` file.
 ///
@@ -19,6 +19,8 @@ pub struct InspectInfo {
     pub scales: usize,
     /// Number of passthrough tensors (norms, embeddings, `lm_head`).
     pub passthrough: usize,
+    /// Unique dtypes of scale factor tensors, in order of first occurrence.
+    pub scale_dtypes: Vec<Dtype>,
     /// Total tensor data size in bytes (as stored in the file).
     pub current_size: u64,
     /// Estimated tensor data size in bytes after dequantization to `BF16`.
@@ -41,6 +43,13 @@ impl From<&SafetensorsHeader> for InspectInfo {
         let quantized = header.quantized_count();
         let scales = header.scale_count();
         let passthrough = header.passthrough_count();
+
+        let mut scale_dtypes: Vec<Dtype> = Vec::new();
+        for entry in header.scale_tensors() {
+            if !scale_dtypes.contains(&entry.dtype) {
+                scale_dtypes.push(entry.dtype);
+            }
+        }
 
         let mut current_size: u64 = 0;
         let mut dequantized_size: u64 = 0;
@@ -74,6 +83,7 @@ impl From<&SafetensorsHeader> for InspectInfo {
             quantized,
             scales,
             passthrough,
+            scale_dtypes,
             current_size,
             dequantized_size,
         }
@@ -85,9 +95,15 @@ impl fmt::Display for InspectInfo {
         write!(f, "Format:      {}", self.format)?;
 
         if self.scales > 0 {
+            let dtype_list: String = self
+                .scale_dtypes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
             write!(
                 f,
-                "\nQuantized:   {} tensors (weights) + {} scale tensors (F32)",
+                "\nQuantized:   {} tensors (weights) + {} scale tensors ({dtype_list})",
                 self.quantized, self.scales,
             )?;
         } else {
@@ -146,7 +162,7 @@ pub fn format_bytes(bytes: u64) -> String {
 #[allow(clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::parse::safetensors::{Dtype, TensorEntry};
+    use crate::parse::safetensors::TensorEntry;
 
     fn make_entry(name: &str, dtype: Dtype, role: TensorRole, shape: &[usize]) -> TensorEntry {
         let num_elements: usize = shape.iter().product();
@@ -299,6 +315,7 @@ mod tests {
             quantized: 224,
             scales: 0,
             passthrough: 53,
+            scale_dtypes: vec![],
             current_size: 4_672 * 1024 * 1024,
             dequantized_size: 8_269 * 1024 * 1024,
         };
@@ -318,6 +335,7 @@ mod tests {
             quantized: 180,
             scales: 180,
             passthrough: 31,
+            scale_dtypes: vec![Dtype::F32],
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
         };
@@ -330,12 +348,30 @@ mod tests {
     }
 
     #[test]
+    fn display_fine_grained_fp8_bf16_scales() {
+        let info = InspectInfo {
+            format: QuantScheme::FineGrainedFp8,
+            quantized: 180,
+            scales: 180,
+            passthrough: 31,
+            scale_dtypes: vec![Dtype::BF16],
+            current_size: 1_310 * 1024 * 1024,
+            dequantized_size: 2_580 * 1024 * 1024,
+        };
+        let output = info.to_string();
+
+        assert!(output.contains("180 scale tensors (BF16)"));
+        assert!(!output.contains("(F32)"));
+    }
+
+    #[test]
     fn display_unquantized_omits_lethe() {
         let info = InspectInfo {
             format: QuantScheme::Unquantized,
             quantized: 0,
             scales: 0,
             passthrough: 100,
+            scale_dtypes: vec![],
             current_size: 1024 * 1024 * 1024,
             dequantized_size: 1024 * 1024 * 1024,
         };

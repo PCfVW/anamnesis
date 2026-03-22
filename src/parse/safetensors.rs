@@ -220,6 +220,12 @@ impl fmt::Display for QuantScheme {
 
 /// Detect the quantization scheme from a list of classified tensor entries.
 ///
+/// **Assumption:** all quantized tensors in a single `.safetensors` file use
+/// the same scheme. This holds for every known quantizer (LG AI, Qwen, Mistral,
+/// `RedHat`, NVIDIA). The function early-returns on the first scale companion
+/// found — if a file ever mixed schemes, the result would reflect only the
+/// first match.
+///
 /// All `FP8` schemes may use `_scale_inv` or `_scale` companions.
 /// The distinction is the **scale tensor shape**:
 /// - Fine-grained: 2D with both dims > 1 (e.g., `[16, 32]` for 128×128 blocks)
