@@ -205,7 +205,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Goal:** Extend `remember/` to cover the major quantization formats. Each scheme adds a new submodule under `remember/` and extends the parsing layer to detect its metadata.
 
-- [ ] GPTQ dequantization (`src/remember/gptq.rs`) — INT4/INT8 with group-wise scale + zero-point. Parse GPTQ metadata from safetensors, reconstruct full-precision weights — **commit**
+- [x] GPTQ dequantization (`src/remember/gptq.rs`) — INT4/INT8 with group-wise scale + zero-point. Parse GPTQ metadata from safetensors, reconstruct full-precision weights. Bit-exact against PyTorch on 4 real models (2 quantizers × 2 bit widths), 6.5–12.2× faster than CPU PyTorch (AVX2). Loop fission for full AVX2 vectorization — **commit**
 - [ ] AWQ dequantization (`src/remember/awq.rs`) — activation-aware quantization with per-channel scales — **commit**
 - [ ] BitsAndBytes dequantization (`src/remember/bnb.rs`) — NF4, INT8 with absmax/zeropoint — **commit**
 - [ ] Feature gates — each scheme behind its own feature flag (`gptq`, `awq`, `bnb`). Default features: `fp8` only — **commit**

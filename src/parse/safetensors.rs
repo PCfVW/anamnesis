@@ -235,6 +235,8 @@ pub enum QuantScheme {
     Unquantized,
     /// `GPTQ` quantization (INT4 or INT8 with group-wise scale + zero-point).
     Gptq,
+    /// `AWQ` quantization (activation-aware, INT4 or INT8 with per-group scales).
+    Awq,
 }
 
 impl fmt::Display for QuantScheme {
@@ -245,6 +247,7 @@ impl fmt::Display for QuantScheme {
             Self::PerTensorFp8 => "Per-tensor FP8 (E4M3)",
             Self::Unquantized => "Unquantized",
             Self::Gptq => "GPTQ",
+            Self::Awq => "AWQ",
         };
         f.write_str(s)
     }
@@ -269,14 +272,33 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
         return QuantScheme::Unquantized;
     }
 
-    // GPTQ: any quantized tensor whose name ends with `.qweight` (feature-gated).
-    #[cfg(feature = "gptq")]
+    // GPTQ / AWQ: both use `.qweight` tensors. Distinguish by packing direction.
+    // GPTQ packs along rows: qweight.cols == scales.cols (both = out_features).
+    // AWQ packs along cols: qweight.cols < scales.cols (qweight.cols * pack_factor = scales.cols).
+    #[cfg(any(feature = "gptq", feature = "awq"))]
     {
-        let has_gptq = entries
+        for entry in entries
             .iter()
-            .any(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"));
-        if has_gptq {
-            return QuantScheme::Gptq;
+            .filter(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"))
+        {
+            let base = entry.name.strip_suffix(".qweight");
+            if let Some(base) = base {
+                let scales_name = format!("{base}.scales");
+                if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
+                    let qw_cols = entry.shape.last().copied().unwrap_or(0);
+                    let sc_cols = scales.shape.last().copied().unwrap_or(0);
+
+                    if qw_cols > 0 && sc_cols > 0 && qw_cols == sc_cols {
+                        // qweight.cols == scales.cols → GPTQ (packed along rows)
+                        #[cfg(feature = "gptq")]
+                        return QuantScheme::Gptq;
+                    } else if qw_cols > 0 && sc_cols > 0 && qw_cols < sc_cols {
+                        // qweight.cols < scales.cols → AWQ (packed along cols)
+                        #[cfg(feature = "awq")]
+                        return QuantScheme::Awq;
+                    }
+                }
+            }
         }
     }
 
@@ -334,6 +356,33 @@ pub struct GptqCompanions<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// AWQ config
+// ---------------------------------------------------------------------------
+
+/// `AWQ` quantization configuration inferred from safetensors metadata
+/// and/or tensor shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AwqConfig {
+    /// Quantization bit width (4 or 8).
+    pub bits: u8,
+    /// Number of input features per group (typically 128).
+    pub group_size: usize,
+}
+
+/// Companion tensors for an `AWQ` `.qweight` tensor.
+///
+/// Same tensor names as `GPTQ` (`.scales`, `.qzeros`) but different packing
+/// direction (packed along `out_features` instead of `in_features`).
+/// `AWQ` never has `.g_idx`.
+#[derive(Debug, Clone)]
+pub struct AwqCompanions<'a> {
+    /// Per-group scale factors (`.scales`).
+    pub scales: &'a TensorEntry,
+    /// Per-group packed zero-points (`.qzeros`).
+    pub qzeros: &'a TensorEntry,
+}
+
+// ---------------------------------------------------------------------------
 // TensorEntry
 // ---------------------------------------------------------------------------
 
@@ -388,6 +437,8 @@ pub struct SafetensorsHeader {
     pub header_size: usize,
     /// `GPTQ` config (bits, group size), if the scheme is `GPTQ`.
     pub gptq_config: Option<GptqConfig>,
+    /// `AWQ` config (bits, group size), if the scheme is `AWQ`.
+    pub awq_config: Option<AwqConfig>,
 }
 
 impl SafetensorsHeader {
@@ -489,11 +540,69 @@ impl SafetensorsHeader {
             g_idx,
         })
     }
+
+    /// Finds the `AWQ` companion tensors (`.scales`, `.qzeros`) for a given
+    /// `.qweight` tensor name.
+    ///
+    /// Same tensor names as `GPTQ` but no `.g_idx` (AWQ always uses sequential groups).
+    #[must_use]
+    pub fn find_awq_companions(&self, qweight_name: &str) -> Option<AwqCompanions<'_>> {
+        let base = qweight_name.strip_suffix(".qweight")?;
+        let scales_name = format!("{base}.scales");
+        let qzeros_name = format!("{base}.qzeros");
+
+        let scales = self.tensors.iter().find(|e| e.name == scales_name)?;
+        let qzeros = self.tensors.iter().find(|e| e.name == qzeros_name)?;
+
+        Some(AwqCompanions { scales, qzeros })
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
+
+/// Infer `AWQ` configuration from tensor shapes.
+///
+/// `AWQ` packs along `out_features`: `qweight` shape is `[in_features, out_features / pack_factor]`.
+/// - `bits = 32 / (out_features / qweight.cols)` where `out_features = scales.cols`
+/// - `group_size = in_features / scales.rows`
+fn infer_awq_config(entries: &[TensorEntry]) -> Option<AwqConfig> {
+    for entry in entries
+        .iter()
+        .filter(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"))
+    {
+        let base = entry.name.strip_suffix(".qweight")?;
+        let scales_name = format!("{base}.scales");
+        if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
+            if entry.shape.len() >= 2 && scales.shape.len() >= 2 {
+                let in_features = entry.shape.first().copied()?;
+                let qw_cols = entry.shape.last().copied()?;
+                let num_groups = scales.shape.first().copied()?;
+                let out_features = scales.shape.last().copied()?;
+
+                if qw_cols == 0 || out_features == 0 || num_groups == 0 || in_features == 0 {
+                    return None;
+                }
+
+                // AWQ: out_features = qw_cols * pack_factor → pack_factor = out_features / qw_cols
+                if out_features.is_multiple_of(qw_cols) {
+                    let pack_factor = out_features / qw_cols;
+                    for bits in [4u8, 8] {
+                        // CAST: u8 → usize, bits is 4 or 8
+                        #[allow(clippy::as_conversions)]
+                        let expected_pf = 32 / bits as usize;
+                        if pack_factor == expected_pf && in_features.is_multiple_of(num_groups) {
+                            let group_size = in_features / num_groups;
+                            return Some(AwqConfig { bits, group_size });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Infer `GPTQ` configuration from safetensors `__metadata__` or tensor shapes.
 ///
@@ -616,12 +725,19 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
         None
     };
 
+    let awq_config = if scheme == QuantScheme::Awq {
+        infer_awq_config(&entries)
+    } else {
+        None
+    };
+
     Ok(SafetensorsHeader {
         tensors: entries,
         scheme,
         metadata: file_metadata,
         header_size,
         gptq_config,
+        awq_config,
     })
 }
 
@@ -859,6 +975,7 @@ mod tests {
             metadata: None,
             header_size: 0,
             gptq_config: None,
+            awq_config: None,
         };
         let found = header.find_scale_for("w");
         assert_eq!(found.map(|e| e.name.as_str()), Some("w_scale_inv"));
@@ -875,6 +992,7 @@ mod tests {
             metadata: None,
             header_size: 0,
             gptq_config: None,
+            awq_config: None,
         };
         let found = header.find_scale_for("w");
         assert_eq!(found.map(|e| e.name.as_str()), Some("w_scale"));
@@ -888,6 +1006,7 @@ mod tests {
             metadata: None,
             header_size: 0,
             gptq_config: None,
+            awq_config: None,
         };
         assert!(header.find_scale_for("w").is_none());
     }

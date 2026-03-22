@@ -445,6 +445,12 @@ impl ParsedModel {
                                 detail: "GPTQ dequantization requires the `gptq` feature".into(),
                             });
                         }
+                        QuantScheme::Awq => {
+                            return Err(AnamnesisError::Unsupported {
+                                format: "AWQ".into(),
+                                detail: "AWQ dequantization requires the `awq` feature".into(),
+                            });
+                        }
                         QuantScheme::Unquantized => {
                             // Shouldn't have quantized tensors in an unquantized model,
                             // but treat as passthrough to be safe.

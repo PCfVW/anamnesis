@@ -13,8 +13,11 @@ pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
 pub use parse::{
-    Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
+    AwqCompanions, AwqConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,
+    TensorEntry, TensorRole,
 };
+#[cfg(feature = "awq")]
+pub use remember::dequantize_awq_to_bf16;
 #[cfg(feature = "gptq")]
 pub use remember::dequantize_gptq_to_bf16;
 pub use remember::{

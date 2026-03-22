@@ -137,7 +137,7 @@ impl fmt::Display for InspectInfo {
         }
 
         let scheme_label = match self.format {
-            QuantScheme::Gptq => "GPTQ",
+            QuantScheme::Gptq | QuantScheme::Awq => "GPTQ/AWQ",
             QuantScheme::Unquantized => "unquantized",
             QuantScheme::FineGrainedFp8
             | QuantScheme::PerChannelFp8
@@ -253,6 +253,7 @@ mod tests {
             metadata: None,
             header_size: 0,
             gptq_config: None,
+            awq_config: None,
         };
         let info = InspectInfo::from(&header);
 
@@ -286,6 +287,7 @@ mod tests {
             metadata: None,
             header_size: 0,
             gptq_config: None,
+            awq_config: None,
         };
         let info = InspectInfo::from(&header);
 
@@ -322,6 +324,7 @@ mod tests {
             metadata: None,
             header_size: 0,
             gptq_config: None,
+            awq_config: None,
         };
         let info = InspectInfo::from(&header);
 
