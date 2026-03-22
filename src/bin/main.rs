@@ -77,6 +77,16 @@ fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
         println!("  {scales:>3} scale       {dtype_list}");
     }
 
+    let zeropoints = model.header.zeropoint_count();
+    if zeropoints > 0 {
+        println!("  {zeropoints:>3} zero-point  I32 (packed)");
+    }
+
+    let group_indices = model.header.group_index_count();
+    if group_indices > 0 {
+        println!("  {group_indices:>3} g_idx       I32 (activation-order)");
+    }
+
     let passthrough = model.header.passthrough_count();
     if passthrough > 0 {
         // Collect passthrough dtype summary.

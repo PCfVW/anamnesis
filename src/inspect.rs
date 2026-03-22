@@ -21,6 +21,10 @@ pub struct InspectInfo {
     pub passthrough: usize,
     /// Unique dtypes of scale factor tensors, in order of first occurrence.
     pub scale_dtypes: Vec<Dtype>,
+    /// Number of zero-point tensors (`GPTQ` `.qzeros`).
+    pub zeropoints: usize,
+    /// Number of group-index tensors (`GPTQ` `.g_idx`).
+    pub group_indices: usize,
     /// Total tensor data size in bytes (as stored in the file).
     pub current_size: u64,
     /// Estimated tensor data size in bytes after dequantization to `BF16`.
@@ -43,6 +47,8 @@ impl From<&SafetensorsHeader> for InspectInfo {
         let quantized = header.quantized_count();
         let scales = header.scale_count();
         let passthrough = header.passthrough_count();
+        let zeropoints = header.zeropoint_count();
+        let group_indices = header.group_index_count();
 
         let mut scale_dtypes: Vec<Dtype> = Vec::new();
         for entry in header.scale_tensors() {
@@ -84,6 +90,8 @@ impl From<&SafetensorsHeader> for InspectInfo {
             scales,
             passthrough,
             scale_dtypes,
+            zeropoints,
+            group_indices,
             current_size,
             dequantized_size,
         }
@@ -116,9 +124,28 @@ impl fmt::Display for InspectInfo {
             self.passthrough,
         )?;
 
+        if self.zeropoints > 0 {
+            write!(f, "\nZero-points: {} tensors", self.zeropoints,)?;
+        }
+
+        if self.group_indices > 0 {
+            write!(
+                f,
+                "\nGroup index: {} tensors (activation-order)",
+                self.group_indices,
+            )?;
+        }
+
+        let scheme_label = match self.format {
+            QuantScheme::Gptq => "GPTQ",
+            QuantScheme::Unquantized => "unquantized",
+            QuantScheme::FineGrainedFp8
+            | QuantScheme::PerChannelFp8
+            | QuantScheme::PerTensorFp8 => "FP8",
+        };
         write!(
             f,
-            "\nSize:        {} (FP8) -> {} (BF16)",
+            "\nSize:        {} ({scheme_label}) -> {} (BF16)",
             format_bytes(self.current_size),
             format_bytes(self.dequantized_size),
         )?;
@@ -319,6 +346,8 @@ mod tests {
             scales: 0,
             passthrough: 53,
             scale_dtypes: vec![],
+            zeropoints: 0,
+            group_indices: 0,
             current_size: 4_672 * 1024 * 1024,
             dequantized_size: 8_269 * 1024 * 1024,
         };
@@ -339,6 +368,8 @@ mod tests {
             scales: 180,
             passthrough: 31,
             scale_dtypes: vec![Dtype::F32],
+            zeropoints: 0,
+            group_indices: 0,
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
         };
@@ -358,6 +389,8 @@ mod tests {
             scales: 180,
             passthrough: 31,
             scale_dtypes: vec![Dtype::BF16],
+            zeropoints: 0,
+            group_indices: 0,
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
         };
@@ -375,6 +408,8 @@ mod tests {
             scales: 0,
             passthrough: 100,
             scale_dtypes: vec![],
+            zeropoints: 0,
+            group_indices: 0,
             current_size: 1024 * 1024 * 1024,
             dequantized_size: 1024 * 1024 * 1024,
         };
