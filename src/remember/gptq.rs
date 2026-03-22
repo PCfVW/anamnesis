@@ -436,11 +436,17 @@ pub fn dequantize_gptq_to_bf16(
     // BITWISE: mask for one quantized value, e.g. 0xF for 4-bit, 0xFF for 8-bit
     let mask = (1u32 << bits_u32) - 1;
 
+    // Pre-allocate a scratch buffer for unpacked f32 values (one row).
+    // Reused across iterations to avoid per-row allocation.
+    let mut unpacked_buf = vec![0.0_f32; out_features];
+
     // --- Hot loop: row-by-row dequantization ---
+    // Two-level bounds checking per CONVENTIONS.md: validate slices ONCE
+    // before the inner loop, then iterate branch-free inside.
     for i in 0..in_features {
         // Determine group for this input feature.
         let g = if let Some(ref idx) = g_idx {
-            // g_idx bounds checked during parse_g_idx; Vec indexing safe for i < in_features
+            // INDEX: i < in_features, g_idx.len() == in_features (validated in parse_g_idx)
             idx.get(i).copied().ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("g_idx index {i} out of bounds"),
             })?
@@ -460,56 +466,83 @@ pub fn dequantize_gptq_to_bf16(
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
         let shift = bits_u32 * (pos as u32);
 
-        // Byte offset to the start of this packed row in qweight.
-        let qw_row_byte_offset = packed_row
+        // --- Pre-validate slices ONCE (two-level bounds checking) ---
+
+        // qweight row: out_features contiguous I32 values for this packed_row.
+        let qw_row_start = packed_row
             .checked_mul(out_features)
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: "qweight row byte offset overflow".into(),
             })?;
+        let qw_row_end = qw_row_start + out_features * 4;
+        let qw_row =
+            qweight_data
+                .get(qw_row_start..qw_row_end)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("qweight row {packed_row} out of bounds"),
+                })?;
 
-        // Precomputed group data offset.
-        let group_offset = g * out_features;
+        // Group zeros and scales: contiguous f32 slices, pre-validated.
+        let group_start = g * out_features;
+        let group_end = group_start + out_features;
+        let zeros_row =
+            all_zeros
+                .get(group_start..group_end)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("zeros row for group {g} out of bounds"),
+                })?;
+        let scales_row =
+            all_scales
+                .get(group_start..group_end)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("scales row for group {g} out of bounds"),
+                })?;
 
-        // Output row offset.
-        let out_row_offset = i * out_features * 2;
+        // Output row: contiguous BF16 bytes.
+        let out_row_start = i * out_features * 2;
+        let out_row_end = out_row_start + out_features * 2;
+        let out_row =
+            output
+                .get_mut(out_row_start..out_row_end)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("output row {i} out of bounds"),
+                })?;
 
-        // Get the output row slice for contiguous writes.
-        let out_row = output
-            .get_mut(out_row_offset..out_row_offset + out_features * 2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("output row {i} out of bounds"),
-            })?;
-
-        // VECTORIZED: inner loop over out_features with hoisted shift/mask,
-        // contiguous qweight reads, precomputed zeros/scales, contiguous
-        // output writes. Pending cargo-show-asm verification.
-        for (j, out_pair) in out_row.chunks_exact_mut(2).enumerate() {
-            // Read packed I32 from qweight — contiguous along out_features.
-            let packed = read_u32_le(qweight_data, qw_row_byte_offset + j * 4)?;
-
+        // --- Unpack qweight row into contiguous f32 values ---
+        // Separates byte→u32 extraction (hard to vectorize) from the
+        // arithmetic (easy to vectorize). The compiler auto-vectorizes
+        // the second loop: pure f32 sub+mul+convert pipeline.
+        // INDEX: unpacked_buf.len() == out_features, allocated before the outer loop
+        let unpacked_row =
+            unpacked_buf
+                .get_mut(..out_features)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: "unpacked buffer too short".into(),
+                })?;
+        #[allow(clippy::indexing_slicing)]
+        for (j, qw_chunk) in qw_row.chunks_exact(4).enumerate() {
+            // INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk;
+            // j < out_features guaranteed by qw_row length validation above
+            let packed = u32::from_le_bytes([qw_chunk[0], qw_chunk[1], qw_chunk[2], qw_chunk[3]]);
             // BITWISE: extract unsigned quantized value at bit position `shift`
-            let qw = unpack_gptq(packed, shift, mask);
-
-            // GPTQ dequantization: (qw - zero) × scale
             // CAST: u32 → f32, qw is at most 15 (4-bit) or 255 (8-bit), exact in f32
             #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
-            let qw_f32 = qw as f32;
+            let qw = unpack_gptq(packed, shift, mask) as f32;
+            unpacked_row[j] = qw;
+        }
 
-            // INDEX: group_offset + j is bounded by num_groups * out_features
-            // (g < num_groups, j < out_features), which equals all_zeros.len()
-            let zero = all_zeros
-                .get(group_offset + j)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("zero-point index out of bounds: group {g}, feature {j}"),
-                })?;
-            let scale = all_scales
-                .get(group_offset + j)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("scale index out of bounds: group {g}, feature {j}"),
-                })?;
-
-            let val = (qw_f32 - zero) * scale;
+        // --- Hot inner loop: pure f32 arithmetic, BRANCH-FREE ---
+        // Contiguous f32 reads (unpacked, zeros, scales) and contiguous
+        // BF16 writes. No byte manipulation — just sub + mul + bf16 convert.
+        // VECTORIZED: pending cargo-show-asm verification
+        for (((out_pair, &qw), &zero), &scale) in out_row
+            .chunks_exact_mut(2)
+            .zip(unpacked_row.iter())
+            .zip(zeros_row.iter())
+            .zip(scales_row.iter())
+        {
+            let val = (qw - zero) * scale;
             let bf16 = f32_bits_to_bf16_bits(val.to_bits());
             out_pair.copy_from_slice(&bf16.to_le_bytes());
         }

@@ -226,14 +226,17 @@ def generate_fixture(model_info: dict) -> None:
     scale_bytes, scale_dtype_id = scale_to_bytes(scale_slice)
     print(f"  Scale dtype: {SCALE_DTYPE_NAMES[scale_dtype_id]}, {len(scale_bytes)} bytes")
 
-    # Dequantize with PyTorch and measure time
-    t0 = time.perf_counter()
-    result_bf16 = dequant_pytorch(weight_slice, scale_slice, scheme, rows, cols)
-    t1 = time.perf_counter()
-    pytorch_us = (t1 - t0) * 1e6
+    # Dequantize with PyTorch and measure time (best of 5 runs to exclude JIT warmup)
+    best_us = float("inf")
+    for _run in range(5):
+        t0 = time.perf_counter()
+        result_bf16 = dequant_pytorch(weight_slice, scale_slice, scheme, rows, cols)
+        t1 = time.perf_counter()
+        run_us = (t1 - t0) * 1e6
+        best_us = min(best_us, run_us)
 
     expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
-    print(f"  PyTorch dequant: {pytorch_us:.1f} µs ({rows}x{cols} = {rows*cols} elements)")
+    print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {rows}x{cols} = {rows*cols} elements)")
 
     # Write fixture
     output_path = Path(__file__).parent / f"{name}.bin"

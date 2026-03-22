@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **GPTQ dequantization** (`src/remember/gptq.rs`) — INT4 and INT8 with
+  group-wise scale + zero-point, activation-order via `g_idx`. Feature-gated
+  behind `gptq`. Bit-exact against PyTorch on 4 real models from 2 quantizers
+  (AutoGPTQ, GPTQModel), **6.5–12.2× faster** than CPU PyTorch (AVX2)
+- **GPTQ parsing layer** — `TensorRole::ZeroPoint` / `GroupIndex`,
+  `QuantScheme::Gptq`, `GptqConfig` (bits + group_size inference from metadata
+  or tensor shapes), `find_gptq_companions()`, `gptq` feature gate
+- **GPTQ cross-validation** against PyTorch on 4 models: Falcon3-1B INT4/INT8
+  (AutoGPTQ), Llama-3.2-1B INT4 (AutoGPTQ), Llama-3.2-1B INT8 (GPTQModel)
+- **GPTQ inspect/CLI** — zero-point, group-index counts in `inspect` and
+  `parse` output; format-aware size label (FP8/GPTQ/unquantized)
+- CONVENTIONS.md: two-level bounds checking pattern (reconciles `// INDEX:`
+  safety with SIMD rule #2) and loop fission for mixed-domain pipelines
+
 ### Fixed
 
 - Added unit tests for `dequantize_per_channel_fp8_to_bf16` covering F32, BF16,

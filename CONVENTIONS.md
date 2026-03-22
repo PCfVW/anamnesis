@@ -126,6 +126,89 @@ loops that satisfy these conditions:
    `&mut [u16]` output buffers — never in-place transformation on a single
    `&mut [u8]`.
 
+### Reconciling bounds checking with vectorization
+
+The `// INDEX:` rule (above) says to prefer `.get()` with `?` for bounds
+checking. In hot loops, `.get()` generates a branch on every element — the
+exact pattern that rule 2 ("no branches in the hot path") forbids.
+
+Satisfy both rules with a **two-level pattern**:
+
+1. **Before the loop:** validate bounds **once** using `.get(range)` with `?`
+   on the enclosing slice. This produces a pre-validated sub-slice whose
+   length is known at the start of the loop.
+
+2. **Inside the loop:** iterate the pre-validated slice with `chunks_exact`,
+   `.iter().zip()`, or direct indexing annotated with `// INDEX:` referencing
+   the pre-validation. No `.get()`, no `?`, no branches.
+
+> ✅ Pre-validate, then iterate branch-free:
+> ```rust
+> let row = data.get(start..start + cols).ok_or_else(|| err())?;  // bounds checked once
+> let out = output.get_mut(o_start..o_start + cols * 2).ok_or_else(|| err())?;
+> // VECTORIZED: inner loop is branch-free, pre-validated slices
+> for (&byte, out_pair) in row.iter().zip(out.chunks_exact_mut(2)) {
+>     out_pair.copy_from_slice(&convert(byte, scale).to_le_bytes());
+> }
+> ```
+>
+> ❌ Per-element `.get()` inside the loop — defeats vectorization:
+> ```rust
+> for j in 0..cols {
+>     let byte = data.get(start + j).ok_or_else(|| err())?;   // branch per element
+>     let scale = scales.get(j).ok_or_else(|| err())?;         // branch per element
+>     // compiler cannot vectorize — too many conditional paths
+> }
+> ```
+
+This pattern appears throughout anamnesis: the FP8 dequantization loops
+pre-slice weight and output rows before the inner `chunks_exact` iteration.
+Every new dequantization module (GPTQ, AWQ, BnB) must follow the same
+two-level structure.
+
+### Loop fission for mixed-domain pipelines
+
+When a single loop mixes data domains (byte extraction, float arithmetic,
+integer bit-manipulation for `BF16` rounding), the compiler often cannot
+vectorize because it sees cross-domain dependencies in the loop body.
+
+**Split the loop into separate passes**, one per domain. Each pass has a
+uniform data flow that the compiler can vectorize independently. Use a
+scratch buffer (typically one row, fits in L1 cache) to communicate between
+passes.
+
+> ✅ Two passes — byte extraction then float arithmetic:
+> ```rust
+> // Pass 1: unpack bytes → f32 scratch buffer (partially vectorizes)
+> for (chunk, dst) in raw.chunks_exact(4).zip(scratch.iter_mut()) {
+>     let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+>     *dst = ((packed >> shift) & mask) as f32;
+> }
+> // Pass 2: pure f32 arithmetic → BF16 output (fully vectorizes to AVX2)
+> for ((&val, &zero, &scale), out) in scratch.iter()
+>     .zip(zeros.iter()).zip(scales.iter()).zip(output.chunks_exact_mut(2)) {
+>     let bf16 = f32_bits_to_bf16_bits(((val - zero) * scale).to_bits());
+>     out.copy_from_slice(&bf16.to_le_bytes());
+> }
+> ```
+>
+> ❌ Single combined loop — mixes byte, float, and integer domains:
+> ```rust
+> for (chunk, out) in raw.chunks_exact(4).zip(output.chunks_exact_mut(2)) {
+>     let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+>     let qw = ((packed >> shift) & mask) as f32;       // byte → int → float
+>     let val = (qw - zero) * scale;                     // float
+>     let bf16 = f32_bits_to_bf16_bits(val.to_bits());   // float → int → truncate
+>     out.copy_from_slice(&bf16.to_le_bytes());           // compiler gives up
+> }
+> ```
+
+The cost of the extra pass is negligible: the scratch buffer is one row
+(typically 1–32 KB, fits in L1 cache). The benefit is full-width SIMD on
+the arithmetic pass. In GPTQ dequantization, this loop fission turned scalar
+`vsubss`/`vmulss` into AVX2 `vsubps`/`vmulps` (8-wide), yielding a 3–4×
+speedup on the inner loop.
+
 ### Verify vectorization
 
 After writing a hot loop, **verify** that the compiler actually vectorized it.
