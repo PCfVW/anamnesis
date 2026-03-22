@@ -19,6 +19,8 @@ use crate::parse::safetensors::{
 use crate::remember::fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
+#[cfg(feature = "gptq")]
+use crate::remember::gptq::dequantize_gptq_to_bf16;
 
 /// Target dtype for dequantization output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -365,6 +367,78 @@ impl ParsedModel {
                             };
                             dequantize_per_tensor_fp8_to_bf16(weight_data, scale)?
                         }
+                        #[cfg(feature = "gptq")]
+                        QuantScheme::Gptq => {
+                            let config =
+                                self.header
+                                    .gptq_config
+                                    .ok_or_else(|| AnamnesisError::Parse {
+                                        reason: format!(
+                                            "GPTQ config not available for `{}`",
+                                            entry.name
+                                        ),
+                                    })?;
+                            let companions = self
+                                .header
+                                .find_gptq_companions(&entry.name)
+                                .ok_or_else(|| AnamnesisError::Parse {
+                                    reason: format!(
+                                        "GPTQ companions not found for `{}`",
+                                        entry.name
+                                    ),
+                                })?;
+
+                            let scales_data = self.tensor_data(
+                                companions.scales.data_offsets.0,
+                                companions.scales.data_offsets.1,
+                            )?;
+                            let qzeros_data = self.tensor_data(
+                                companions.qzeros.data_offsets.0,
+                                companions.qzeros.data_offsets.1,
+                            )?;
+                            let g_idx_data = companions
+                                .g_idx
+                                .map(|e| self.tensor_data(e.data_offsets.0, e.data_offsets.1))
+                                .transpose()?;
+
+                            // Derive in_features and out_features from qweight shape.
+                            // qweight shape: [in_features/pack_factor, out_features]
+                            let (packed_rows, out_features) =
+                                Self::shape_to_rows_cols(&entry.shape)?;
+                            // CAST: u8 → usize, bits is 4 or 8
+                            #[allow(clippy::as_conversions)]
+                            let pack_factor = 32 / config.bits as usize;
+                            let in_features =
+                                packed_rows.checked_mul(pack_factor).ok_or_else(|| {
+                                    AnamnesisError::Parse {
+                                        reason: "in_features overflow".into(),
+                                    }
+                                })?;
+
+                            let bf16_data = dequantize_gptq_to_bf16(
+                                weight_data,
+                                scales_data,
+                                qzeros_data,
+                                g_idx_data,
+                                in_features,
+                                out_features,
+                                config.group_size,
+                                config.bits,
+                                companions.scales.dtype,
+                            )?;
+
+                            // Output tensor: strip ".qweight" suffix, use ".weight".
+                            let output_name = entry.name.strip_suffix(".qweight").map_or_else(
+                                || entry.name.clone(),
+                                |base| format!("{base}.weight"),
+                            );
+                            let output_shape = vec![in_features, out_features];
+
+                            dequantized_data.push((output_name, bf16_data, output_shape));
+                            on_tensor();
+                            continue;
+                        }
+                        #[cfg(not(feature = "gptq"))]
                         QuantScheme::Gptq => {
                             return Err(AnamnesisError::Unsupported {
                                 format: "GPTQ".into(),
