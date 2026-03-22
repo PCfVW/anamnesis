@@ -15,6 +15,8 @@ pub use model::{parse, ParsedModel, TargetDtype};
 pub use parse::{
     Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
 };
+#[cfg(feature = "gptq")]
+pub use remember::dequantize_gptq_to_bf16;
 pub use remember::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };

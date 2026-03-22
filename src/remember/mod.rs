@@ -7,7 +7,11 @@
 //! raw `BF16` bytes suitable for writing back to a standard `.safetensors` file.
 
 pub mod fp8;
+#[cfg(feature = "gptq")]
+pub mod gptq;
 
 pub use fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
+#[cfg(feature = "gptq")]
+pub use gptq::dequantize_gptq_to_bf16;
