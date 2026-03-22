@@ -12,8 +12,11 @@ Required on every `Box<dyn Trait>` or `&dyn Trait` usage.
 > Example: `// TRAIT_OBJECT: heterogeneous format parsers require dynamic dispatch`
 
 ### `// EXHAUSTIVE: <reason>`
-Required on `#[allow(clippy::exhaustive_enums)]`.
+Required on `#[allow(clippy::exhaustive_enums)]` or
+`#[allow(clippy::wildcard_enum_match_arm)]` when a wildcard is used on a
+foreign `#[non_exhaustive]` enum that we cannot match exhaustively.
 > Example: `// EXHAUSTIVE: internal dispatch enum; crate owns and matches all variants`
+> Example: `// EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants`
 
 ### `// EXPLICIT: <reason>`
 Required when a match arm is intentionally a no-op, or when an imperative
@@ -49,8 +52,10 @@ Required on every direct slice index (`slice[i]`, `slice[a..b]`) that cannot
 be replaced by an iterator. Direct indexing panics on out-of-bounds; prefer
 `.get(i)` with `?` or explicit error handling. Use direct indexing only when
 the bound is provably valid and an iterator idiom would be significantly less
-readable.
+readable. See also "Reconciling bounds checking with vectorization" below for
+how this rule interacts with the SIMD rules in hot loops.
 > Example: `// INDEX: offset is bounded by header.data_offsets checked above`
+> Example: `// INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk`
 
 ### `// CAST: <from> → <to>, <reason>`
 Required on every `as` cast between numeric types. Prefer `From`/`Into` for
@@ -67,11 +72,13 @@ operation achieves — the mapping between storage format and numerical value
 must be traceable through the annotations.
 > Example: `// BITWISE: extract 3-bit mantissa from E4M3 byte (bits [2:0])`
 > Example: `// BITWISE: combine sign, exponent, mantissa into IEEE 754 half-precision`
+> Example: `// BITWISE: extract unsigned 4-bit value from packed I32 at bit position shift`
 
 ### `// VECTORIZED: <verification>`
 Required on every bulk conversion loop that is expected to auto-vectorize.
 Document how vectorization was verified and on which target.
 > Example: `// VECTORIZED: confirmed AVX2 vmulps + vpermb in cargo-show-asm, x86-64, opt-level=3`
+> Example: `// VECTORIZED: confirmed AVX2 vsubps+vmulps (target-cpu=native) via --emit=asm`
 > Example: `// VECTORIZED: scalar fallback — loop body contains branch that defeats auto-vectorization`
 
 ---
@@ -89,8 +96,8 @@ no cross-iteration dependencies, fixed stride, and known trip count. Write
 loops that satisfy these conditions:
 
 1. **Process contiguous slices, not iterators over structs.**
-   The input is `&[u8]` (FP8 bytes), the output is `&mut [u16]` (BF16 bits).
-   Work on flat slices, not abstracted types.
+   Work on flat slices (e.g., `&[u8]` for packed data, `&[f32]` for
+   precomputed values, `&mut [u8]` for `BF16` output), not abstracted types.
 
    > ✅ `for i in 0..block.len() { out[i] = convert(block[i], scale); }`
    > ✅ `block.iter().zip(out.iter_mut()).for_each(|(&b, o)| *o = convert(b, scale));`
@@ -98,13 +105,15 @@ loops that satisfy these conditions:
 
 2. **No branches in the hot path.** Conditional logic (NaN handling, subnormal
    detection) must be expressed as bitwise select or arithmetic, not `if`/`match`.
+   This includes bounds checks — see "Reconciling bounds checking with
+   vectorization" below.
 
    > ✅ `let is_nan_mask = ((exp == 0xF) & (mant != 0)) as u16;` then blend with bitwise ops
    > ❌ `if exp == 0xF && mant != 0 { return BF16_NAN; }` ← branch per element kills SIMD
 
 3. **Hoist invariants out of the loop.** The scale factor is constant for an
-   entire block (128 elements in fine-grained FP8). Compute it once before
-   the loop, not inside.
+   entire block (128 elements in fine-grained FP8) or an entire row (GPTQ
+   group). Compute it once before the loop, not inside.
 
    > ✅ `let scale = load_scale(block_idx);  for i in 0..128 { ... scale ... }`
    > ❌ `for i in 0..128 { let scale = load_scale(block_idx); ... }` ← redundant load, may confuse optimizer
@@ -119,11 +128,13 @@ loops that satisfy these conditions:
 5. **Avoid `as` casts that widen through intermediate types.** A chain like
    `u8 → u32 → f32 → f32 (multiply) → u16` may force the compiler to emit
    widening/narrowing shuffles that break vectorization. Prefer bitwise
-   manipulation that stays in the target width.
+   manipulation that stays in the target width. When the pipeline inevitably
+   crosses domains (e.g., GPTQ: byte extraction → float arithmetic → integer
+   `BF16` rounding), use loop fission — see below.
 
 6. **Separate input and output slices.** The compiler cannot vectorize if it
    suspects the output aliases the input. Use distinct `&[u8]` input and
-   `&mut [u16]` output buffers — never in-place transformation on a single
+   `&mut [u8]` output buffers — never in-place transformation on a single
    `&mut [u8]`.
 
 ### Reconciling bounds checking with vectorization
@@ -205,22 +216,32 @@ passes.
 
 The cost of the extra pass is negligible: the scratch buffer is one row
 (typically 1–32 KB, fits in L1 cache). The benefit is full-width SIMD on
-the arithmetic pass. In GPTQ dequantization, this loop fission turned scalar
-`vsubss`/`vmulss` into AVX2 `vsubps`/`vmulps` (8-wide), yielding a 3–4×
-speedup on the inner loop.
+the arithmetic pass. In GPTQ dequantization, loop fission turned scalar
+`vsubss`/`vmulss` into AVX2 `vsubps`/`vmulps` (8-wide), improving the
+function from 1.5–2.8× to **6.5–12.2× faster** than CPU PyTorch.
+
+**When to expect the need for fission:** if the input format packs multiple
+logical values per storage word (GPTQ: 8 INT4 per `I32`, AWQ: similar), the
+unpacking step will mix byte/integer domains with the float arithmetic.
+Plan two passes from the start. Conversely, if the input-to-output mapping
+is 1:1 with a small branchless inline kernel (FP8: one byte → one `BF16`),
+the compiler typically fuses the pipeline without fission.
 
 ### Verify vectorization
 
 After writing a hot loop, **verify** that the compiler actually vectorized it.
 Do not assume — auto-vectorization is fragile and can silently regress.
 
-- Use `cargo-show-asm` or `RUSTFLAGS="--emit=asm" cargo build --release` to
-  inspect the generated assembly for the conversion function.
-- Look for SIMD instructions: `vmulps`, `vpmovzxbw`, `vpermb` (AVX2/AVX-512)
-  or `fmul.4s`, `ushll` (NEON).
+- Use `cargo-show-asm` or `RUSTFLAGS="-C target-cpu=native --emit=asm" cargo
+  build --release` to inspect the generated assembly.
+- Look for packed SIMD instructions: `vmulps`, `vsubps`, `vpsrld`, `vpaddd`,
+  `vpackusdw` (AVX2) or `fmul.4s`, `ushll` (NEON). Scalar variants
+  (`vmulss`, `vsubss`) indicate the loop did not vectorize.
 - If the loop did not vectorize, add a `// VECTORIZED: scalar fallback — <reason>`
   annotation explaining why and what would need to change.
-- If it did vectorize, add `// VECTORIZED: confirmed <ISA> <key instruction> in cargo-show-asm, <target>, opt-level=3`.
+- If it did vectorize, add `// VECTORIZED: confirmed <ISA> <key instruction>
+  in cargo-show-asm, <target>, opt-level=3`.
+- Re-verify after any change to the loop body or its dependencies.
 
 ### When auto-vectorization is not enough
 
@@ -248,7 +269,7 @@ rustdoc renders them as inline code and Clippy's `doc_markdown` lint passes.
 Applies to: struct/enum/field names, method names (`fn foo`), types
 (`Vec<T>`, `Option<f32>`), crate names (`safetensors`, `half`),
 file extensions (`.npy`, `.npz`, `.safetensors`), and acronyms that double
-as types (`DType`, `NaN`, `FP8`, `E4M3`, `BF16`).
+as types (`DType`, `NaN`, `FP8`, `E4M3`, `BF16`, `GPTQ`).
 
 > ✅ `` /// Parses the header of a `.safetensors` file. ``
 > ❌ `/// Parses the header of a .safetensors file.`
@@ -258,8 +279,8 @@ as types (`DType`, `NaN`, `FP8`, `E4M3`, `BF16`).
 Rustdoc intra-doc links must resolve under all feature-flag combinations
 (enforced by `#![deny(warnings)]` → `rustdoc::broken_intra_doc_links`).
 
-Feature-gated items (e.g., NPZ types behind `npz` feature) must use plain
-backtick text, not link syntax:
+Feature-gated items (e.g., NPZ types behind `npz` feature, GPTQ types
+behind `gptq` feature) must use plain backtick text, not link syntax:
 
 > ✅ `` /// See `NpzTensor` (requires `npz` feature). ``
 > ❌ `` /// See [`NpzTensor`](crate::parse::npz::NpzTensor). ``
@@ -335,10 +356,12 @@ preemptively.
 ## `#[non_exhaustive]` Policy
 
 - Public enums that may gain new variants: `#[non_exhaustive]`.
-  `NpzDtype`, `QuantScheme`, and `TargetDtype` are all non-exhaustive — new
-  formats and dtypes will be added over time.
+  `Dtype`, `QuantScheme`, `TargetDtype`, and `TensorRole` are all
+  non-exhaustive — new formats and dtypes will be added over time.
 - Internal dispatch enums matched exhaustively by this crate:
   `#[allow(clippy::exhaustive_enums)] // EXHAUSTIVE: <reason>`.
+
+---
 
 ## `#[must_use]` Policy
 
@@ -348,6 +371,8 @@ and pure queries (`byte_size`, `is_quantized`, `tensor_count`).
 
 The `clippy::must_use_candidate` lint enforces this at `warn` level
 (promoted to error by `#![deny(warnings)]`).
+
+---
 
 ## `# Errors` Doc Section
 
@@ -364,20 +389,24 @@ Rules:
 - Follow with `if` (condition), `on` (event), or `when` (circumstance).
 - One bullet per distinct error path.
 
+---
+
 ## Error Message Wording
 
 Error strings passed to `AnamnesisError` variants follow two patterns:
 
 - **External failures** (I/O, serde): `"failed to <verb>: {e}"`
-  > Example: `AnamnesisError::Parse(format!("failed to parse safetensors header: {e}"))`
+  > Example: `AnamnesisError::Parse { reason: format!("failed to parse safetensors header: {e}") }`
 - **Validation failures** (format, range): `"<noun> <problem> (<context>)"`
-  > Example: `AnamnesisError::Parse(format!("unexpected dtype {dtype} for tensor {name}"))`
+  > Example: `AnamnesisError::Parse { reason: format!("unexpected dtype {dtype} for tensor {name}") }`
   > Example: `AnamnesisError::Unsupported { format: "GPTQ".into(), detail: "3-bit quantization not yet supported".into() }`
 
 Rules:
 - Use lowercase, no trailing period.
 - Include the offending value and the valid range or constraint when applicable.
 - Wrap external errors with `: {e}`, not `.to_string()`.
+
+---
 
 ## `# Memory` Doc Section
 
@@ -394,6 +423,8 @@ Format:
     /// Reads the entire safetensors file into memory (~2× model size during
     /// dequantization: source FP8 + destination BF16). The source buffer is
     /// dropped before returning.
+
+---
 
 ## HashMap Grouping Idiom
 
