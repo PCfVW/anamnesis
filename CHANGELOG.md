@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (AutoGPTQ), Llama-3.2-1B INT4 (AutoGPTQ), Llama-3.2-1B INT8 (GPTQModel)
 - **GPTQ inspect/CLI** — zero-point, group-index counts in `inspect` and
   `parse` output; format-aware size label (FP8/GPTQ/unquantized)
+- **AWQ dequantization** (`src/remember/awq.rs`) — INT4 (and INT8 path,
+  unit-tested) with per-group scales, no +1 zero-point offset. Feature-gated
+  behind `awq`. Bit-exact against PyTorch on 2 real models (AutoAWQ GEMM),
+  **4.7–5.7× faster** than CPU PyTorch (AVX2). Loop fission applied from the
+  start; full AVX2 `vsubps`/`vmulps` ymm confirmed
+- **AWQ parsing layer** — `QuantScheme::Awq`, `AwqConfig`, `AwqCompanions`,
+  shape-based detection distinguishing AWQ (packed along cols) from GPTQ
+  (packed along rows), `awq` feature gate
+- **AWQ cross-validation** against PyTorch on 2 models: Llama-3.2-1B and
+  Falcon3-1B (both AutoAWQ GEMM, 4-bit). Note: no real 8-bit AWQ models
+  exist in the standard AutoAWQ `.qweight` format — all "8-bit AWQ" models
+  on HuggingFace are either dequantized F16, `compressed-tensors` (vLLM), or
+  mislabeled 4-bit
 - CONVENTIONS.md: two-level bounds checking pattern (reconciles `// INDEX:`
   safety with SIMD rule #2) and loop fission for mixed-domain pipelines
 
