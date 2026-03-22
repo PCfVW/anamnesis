@@ -25,6 +25,26 @@ Cross-validated against PyTorch on 7 real FP8 models from 5 quantization tools. 
 | Llama-3.2-1B-Instruct-FP8-dynamic | RedHat | Per-channel | BF16 | 2.7x faster |
 | Llama-3.1-8B-Instruct-FP8 | NVIDIA | Per-tensor | F32 | 6.3x faster |
 
+### GPTQ Dequantization
+
+Cross-validated against PyTorch on 4 real GPTQ models from 2 quantizers (AutoGPTQ, GPTQModel). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization.
+
+| Model | Quantizer | Bits | vs PyTorch (AVX2) |
+|---|---|---|---|
+| Falcon3-1B-Instruct-GPTQ-Int4 | AutoGPTQ | 4 | 6.5x faster |
+| Llama-3.2-1B-Instruct-GPTQ | AutoGPTQ | 4 | 12.2x faster |
+| Falcon3-1B-Instruct-GPTQ-Int8 | AutoGPTQ | 8 | 7.0x faster |
+| Llama-3.2-1B-gptqmodel-8bit | GPTQModel | 8 | 7.9x faster |
+
+### AWQ Dequantization
+
+Cross-validated against PyTorch on 2 real AWQ models (AutoAWQ GEMM). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization.
+
+| Model | Quantizer | Bits | vs PyTorch (AVX2) |
+|---|---|---|---|
+| llama-3.2-1b-instruct-awq | AutoAWQ | 4 | 5.7x faster |
+| Falcon3-1B-Instruct-AWQ | AutoAWQ | 4 | 4.7x faster |
+
 ## Development
 
 - Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
