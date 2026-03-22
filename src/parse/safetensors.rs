@@ -175,13 +175,42 @@ pub enum TensorRole {
     Scale,
     /// Passthrough tensor (norms, embeddings, `lm_head`) — already full-precision.
     Passthrough,
+    /// Zero-point tensor (`GPTQ` `.qzeros` — packed integer zero-points).
+    ZeroPoint,
+    /// Group index tensor (`GPTQ` `.g_idx` — maps input features to groups).
+    GroupIndex,
 }
 
 /// Classify a tensor based on its name and dtype.
+///
+/// FP8 rules are checked first (suffix `_scale_inv` / `_scale`, then dtype).
+/// GPTQ rules (`.qweight`, `.qzeros`, `.scales`, `.g_idx`) are checked when
+/// the `gptq` feature is enabled.
 fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
+    // FP8 scale companions (suffix-based, always active)
     if name.ends_with("_scale_inv") || name.ends_with("_scale") {
-        TensorRole::Scale
-    } else if dtype.is_quantized() {
+        return TensorRole::Scale;
+    }
+
+    // GPTQ tensor patterns (name-based, feature-gated)
+    #[cfg(feature = "gptq")]
+    {
+        if name.ends_with(".qweight") {
+            return TensorRole::Quantized;
+        }
+        if name.ends_with(".qzeros") {
+            return TensorRole::ZeroPoint;
+        }
+        if name.ends_with(".scales") {
+            return TensorRole::Scale;
+        }
+        if name.ends_with(".g_idx") {
+            return TensorRole::GroupIndex;
+        }
+    }
+
+    // FP8 quantized by dtype
+    if dtype.is_quantized() {
         TensorRole::Quantized
     } else {
         TensorRole::Passthrough
@@ -204,6 +233,8 @@ pub enum QuantScheme {
     PerTensorFp8,
     /// No quantization detected — all tensors are passthrough.
     Unquantized,
+    /// `GPTQ` quantization (INT4 or INT8 with group-wise scale + zero-point).
+    Gptq,
 }
 
 impl fmt::Display for QuantScheme {
@@ -213,6 +244,7 @@ impl fmt::Display for QuantScheme {
             Self::PerChannelFp8 => "Per-channel FP8 (E4M3), one scale per row",
             Self::PerTensorFp8 => "Per-tensor FP8 (E4M3)",
             Self::Unquantized => "Unquantized",
+            Self::Gptq => "GPTQ",
         };
         f.write_str(s)
     }
@@ -237,7 +269,18 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
         return QuantScheme::Unquantized;
     }
 
-    // Find the first scale companion for any quantized tensor and inspect its shape.
+    // GPTQ: any quantized tensor whose name ends with `.qweight` (feature-gated).
+    #[cfg(feature = "gptq")]
+    {
+        let has_gptq = entries
+            .iter()
+            .any(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"));
+        if has_gptq {
+            return QuantScheme::Gptq;
+        }
+    }
+
+    // FP8: find the first scale companion for any quantized tensor and inspect its shape.
     // We check both `_scale_inv` and `_scale` suffixes.
     for entry in entries.iter().filter(|e| e.role == TensorRole::Quantized) {
         for suffix in &["_scale_inv", "_scale"] {
@@ -263,6 +306,31 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
 
     // Quantized tensors exist but no scale companions found at all
     QuantScheme::PerTensorFp8
+}
+
+// ---------------------------------------------------------------------------
+// GPTQ config (feature-gated types, unconditional struct definition)
+// ---------------------------------------------------------------------------
+
+/// `GPTQ` quantization configuration inferred from safetensors metadata
+/// and/or tensor shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GptqConfig {
+    /// Quantization bit width (4 or 8).
+    pub bits: u8,
+    /// Number of input features per group (typically 128).
+    pub group_size: usize,
+}
+
+/// Companion tensors for a `GPTQ` `.qweight` tensor.
+#[derive(Debug, Clone)]
+pub struct GptqCompanions<'a> {
+    /// Per-group scale factors (`.scales`).
+    pub scales: &'a TensorEntry,
+    /// Per-group packed zero-points (`.qzeros`).
+    pub qzeros: &'a TensorEntry,
+    /// Optional group index mapping (`.g_idx`).
+    pub g_idx: Option<&'a TensorEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +386,8 @@ pub struct SafetensorsHeader {
     pub metadata: Option<HashMap<String, String>>,
     /// Size of the JSON header in bytes (data begins at `header_size + 8`).
     pub header_size: usize,
+    /// `GPTQ` config (bits, group size), if the scheme is `GPTQ`.
+    pub gptq_config: Option<GptqConfig>,
 }
 
 impl SafetensorsHeader {
@@ -370,17 +440,137 @@ impl SafetensorsHeader {
             .find(|e| e.name == scale_inv)
             .or_else(|| self.tensors.iter().find(|e| e.name == scale))
     }
+
+    /// Returns an iterator over zero-point tensors.
+    pub fn zeropoint_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
+        self.tensors
+            .iter()
+            .filter(|e| e.role == TensorRole::ZeroPoint)
+    }
+
+    /// Returns the number of zero-point tensors.
+    #[must_use]
+    pub fn zeropoint_count(&self) -> usize {
+        self.zeropoint_tensors().count()
+    }
+
+    /// Returns an iterator over group-index tensors.
+    pub fn group_index_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
+        self.tensors
+            .iter()
+            .filter(|e| e.role == TensorRole::GroupIndex)
+    }
+
+    /// Returns the number of group-index tensors.
+    #[must_use]
+    pub fn group_index_count(&self) -> usize {
+        self.group_index_tensors().count()
+    }
+
+    /// Finds the `GPTQ` companion tensors (`.scales`, `.qzeros`, optional `.g_idx`)
+    /// for a given `.qweight` tensor name.
+    ///
+    /// Strips the `.qweight` suffix and looks up `{base}.scales`,
+    /// `{base}.qzeros`, and `{base}.g_idx` by name.
+    #[must_use]
+    pub fn find_gptq_companions(&self, qweight_name: &str) -> Option<GptqCompanions<'_>> {
+        let base = qweight_name.strip_suffix(".qweight")?;
+        let scales_name = format!("{base}.scales");
+        let qzeros_name = format!("{base}.qzeros");
+        let g_idx_name = format!("{base}.g_idx");
+
+        let scales = self.tensors.iter().find(|e| e.name == scales_name)?;
+        let qzeros = self.tensors.iter().find(|e| e.name == qzeros_name)?;
+        let g_idx = self.tensors.iter().find(|e| e.name == g_idx_name);
+
+        Some(GptqCompanions {
+            scales,
+            qzeros,
+            g_idx,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
 
+/// Infer `GPTQ` configuration from safetensors `__metadata__` or tensor shapes.
+///
+/// **Primary source:** `AutoGPTQ`-style metadata keys `gptq_bits` and
+/// `gptq_group_size` in the safetensors `__metadata__` section.
+///
+/// **Fallback:** infer from the first `.qweight` / `.scales` pair:
+/// - `bits = 32 / (in_features / qweight.rows)` where `in_features = scales.cols`
+/// - `group_size = in_features / scales.rows`
+fn infer_gptq_config(
+    entries: &[TensorEntry],
+    metadata: Option<&HashMap<String, String>>,
+) -> Option<GptqConfig> {
+    // Try metadata first (AutoGPTQ format).
+    if let Some(meta) = metadata {
+        let bits = meta.get("gptq_bits").and_then(|v| v.parse::<u8>().ok());
+        let group_size = meta
+            .get("gptq_group_size")
+            .and_then(|v| v.parse::<usize>().ok());
+        if let (Some(bits), Some(group_size)) = (bits, group_size) {
+            return Some(GptqConfig { bits, group_size });
+        }
+    }
+
+    // Fallback: infer from tensor shapes.
+    // Find the first .qweight and its companion .scales.
+    for entry in entries
+        .iter()
+        .filter(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"))
+    {
+        let base = entry.name.strip_suffix(".qweight")?;
+        let scales_name = format!("{base}.scales");
+        if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
+            // qweight shape: (in_features / pack_factor, out_features)
+            // scales shape:  (num_groups, out_features)
+            // in_features = scales shape's last dim tells us out_features;
+            //               but we need in_features from g_idx or scales.rows * group_size.
+            // pack_factor = qweight.rows tells us in_features / pack_factor.
+            // out_features = qweight.cols = scales.cols
+            // num_groups = scales.rows
+            // in_features = qweight.rows * pack_factor
+            // bits = 32 / pack_factor
+            // group_size = in_features / num_groups
+
+            if entry.shape.len() >= 2 && scales.shape.len() >= 2 {
+                let qw_rows = entry.shape.first().copied()?;
+                let num_groups = scales.shape.first().copied()?;
+                let out_features = scales.shape.last().copied()?;
+
+                if num_groups == 0 || qw_rows == 0 || out_features == 0 {
+                    return None;
+                }
+
+                // Try each valid bit width to find one that yields integer in_features.
+                for bits in [4u8, 8] {
+                    // CAST: u8 → usize, bits is 4 or 8
+                    #[allow(clippy::as_conversions)]
+                    let pack_factor = 32 / bits as usize;
+                    let in_features = qw_rows.checked_mul(pack_factor)?;
+                    if in_features.is_multiple_of(num_groups) {
+                        let group_size = in_features / num_groups;
+                        return Some(GptqConfig { bits, group_size });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Parses the header of a `.safetensors` file from a byte buffer.
 ///
 /// Extracts all tensor metadata (names, shapes, dtypes, byte offsets),
 /// classifies each tensor (quantized, scale, passthrough), and detects
-/// the quantization scheme (fine-grained `FP8`, per-tensor `FP8`, or unquantized).
+/// the quantization scheme (fine-grained `FP8`, per-tensor `FP8`, `GPTQ`,
+/// or unquantized).
 ///
 /// The buffer must contain at least the 8-byte length prefix and the full
 /// JSON header. It may also contain the tensor data (the data is not read).
@@ -420,11 +610,18 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
     let scheme = detect_scheme(&entries);
     let file_metadata = metadata.metadata().clone();
 
+    let gptq_config = if scheme == QuantScheme::Gptq {
+        infer_gptq_config(&entries, file_metadata.as_ref())
+    } else {
+        None
+    };
+
     Ok(SafetensorsHeader {
         tensors: entries,
         scheme,
         metadata: file_metadata,
         header_size,
+        gptq_config,
     })
 }
 
@@ -661,6 +858,7 @@ mod tests {
             scheme: QuantScheme::FineGrainedFp8,
             metadata: None,
             header_size: 0,
+            gptq_config: None,
         };
         let found = header.find_scale_for("w");
         assert_eq!(found.map(|e| e.name.as_str()), Some("w_scale_inv"));
@@ -676,6 +874,7 @@ mod tests {
             scheme: QuantScheme::PerTensorFp8,
             metadata: None,
             header_size: 0,
+            gptq_config: None,
         };
         let found = header.find_scale_for("w");
         assert_eq!(found.map(|e| e.name.as_str()), Some("w_scale"));
@@ -688,6 +887,7 @@ mod tests {
             scheme: QuantScheme::PerTensorFp8,
             metadata: None,
             header_size: 0,
+            gptq_config: None,
         };
         assert!(header.find_scale_for("w").is_none());
     }

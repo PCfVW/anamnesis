@@ -365,6 +365,12 @@ impl ParsedModel {
                             };
                             dequantize_per_tensor_fp8_to_bf16(weight_data, scale)?
                         }
+                        QuantScheme::Gptq => {
+                            return Err(AnamnesisError::Unsupported {
+                                format: "GPTQ".into(),
+                                detail: "GPTQ dequantization requires the `gptq` feature".into(),
+                            });
+                        }
                         QuantScheme::Unquantized => {
                             // Shouldn't have quantized tensors in an unquantized model,
                             // but treat as passthrough to be safe.
@@ -376,8 +382,8 @@ impl ParsedModel {
                     dequantized_data.push((entry.name.clone(), bf16_bytes, entry.shape.clone()));
                     on_tensor();
                 }
-                TensorRole::Scale => {
-                    // Scale tensors are consumed during dequantization; skip.
+                TensorRole::Scale | TensorRole::ZeroPoint | TensorRole::GroupIndex => {
+                    // Companion tensors are consumed during dequantization; skip.
                 }
                 TensorRole::Passthrough => {
                     let data = self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;

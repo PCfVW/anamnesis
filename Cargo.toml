@@ -15,6 +15,7 @@ default-run = "anamnesis"
 [features]
 default = []
 cli = ["dep:clap"]
+gptq = []
 npz = ["dep:npyz"]
 indicatif = ["dep:indicatif"]
 

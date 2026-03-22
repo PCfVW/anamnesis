@@ -67,8 +67,8 @@ impl From<&SafetensorsHeader> for InspectInfo {
                     let deq_bytes = entry.num_elements() as u64 * 2;
                     dequantized_size += deq_bytes;
                 }
-                TensorRole::Scale => {
-                    // Scale tensors are consumed during dequantization,
+                TensorRole::Scale | TensorRole::ZeroPoint | TensorRole::GroupIndex => {
+                    // Companion tensors are consumed during dequantization,
                     // not written to the output file.
                 }
                 TensorRole::Passthrough => {
@@ -225,6 +225,7 @@ mod tests {
             scheme: QuantScheme::Unquantized,
             metadata: None,
             header_size: 0,
+            gptq_config: None,
         };
         let info = InspectInfo::from(&header);
 
@@ -257,6 +258,7 @@ mod tests {
             scheme: QuantScheme::FineGrainedFp8,
             metadata: None,
             header_size: 0,
+            gptq_config: None,
         };
         let info = InspectInfo::from(&header);
 
@@ -292,6 +294,7 @@ mod tests {
             scheme: QuantScheme::PerTensorFp8,
             metadata: None,
             header_size: 0,
+            gptq_config: None,
         };
         let info = InspectInfo::from(&header);
 
