@@ -18,6 +18,10 @@ use crate::parse::safetensors::{
 };
 #[cfg(feature = "awq")]
 use crate::remember::awq::dequantize_awq_to_bf16;
+#[cfg(feature = "bnb")]
+use crate::remember::bnb::{
+    dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16,
+};
 use crate::remember::fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
@@ -522,11 +526,139 @@ impl ParsedModel {
                             });
                         }
                         #[cfg(feature = "bnb")]
-                        QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {
-                            return Err(AnamnesisError::Unsupported {
-                                format: "BnB".into(),
-                                detail: "BnB model.rs integration not yet implemented".into(),
-                            });
+                        QuantScheme::Bnb4 => {
+                            let config =
+                                self.header
+                                    .bnb_config
+                                    .ok_or_else(|| AnamnesisError::Parse {
+                                        reason: format!(
+                                            "BnB config not available for `{}`",
+                                            entry.name
+                                        ),
+                                    })?;
+                            let companions = self
+                                .header
+                                .find_bnb4_companions(&entry.name)
+                                .ok_or_else(|| AnamnesisError::Parse {
+                                    reason: format!(
+                                        "BnB4 companions not found for `{}`",
+                                        entry.name
+                                    ),
+                                })?;
+
+                            let absmax_data = self.tensor_data(
+                                companions.absmax.data_offsets.0,
+                                companions.absmax.data_offsets.1,
+                            )?;
+                            let quant_map_data = self.tensor_data(
+                                companions.quant_map.data_offsets.0,
+                                companions.quant_map.data_offsets.1,
+                            )?;
+
+                            let total_elements =
+                                entry.byte_len().checked_mul(2).ok_or_else(|| {
+                                    AnamnesisError::Parse {
+                                        reason: "BnB4 total_elements overflow".into(),
+                                    }
+                                })?;
+
+                            let bf16_data = if config.double_quant {
+                                let nested_absmax = companions.nested_absmax.ok_or_else(|| {
+                                    AnamnesisError::Parse {
+                                        reason: format!(
+                                            "BnB4 double-quant: nested_absmax not found for `{}`",
+                                            entry.name
+                                        ),
+                                    }
+                                })?;
+                                let nested_quant_map =
+                                    companions.nested_quant_map.ok_or_else(|| {
+                                        AnamnesisError::Parse {
+                                            reason: format!(
+                                            "BnB4 double-quant: nested_quant_map not found for `{}`",
+                                            entry.name
+                                        ),
+                                        }
+                                    })?;
+                                let nested_absmax_data = self.tensor_data(
+                                    nested_absmax.data_offsets.0,
+                                    nested_absmax.data_offsets.1,
+                                )?;
+                                let nested_quant_map_data = self.tensor_data(
+                                    nested_quant_map.data_offsets.0,
+                                    nested_quant_map.data_offsets.1,
+                                )?;
+
+                                // Infer nested_block_size from absmax count / nested_absmax count
+                                let absmax_count = companions.absmax.num_elements();
+                                let nested_absmax_count = nested_absmax.num_elements();
+                                let nested_block_size = if nested_absmax_count > 0 {
+                                    absmax_count.div_ceil(nested_absmax_count)
+                                } else {
+                                    256
+                                };
+
+                                dequantize_bnb4_double_quant_to_bf16(
+                                    weight_data,
+                                    absmax_data,
+                                    quant_map_data,
+                                    nested_absmax_data,
+                                    nested_quant_map_data,
+                                    total_elements,
+                                    config.block_size,
+                                    nested_block_size,
+                                )?
+                            } else {
+                                dequantize_bnb4_to_bf16(
+                                    weight_data,
+                                    absmax_data,
+                                    quant_map_data,
+                                    total_elements,
+                                    config.block_size,
+                                )?
+                            };
+
+                            // BnB4 weights are flattened to [N, 1]. Output as flat [total_elements].
+                            // Shape recovery from config.json is deferred to a future commit.
+                            let output_shape = vec![total_elements];
+
+                            dequantized_data.push((entry.name.clone(), bf16_data, output_shape));
+                            on_tensor();
+                            continue;
+                        }
+                        #[cfg(feature = "bnb")]
+                        QuantScheme::BnbInt8 => {
+                            let scb_entry =
+                                self.header.find_bnb_int8_scb(&entry.name).ok_or_else(|| {
+                                    AnamnesisError::Parse {
+                                        reason: format!(
+                                            "BnB INT8 SCB companion not found for `{}`",
+                                            entry.name
+                                        ),
+                                    }
+                                })?;
+                            let scb_data = self
+                                .tensor_data(scb_entry.data_offsets.0, scb_entry.data_offsets.1)?;
+
+                            // INT8 keeps its 2D shape [out_features, in_features].
+                            let (out_features, in_features) =
+                                Self::shape_to_rows_cols(&entry.shape)?;
+
+                            let bf16_data = dequantize_bnb_int8_to_bf16(
+                                weight_data,
+                                scb_data,
+                                out_features,
+                                in_features,
+                            )?;
+
+                            // Output tensor: keep name, keep shape.
+                            dequantized_data.push((
+                                entry.name.clone(),
+                                bf16_data,
+                                entry.shape.clone(),
+                            ));
+                            on_tensor();
+                            continue;
                         }
                         #[cfg(not(feature = "bnb"))]
                         QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {

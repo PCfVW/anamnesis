@@ -207,9 +207,9 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 - [x] GPTQ dequantization (`src/remember/gptq.rs`) — INT4/INT8 with group-wise scale + zero-point. Parse GPTQ metadata from safetensors, reconstruct full-precision weights. Bit-exact against PyTorch on 4 real models (2 quantizers × 2 bit widths), 6.5–12.2× faster than CPU PyTorch (AVX2). Loop fission for full AVX2 vectorization — **commit**
 - [x] AWQ dequantization (`src/remember/awq.rs`) — activation-aware INT4 with per-group scales, no +1 zero-point offset. Packs along out_features (columns), unlike GPTQ (rows). Bit-exact against PyTorch on 2 real models (AutoAWQ GEMM), 4.7–5.7× faster than CPU PyTorch (AVX2). Loop fission applied from the start. Note: 8-bit AWQ path is unit-tested but no real 8-bit AWQ models exist in the standard AutoAWQ `.qweight` format — all "8-bit AWQ" on HuggingFace use `compressed-tensors` (vLLM) or are mislabeled 4-bit — **commit**
-- [ ] BitsAndBytes dequantization (`src/remember/bnb.rs`) — NF4, INT8 with absmax/zeropoint — **commit**
-- [ ] Feature gates — each scheme behind its own feature flag (`gptq`, `awq`, `bnb`). Default features: `fp8` only — **commit**
-- [ ] Validation against real models for each scheme — **commits as needed** — **PUSH**
+- [x] BitsAndBytes dequantization (`src/remember/bnb.rs`) — NF4, FP4, double-quant NF4/FP4, and INT8 (LLM.int8()). 4-bit uses 16-entry lookup table + per-block absmax; INT8 uses per-row absmax / 127.0. Bit-exact against PyTorch on 4 real models, 18–54× faster for NF4/FP4 (AVX2), 1.2× for INT8 (near bandwidth limit). Loop fission for NF4/FP4; single-pass AVX2 for INT8 (`vpmovsxbd` → `vcvtdq2ps` → `vmulps`). Format discovery via `hf-fm inspect` (remote header probing) — **commit**
+- [x] Feature gates — each scheme behind its own feature flag (`gptq`, `awq`, `bnb`). Default features: `fp8` only — **commit**
+- [x] Validation against real models for each scheme — **commits as needed** — **PUSH**
 
 **Deliverable:** `anamnesis` v0.2.0 — all major quantization schemes supported. — **PUSH + tag `v0.2.0`**
 

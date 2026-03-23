@@ -25,6 +25,10 @@ pub struct InspectInfo {
     pub zeropoints: usize,
     /// Number of group-index tensors (`GPTQ` `.g_idx`).
     pub group_indices: usize,
+    /// Number of quant-map tensors (`BnB` lookup tables).
+    pub quant_maps: usize,
+    /// Number of nested-scale tensors (`BnB` double-quant absmax).
+    pub nested_scales: usize,
     /// Total tensor data size in bytes (as stored in the file).
     pub current_size: u64,
     /// Estimated tensor data size in bytes after dequantization to `BF16`.
@@ -49,6 +53,8 @@ impl From<&SafetensorsHeader> for InspectInfo {
         let passthrough = header.passthrough_count();
         let zeropoints = header.zeropoint_count();
         let group_indices = header.group_index_count();
+        let quant_maps = header.quant_map_count();
+        let nested_scales = header.nested_scale_count();
 
         let mut scale_dtypes: Vec<Dtype> = Vec::new();
         for entry in header.scale_tensors() {
@@ -68,9 +74,17 @@ impl From<&SafetensorsHeader> for InspectInfo {
 
             match entry.role {
                 TensorRole::Quantized => {
+                    // BnB NF4/FP4: each U8 byte packs 2 values → 2 BF16 = 4 bytes output.
+                    // All other schemes: 1 element → 1 BF16 = 2 bytes output.
                     // CAST: usize → u64, element count fits in u64 for any realistic model
                     #[allow(clippy::as_conversions)]
-                    let deq_bytes = entry.num_elements() as u64 * 2;
+                    let deq_bytes =
+                        if header.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
+                            // 2 NF4/FP4 values per byte → output is byte_len * 2 * 2
+                            entry.byte_len() as u64 * 4
+                        } else {
+                            entry.num_elements() as u64 * 2
+                        };
                     dequantized_size += deq_bytes;
                 }
                 TensorRole::Scale
@@ -96,6 +110,8 @@ impl From<&SafetensorsHeader> for InspectInfo {
             scale_dtypes,
             zeropoints,
             group_indices,
+            quant_maps,
+            nested_scales,
             current_size,
             dequantized_size,
         }
@@ -137,6 +153,22 @@ impl fmt::Display for InspectInfo {
                 f,
                 "\nGroup index: {} tensors (activation-order)",
                 self.group_indices,
+            )?;
+        }
+
+        if self.quant_maps > 0 {
+            write!(
+                f,
+                "\nQuant maps:  {} tensors (lookup tables)",
+                self.quant_maps,
+            )?;
+        }
+
+        if self.nested_scales > 0 {
+            write!(
+                f,
+                "\nNested:      {} tensors (double-quant absmax)",
+                self.nested_scales,
             )?;
         }
 
@@ -360,6 +392,8 @@ mod tests {
             scale_dtypes: vec![],
             zeropoints: 0,
             group_indices: 0,
+            quant_maps: 0,
+            nested_scales: 0,
             current_size: 4_672 * 1024 * 1024,
             dequantized_size: 8_269 * 1024 * 1024,
         };
@@ -382,6 +416,8 @@ mod tests {
             scale_dtypes: vec![Dtype::F32],
             zeropoints: 0,
             group_indices: 0,
+            quant_maps: 0,
+            nested_scales: 0,
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
         };
@@ -403,6 +439,8 @@ mod tests {
             scale_dtypes: vec![Dtype::BF16],
             zeropoints: 0,
             group_indices: 0,
+            quant_maps: 0,
+            nested_scales: 0,
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
         };
@@ -422,6 +460,8 @@ mod tests {
             scale_dtypes: vec![],
             zeropoints: 0,
             group_indices: 0,
+            quant_maps: 0,
+            nested_scales: 0,
             current_size: 1024 * 1024 * 1024,
             dequantized_size: 1024 * 1024 * 1024,
         };

@@ -20,8 +20,8 @@
 
 use std::time::Instant;
 
-use anamnesis::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
 use anamnesis::remember::bnb::dequantize_bnb4_double_quant_to_bf16;
+use anamnesis::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
@@ -32,7 +32,7 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-/// Parsed NF4/FP4 fixture (format_id = 0 or 2).
+/// Parsed `NF4`/`FP4` fixture (`format_id` = 0 or 2).
 struct Bnb4Fixture {
     format_id: u32,
     total_elements: usize,
@@ -45,7 +45,7 @@ struct Bnb4Fixture {
     expected_bf16: Vec<u8>,
 }
 
-/// Parsed INT8 fixture (format_id = 1).
+/// Parsed `INT8` fixture (`format_id` = 1).
 struct BnbInt8Fixture {
     out_features: usize,
     in_features: usize,
@@ -187,7 +187,7 @@ fn run_bnb4_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         let absmax_count = fixture.absmax_data.len();
         let nested_absmax_count = fixture.nested_absmax_data.len() / 4;
         let nested_block_size = if nested_absmax_count > 0 {
-            (absmax_count + nested_absmax_count - 1) / nested_absmax_count
+            absmax_count.div_ceil(nested_absmax_count)
         } else {
             256
         };
@@ -219,7 +219,10 @@ fn run_bnb4_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         "  {mismatches} mismatches, max ULP diff = {max_diff}, anamnesis = {:.1} µs",
         elapsed.as_secs_f64() * 1e6,
     );
-    assert_eq!(mismatches, 0, "{name}: {mismatches} BF16 mismatches (max ULP diff = {max_diff})");
+    assert_eq!(
+        mismatches, 0,
+        "{name}: {mismatches} BF16 mismatches (max ULP diff = {max_diff})"
+    );
 }
 
 fn run_int8_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
@@ -247,7 +250,10 @@ fn run_int8_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         "  {mismatches} mismatches, max ULP diff = {max_diff}, anamnesis = {:.1} µs",
         elapsed.as_secs_f64() * 1e6,
     );
-    assert_eq!(mismatches, 0, "{name}: {mismatches} BF16 mismatches (max ULP diff = {max_diff})");
+    assert_eq!(
+        mismatches, 0,
+        "{name}: {mismatches} BF16 mismatches (max ULP diff = {max_diff})"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exist in the standard AutoAWQ `.qweight` format — all "8-bit AWQ" models
   on HuggingFace are either dequantized F16, `compressed-tensors` (vLLM), or
   mislabeled 4-bit
+- **BitsAndBytes dequantization** (`src/remember/bnb.rs`) — NF4, FP4 (both
+  4-bit lookup-table with per-block absmax), double-quant NF4/FP4 (nested
+  absmax), and INT8 (`LLM.int8()` with per-row absmax). Feature-gated behind
+  `bnb`. Bit-exact against PyTorch on 4 real models, **18–54× faster** for
+  NF4/FP4 (AVX2), **1.2× faster** for INT8 (near memory bandwidth limit).
+  Loop fission for NF4/FP4; single-pass AVX2 for INT8 (`vpmovsxbd` →
+  `vcvtdq2ps` → `vmulps`)
+- **BnB parsing layer** — `QuantScheme::Bnb4` / `BnbInt8`,
+  `TensorRole::QuantMap` / `NestedScale`, `BnbConfig` (block_size,
+  double_quant), `Bnb4Companions`, detection by `.weight.quant_map` (NF4/FP4)
+  and `.SCB` (INT8) naming patterns, `bnb` feature gate
+- **BnB cross-validation** against PyTorch on 4 models: Llama-3.2-1B NF4,
+  Llama-3.2-1B NF4 double-quant, Llama-3.2-1B FP4, Llama-3.2-1B INT8
+- **BnB model.rs integration** — `Bnb4` and `BnbInt8` arms in
+  `remember_bf16_inner` with companion lookup, double-quant detection, and
+  shape handling (flat output for NF4/FP4, preserved 2D for INT8)
 - CONVENTIONS.md: two-level bounds checking pattern (reconciles `// INDEX:`
   safety with SIMD rule #2) and loop fission for mixed-domain pipelines
 
