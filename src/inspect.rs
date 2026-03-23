@@ -73,7 +73,11 @@ impl From<&SafetensorsHeader> for InspectInfo {
                     let deq_bytes = entry.num_elements() as u64 * 2;
                     dequantized_size += deq_bytes;
                 }
-                TensorRole::Scale | TensorRole::ZeroPoint | TensorRole::GroupIndex => {
+                TensorRole::Scale
+                | TensorRole::ZeroPoint
+                | TensorRole::GroupIndex
+                | TensorRole::QuantMap
+                | TensorRole::NestedScale => {
                     // Companion tensors are consumed during dequantization,
                     // not written to the output file.
                 }
@@ -138,6 +142,8 @@ impl fmt::Display for InspectInfo {
 
         let scheme_label = match self.format {
             QuantScheme::Gptq | QuantScheme::Awq => "GPTQ/AWQ",
+            QuantScheme::Bnb4 => "BnB NF4/FP4",
+            QuantScheme::BnbInt8 => "BnB INT8",
             QuantScheme::Unquantized => "unquantized",
             QuantScheme::FineGrainedFp8
             | QuantScheme::PerChannelFp8
@@ -254,6 +260,7 @@ mod tests {
             header_size: 0,
             gptq_config: None,
             awq_config: None,
+            bnb_config: None,
         };
         let info = InspectInfo::from(&header);
 
@@ -288,6 +295,7 @@ mod tests {
             header_size: 0,
             gptq_config: None,
             awq_config: None,
+            bnb_config: None,
         };
         let info = InspectInfo::from(&header);
 
@@ -325,6 +333,7 @@ mod tests {
             header_size: 0,
             gptq_config: None,
             awq_config: None,
+            bnb_config: None,
         };
         let info = InspectInfo::from(&header);
 

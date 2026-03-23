@@ -4,6 +4,6 @@
 pub mod safetensors;
 
 pub use safetensors::{
-    AwqCompanions, AwqConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,
-    TensorEntry, TensorRole,
+    AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
+    QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
 };

@@ -13,13 +13,15 @@ pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
 pub use parse::{
-    AwqCompanions, AwqConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,
-    TensorEntry, TensorRole,
+    AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
+    QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
 };
 #[cfg(feature = "awq")]
 pub use remember::dequantize_awq_to_bf16;
 #[cfg(feature = "gptq")]
 pub use remember::dequantize_gptq_to_bf16;
+#[cfg(feature = "bnb")]
+pub use remember::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
 pub use remember::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };

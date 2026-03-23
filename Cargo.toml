@@ -17,6 +17,7 @@ default = []
 cli = ["dep:clap"]
 gptq = []
 awq = []
+bnb = []
 npz = ["dep:npyz"]
 indicatif = ["dep:indicatif"]
 

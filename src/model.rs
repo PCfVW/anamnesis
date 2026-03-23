@@ -521,6 +521,20 @@ impl ParsedModel {
                                 detail: "AWQ dequantization requires the `awq` feature".into(),
                             });
                         }
+                        #[cfg(feature = "bnb")]
+                        QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {
+                            return Err(AnamnesisError::Unsupported {
+                                format: "BnB".into(),
+                                detail: "BnB model.rs integration not yet implemented".into(),
+                            });
+                        }
+                        #[cfg(not(feature = "bnb"))]
+                        QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {
+                            return Err(AnamnesisError::Unsupported {
+                                format: "BnB".into(),
+                                detail: "BnB dequantization requires the `bnb` feature".into(),
+                            });
+                        }
                         QuantScheme::Unquantized => {
                             // Shouldn't have quantized tensors in an unquantized model,
                             // but treat as passthrough to be safe.
@@ -532,7 +546,11 @@ impl ParsedModel {
                     dequantized_data.push((entry.name.clone(), bf16_bytes, entry.shape.clone()));
                     on_tensor();
                 }
-                TensorRole::Scale | TensorRole::ZeroPoint | TensorRole::GroupIndex => {
+                TensorRole::Scale
+                | TensorRole::ZeroPoint
+                | TensorRole::GroupIndex
+                | TensorRole::QuantMap
+                | TensorRole::NestedScale => {
                     // Companion tensors are consumed during dequantization; skip.
                 }
                 TensorRole::Passthrough => {

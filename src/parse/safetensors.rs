@@ -179,6 +179,10 @@ pub enum TensorRole {
     ZeroPoint,
     /// Group index tensor (`GPTQ` `.g_idx` — maps input features to groups).
     GroupIndex,
+    /// Quantization lookup table (`BnB` `.weight.quant_map` / `.weight.nested_quant_map`).
+    QuantMap,
+    /// Nested absmax scale (`BnB` double-quant `.weight.nested_absmax`).
+    NestedScale,
 }
 
 /// Classify a tensor based on its name and dtype.
@@ -206,6 +210,37 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
         }
         if name.ends_with(".g_idx") {
             return TensorRole::GroupIndex;
+        }
+    }
+
+    // BitsAndBytes tensor patterns (name-based, feature-gated)
+    #[cfg(feature = "bnb")]
+    {
+        // NF4/FP4 companions (checked before weight to avoid false positives)
+        if name.ends_with(".weight.nested_quant_map") || name.ends_with(".weight.quant_map") {
+            return TensorRole::QuantMap;
+        }
+        if name.ends_with(".weight.nested_absmax") {
+            return TensorRole::NestedScale;
+        }
+        if name.ends_with(".weight.absmax") {
+            return TensorRole::Scale;
+        }
+        // INT8 companion (per-row scale)
+        // Not a file extension — `.SCB` is a BnB tensor name suffix.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        if name.ends_with(".SCB") {
+            return TensorRole::Scale;
+        }
+        // NF4/FP4 quantized weight: U8 dtype, flattened [N, 1] shape, and has
+        // a `.weight.quant_map` companion (but we check dtype + shape here;
+        // the companion is verified during scheme detection).
+        if dtype == Dtype::U8 && name.ends_with(".weight") {
+            return TensorRole::Quantized;
+        }
+        // INT8 quantized weight: I8 dtype with a `.SCB` companion.
+        if dtype == Dtype::I8 && name.ends_with(".weight") {
+            return TensorRole::Quantized;
         }
     }
 
@@ -237,6 +272,10 @@ pub enum QuantScheme {
     Gptq,
     /// `AWQ` quantization (activation-aware, INT4 or INT8 with per-group scales).
     Awq,
+    /// `BitsAndBytes` 4-bit quantization (`NF4` or `FP4` with per-block absmax).
+    Bnb4,
+    /// `BitsAndBytes` `INT8` quantization (`LLM.int8()` with per-row absmax).
+    BnbInt8,
 }
 
 impl fmt::Display for QuantScheme {
@@ -248,6 +287,8 @@ impl fmt::Display for QuantScheme {
             Self::Unquantized => "Unquantized",
             Self::Gptq => "GPTQ",
             Self::Awq => "AWQ",
+            Self::Bnb4 => "BitsAndBytes NF4/FP4 (4-bit, per-block absmax)",
+            Self::BnbInt8 => "BitsAndBytes INT8 (LLM.int8(), per-row absmax)",
         };
         f.write_str(s)
     }
@@ -299,6 +340,26 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
                     }
                 }
             }
+        }
+    }
+
+    // BitsAndBytes: detect by companion tensor naming patterns.
+    // NF4/FP4: `.weight.quant_map` (F32[16] lookup table) is the definitive marker.
+    // INT8: `.SCB` (F32 per-row absmax) with I8 weight.
+    #[cfg(feature = "bnb")]
+    {
+        let has_quant_map = entries.iter().any(|e| e.role == TensorRole::QuantMap);
+        if has_quant_map {
+            return QuantScheme::Bnb4;
+        }
+        let has_scb = entries.iter().any(|e| {
+            // Not a file extension — `.SCB` is a BnB tensor name suffix.
+            #[allow(clippy::case_sensitive_file_extension_comparisons)]
+            let is_scb = e.name.ends_with(".SCB");
+            e.role == TensorRole::Scale && is_scb
+        });
+        if has_scb {
+            return QuantScheme::BnbInt8;
         }
     }
 
@@ -383,6 +444,36 @@ pub struct AwqCompanions<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// BnB config
+// ---------------------------------------------------------------------------
+
+/// `BitsAndBytes` 4-bit (`NF4`/`FP4`) quantization configuration.
+///
+/// Inferred from tensor shapes. The `quant_map` distinguishes `NF4` from `FP4`
+/// (different lookup table values), but both use the same dequantization code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BnbConfig {
+    /// Block size for absmax quantization (typically 64).
+    pub block_size: usize,
+    /// Whether the model uses double quantization (nested absmax).
+    pub double_quant: bool,
+}
+
+/// Companion tensors for a `BitsAndBytes` `NF4`/`FP4` `.weight` tensor.
+#[derive(Debug, Clone)]
+pub struct Bnb4Companions<'a> {
+    /// Per-block absolute maximum values (`.weight.absmax`).
+    /// `F32` for plain `NF4`/`FP4`, `U8` for double-quant.
+    pub absmax: &'a TensorEntry,
+    /// 4-bit → `f32` lookup table (`.weight.quant_map`, `F32[16]`).
+    pub quant_map: &'a TensorEntry,
+    /// Nested absmax for double quantization (`.weight.nested_absmax`, `F32`).
+    pub nested_absmax: Option<&'a TensorEntry>,
+    /// Nested lookup table for double quantization (`.weight.nested_quant_map`, `F32[256]`).
+    pub nested_quant_map: Option<&'a TensorEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // TensorEntry
 // ---------------------------------------------------------------------------
 
@@ -439,6 +530,8 @@ pub struct SafetensorsHeader {
     pub gptq_config: Option<GptqConfig>,
     /// `AWQ` config (bits, group size), if the scheme is `AWQ`.
     pub awq_config: Option<AwqConfig>,
+    /// `BnB` 4-bit config (block size, double-quant), if the scheme is `Bnb4`.
+    pub bnb_config: Option<BnbConfig>,
 }
 
 impl SafetensorsHeader {
@@ -555,6 +648,71 @@ impl SafetensorsHeader {
         let qzeros = self.tensors.iter().find(|e| e.name == qzeros_name)?;
 
         Some(AwqCompanions { scales, qzeros })
+    }
+
+    /// Returns an iterator over quant-map tensors (`BnB` lookup tables).
+    pub fn quant_map_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
+        self.tensors
+            .iter()
+            .filter(|e| e.role == TensorRole::QuantMap)
+    }
+
+    /// Returns the number of quant-map tensors.
+    #[must_use]
+    pub fn quant_map_count(&self) -> usize {
+        self.quant_map_tensors().count()
+    }
+
+    /// Returns an iterator over nested-scale tensors (`BnB` double-quant absmax).
+    pub fn nested_scale_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
+        self.tensors
+            .iter()
+            .filter(|e| e.role == TensorRole::NestedScale)
+    }
+
+    /// Returns the number of nested-scale tensors.
+    #[must_use]
+    pub fn nested_scale_count(&self) -> usize {
+        self.nested_scale_tensors().count()
+    }
+
+    /// Finds the `BnB` `NF4`/`FP4` companion tensors for a given quantized
+    /// `.weight` tensor name.
+    ///
+    /// Looks up `{name}.absmax`, `{name}.quant_map`, and optionally
+    /// `{name}.nested_absmax` and `{name}.nested_quant_map`.
+    #[must_use]
+    pub fn find_bnb4_companions(&self, weight_name: &str) -> Option<Bnb4Companions<'_>> {
+        let absmax_name = format!("{weight_name}.absmax");
+        let quant_map_name = format!("{weight_name}.quant_map");
+        let nested_absmax_name = format!("{weight_name}.nested_absmax");
+        let nested_quant_map_name = format!("{weight_name}.nested_quant_map");
+
+        let absmax = self.tensors.iter().find(|e| e.name == absmax_name)?;
+        let quant_map = self.tensors.iter().find(|e| e.name == quant_map_name)?;
+        let nested_absmax = self.tensors.iter().find(|e| e.name == nested_absmax_name);
+        let nested_quant_map = self
+            .tensors
+            .iter()
+            .find(|e| e.name == nested_quant_map_name);
+
+        Some(Bnb4Companions {
+            absmax,
+            quant_map,
+            nested_absmax,
+            nested_quant_map,
+        })
+    }
+
+    /// Finds the `BnB` `INT8` companion tensor (`.SCB`) for a given `.weight`
+    /// tensor name.
+    ///
+    /// Strips the `.weight` suffix and looks up `{base}.SCB`.
+    #[must_use]
+    pub fn find_bnb_int8_scb(&self, weight_name: &str) -> Option<&TensorEntry> {
+        let base = weight_name.strip_suffix(".weight")?;
+        let scb_name = format!("{base}.SCB");
+        self.tensors.iter().find(|e| e.name == scb_name)
     }
 }
 
@@ -674,6 +832,42 @@ fn infer_gptq_config(
     None
 }
 
+/// Infer `BnB` 4-bit configuration from tensor shapes.
+///
+/// Block size is derived from `total_elements / absmax_count`:
+/// - `total_elements = weight.byte_len() * 2` (2 nibbles per byte)
+/// - `absmax_count = absmax.num_elements()`
+/// - `block_size = total_elements / absmax_count`
+///
+/// Double-quant is detected by the presence of `.weight.nested_absmax`.
+fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
+    // Find the first quantized weight with a .quant_map companion.
+    for entry in entries
+        .iter()
+        .filter(|e| e.role == TensorRole::Quantized && e.dtype == Dtype::U8)
+    {
+        let absmax_name = format!("{}.absmax", entry.name);
+        let nested_name = format!("{}.nested_absmax", entry.name);
+
+        if let Some(absmax) = entries.iter().find(|e| e.name == absmax_name) {
+            // total_elements = weight bytes × 2 (two NF4 values per byte)
+            let total_elements = entry.byte_len().checked_mul(2)?;
+            let absmax_count = absmax.num_elements();
+            if absmax_count == 0 || total_elements % absmax_count != 0 {
+                return None;
+            }
+            let block_size = total_elements / absmax_count;
+            let double_quant = entries.iter().any(|e| e.name == nested_name);
+
+            return Some(BnbConfig {
+                block_size,
+                double_quant,
+            });
+        }
+    }
+    None
+}
+
 /// Parses the header of a `.safetensors` file from a byte buffer.
 ///
 /// Extracts all tensor metadata (names, shapes, dtypes, byte offsets),
@@ -731,6 +925,12 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
         None
     };
 
+    let bnb_config = if scheme == QuantScheme::Bnb4 {
+        infer_bnb_config(&entries)
+    } else {
+        None
+    };
+
     Ok(SafetensorsHeader {
         tensors: entries,
         scheme,
@@ -738,6 +938,7 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
         header_size,
         gptq_config,
         awq_config,
+        bnb_config,
     })
 }
 
@@ -976,6 +1177,7 @@ mod tests {
             header_size: 0,
             gptq_config: None,
             awq_config: None,
+            bnb_config: None,
         };
         let found = header.find_scale_for("w");
         assert_eq!(found.map(|e| e.name.as_str()), Some("w_scale_inv"));
@@ -993,6 +1195,7 @@ mod tests {
             header_size: 0,
             gptq_config: None,
             awq_config: None,
+            bnb_config: None,
         };
         let found = header.find_scale_for("w");
         assert_eq!(found.map(|e| e.name.as_str()), Some("w_scale"));
@@ -1007,6 +1210,7 @@ mod tests {
             header_size: 0,
             gptq_config: None,
             awq_config: None,
+            bnb_config: None,
         };
         assert!(header.find_scale_for("w").is_none());
     }
