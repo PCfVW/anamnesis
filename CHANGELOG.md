@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BnB model.rs integration** — `Bnb4` and `BnbInt8` arms in
   `remember_bf16_inner` with companion lookup, double-quant detection, and
   shape handling (flat output for NF4/FP4, preserved 2D for INT8)
+- `FromStr` impl for `TargetDtype` — centralizes string-to-enum parsing so new
+  variants cannot be silently missed in the CLI
+- `ParsedModel::remember_with_progress()` — dequantize with a per-tensor
+  callback, enabling progress reporting in CLI contexts
+- `indicatif` progress bar during `remember`/`dequantize` when built with the
+  `indicatif` feature (`amn remember` shows `[====================] 2.1s`)
 - CONVENTIONS.md: two-level bounds checking pattern (reconciles `// INDEX:`
   safety with SIMD rule #2) and loop fission for mixed-domain pipelines
 
@@ -76,15 +82,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wildcard that would silently produce broken paths for future variants
 - Simplified `shape_to_rows_cols` 2D arm: direct indexing with `// INDEX:`
   annotation instead of redundant `Option` unwrapping
-
-### Added
-
-- `FromStr` impl for `TargetDtype` — centralizes string-to-enum parsing so new
-  variants cannot be silently missed in the CLI
-- `ParsedModel::remember_with_progress()` — dequantize with a per-tensor
-  callback, enabling progress reporting in CLI contexts
-- `indicatif` progress bar during `remember`/`dequantize` when built with the
-  `indicatif` feature (`amn remember` shows `[====================] 2.1s`)
 
 ## [0.1.0] — FP8 Dequantization
 
