@@ -11,7 +11,18 @@
 
 > ⚠️ **This crate is under active development.** See [ROADMAP.md](ROADMAP.md) for the plan and [CHANGELOG.md](CHANGELOG.md) for current progress.
 
+## Table of Contents
+
+- [Tested Models](#tested-models)
+  - [FP8 Dequantization](#fp8-dequantization)
+  - [GPTQ Dequantization](#gptq-dequantization)
+  - [AWQ Dequantization](#awq-dequantization)
+  - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
+- [Development](#development)
+
 ## Tested Models
+
+### FP8 Dequantization
 
 Cross-validated against PyTorch on 7 real FP8 models from 5 quantization tools. Bit-exact output (0 ULP difference). Auto-vectorized: SSE2 on any x86-64, AVX2 with `target-cpu=native`.
 
