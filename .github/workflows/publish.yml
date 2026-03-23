@@ -33,7 +33,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test
+        run: cargo test --all-features
 
       - name: Doc check
         run: cargo doc --all-features --no-deps
