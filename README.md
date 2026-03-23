@@ -45,6 +45,19 @@ Cross-validated against PyTorch on 2 real AWQ models (AutoAWQ GEMM). Bit-exact o
 | llama-3.2-1b-instruct-awq | AutoAWQ | 4 | 5.7x faster |
 | Falcon3-1B-Instruct-AWQ | AutoAWQ | 4 | 4.7x faster |
 
+### BitsAndBytes Dequantization
+
+Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-quant, INT8). Bit-exact output (0 ULP difference). Loop fission for AVX2 on NF4/FP4; single-pass AVX2 on INT8 (`vpmovsxbd` → `vcvtdq2ps` → `vmulps`).
+
+| Model | Format | Elements | vs PyTorch (AVX2) |
+|---|---|---|---|
+| Llama-3.2-1B-Instruct-bnb-nf4 | NF4 | 4,096 | 21.8x faster |
+| Llama-3.2-1B-BNB-FP4 | FP4 | 4,096 | 18.0x faster |
+| Llama-3.2-1B-Instruct-bnb-nf4-double-quant | NF4 double-quant | 4,096 | 54.0x faster |
+| Llama-3.2-1B-BNB-INT8 | INT8 | 65,536 | 1.2x faster |
+
+> **Note:** INT8 speedup is modest because the operation is trivially simple (`i8→f32→multiply`). Both PyTorch and anamnesis are near memory bandwidth limits at ~0.7–0.8 ns/element. The AVX2 hot loop is fully vectorized — the 1.2× reflects the inherent ceiling, not a missed optimization.
+
 ## Development
 
 - Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
