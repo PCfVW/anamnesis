@@ -234,7 +234,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Deliverable:** `anamnesis` v0.3.0 — NPZ parsing works. candle-mi can migrate its NPZ dependency from internal to `anamnesis`. — **PUSH + tag `v0.3.0`**
 
-**New dependencies:** `npyz` with its `npz` feature enabled (pulls in `zip` transitively). Feature-gated behind anamnesis's `npz` feature.
+**New dependencies:** `zip` v2 with `deflate` feature (direct dependency, no `npyz`). Feature-gated behind anamnesis's `npz` feature.
 
 ### Phase 4: Quantization (Lethe)
 
