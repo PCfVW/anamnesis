@@ -139,6 +139,8 @@ fn classify_dtype(dtype: &npyz::DType, name: &str) -> crate::Result<NpzDtype> {
             (npyz::TypeChar::Float, 4) => Ok(NpzDtype::F32),
             (npyz::TypeChar::Float, 8) => Ok(NpzDtype::F64),
             (npyz::TypeChar::RawData, 2) => Ok(NpzDtype::BF16),
+            // EXHAUSTIVE: TypeChar is a foreign #[non_exhaustive] enum; catch-all
+            // covers complex, timedelta, datetime, bytestr, unicode, and future variants
             (tc, size) => Err(AnamnesisError::Unsupported {
                 format: "NPZ".into(),
                 detail: format!("unsupported dtype {}{size} for array {name}", tc.to_str()),
@@ -214,11 +216,7 @@ fn read_typed_array<R: Read>(
         NpzDtype::Bool => {
             let npy = npyz::NpyFile::with_header(header, reader);
             let vals = read_into_vec::<bool, R>(npy, name)?;
-            let mut bytes = Vec::with_capacity(vals.len());
-            for &v in &vals {
-                bytes.push(u8::from(v));
-            }
-            Ok(bytes)
+            Ok(vals.iter().map(|&v| u8::from(v)).collect())
         }
         NpzDtype::U8 => {
             let npy = npyz::NpyFile::with_header(header, reader);
@@ -227,8 +225,6 @@ fn read_typed_array<R: Read>(
         NpzDtype::I8 => {
             let npy = npyz::NpyFile::with_header(header, reader);
             let vals = read_into_vec::<i8, R>(npy, name)?;
-            // CAST: i8 → u8, reinterpreting the sign bit as raw bytes
-            #[allow(clippy::as_conversions)]
             let bytes = vals.iter().map(|&v| v.cast_unsigned()).collect();
             Ok(bytes)
         }
@@ -351,7 +347,12 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
         let data = if npz_dtype == NpzDtype::BF16 {
             // BF16 (V2): read raw bytes directly — header already consumed,
             // entry is positioned at the data section.
-            let n_elements: usize = shape.iter().product();
+            let n_elements: usize = shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("element count overflow for array {name}"),
+                })?;
             let byte_count = n_elements
                 .checked_mul(2)
                 .ok_or_else(|| AnamnesisError::Parse {
