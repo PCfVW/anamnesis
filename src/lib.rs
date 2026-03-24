@@ -3,9 +3,9 @@
 //! **ἀνάμνησις** — parse any tensor format, recover any precision.
 //!
 //! `anamnesis` is a framework-agnostic Rust library for dequantizing
-//! quantized model weights stored in `.safetensors` files. It reads once,
-//! classifies every tensor by role, detects the quantization scheme, and
-//! recovers full-precision `BF16` weights — all without `unsafe` code.
+//! quantized model weights and parsing tensor archives. It handles
+//! `.safetensors` (read once, classify, dequantize to `BF16`) and
+//! `.npz` (bulk extraction at near-I/O speed) — all without `unsafe` code.
 //!
 //! # Supported Quantization Schemes
 //!
@@ -19,6 +19,13 @@
 //!
 //! All schemes produce **bit-exact** output (0 ULP difference) against
 //! `PyTorch` reference implementations, verified on real models.
+//!
+//! # `NPZ`/`NPY` Parsing
+//!
+//! Feature-gated behind `npz`. Custom `NPY` header parser with bulk
+//! `read_exact` — zero per-element deserialization for LE data on LE
+//! machines. Supports `F16`, `BF16`, `F32`, `F64`, all integer types,
+//! and `Bool`. **3,586 MB/s** on a 302 MB file (1.3× raw I/O overhead).
 //!
 //! # Quick Start
 //!
@@ -40,6 +47,8 @@
 //!   estimates from the header (zero I/O)
 //! - [`ParsedModel::remember`] — dequantize all quantized tensors to `BF16`
 //!   and write a standard `.safetensors` file
+//! - `parse_npz()` — read an `.npz` archive into a `HashMap<String, NpzTensor>`
+//!   (requires `npz` feature)
 //!
 //! The [`remember`] module contains one submodule per quantization family
 //! ([`remember::fp8`], [`remember::gptq`], [`remember::awq`],
