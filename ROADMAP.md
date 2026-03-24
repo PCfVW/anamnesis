@@ -296,10 +296,9 @@ Silicon and ARM servers. The scalar fallback covers everything else.
 ### Error type
 
 A single `AnamnesisError` enum with variants per failure category:
-- `Parse { reason }` — format decoding failures
+- `Parse { reason }` — format decoding failures (including `NPZ`/`NPY` and `ZIP` errors)
 - `Unsupported { format, detail }` — recognized but unimplemented format
 - `Io(std::io::Error)` — file system errors
-- `NpzParse { reason }` — NPZ-specific parse failures (feature-gated)
 
 ---
 

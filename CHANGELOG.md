@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overhead), **17.7× faster** than `npyz`-backed parser
 - **NPZ cross-validation** against Gemma Scope 2B SAE weights (`params.npz`,
   5 `F32` arrays). Byte-exact match against `NumPy` reference on all arrays
+
+## [0.2.0] - 2026-03-24
+
+### Added
+
 - **GPTQ dequantization** (`src/remember/gptq.rs`) — INT4 and INT8 with
   group-wise scale + zero-point, activation-order via `g_idx`. Feature-gated
   behind `gptq`. Bit-exact against PyTorch on 4 real models from 2 quantizers
@@ -122,7 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated GPTQ docstring memory estimate from "~1 MB" to "up to ~8 MB per
   weight tensor" to reflect fine-grained group configurations
 
-## [0.1.0] — FP8 Dequantization
+## [0.1.0] - 2026-03-24
 
 ### Added
 

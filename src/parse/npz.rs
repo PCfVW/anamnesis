@@ -122,6 +122,7 @@ impl fmt::Display for NpzDtype {
 #[derive(Debug, Clone)]
 pub struct NpzTensor {
     /// Tensor name as stored in the archive (without `.npy` extension).
+    /// Matches the `HashMap` key returned by [`parse_npz`].
     pub name: String,
     /// Tensor dimensions (e.g., `[16384, 2304]`).
     pub shape: Vec<usize>,
@@ -173,7 +174,9 @@ fn parse_npy_header(reader: &mut impl Read) -> crate::Result<NpyHeader> {
         });
     }
 
-    // INDEX: preamble[6] and preamble[7] are safe (8-byte array)
+    // INDEX: preamble[6] is safe (8-byte array)
+    // EXPLICIT: preamble[7] (minor version) is read but unused — the NPY spec
+    // defines only minor version 0 for all major versions (1, 2, 3).
     #[allow(clippy::indexing_slicing)]
     let major = preamble[6];
 
@@ -261,28 +264,30 @@ fn extract_descr(header: &str) -> crate::Result<(NpzDtype, bool)> {
             reason: "NPY header truncated after 'descr'".into(),
         })?;
 
-    // Extract the string between quotes.
-    let quote_char = if value_str.contains('\'') { '\'' } else { '"' };
-    let first_quote = value_str
-        .find(quote_char)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "NPY header 'descr' value not quoted".into(),
-        })?;
-    let inner = value_str
-        .get(first_quote + 1..)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "NPY header 'descr' value truncated".into(),
-        })?;
-    let second_quote = inner
+    // Extract the string between quotes. Detect the quote character from the
+    // first quote found in the value portion (not the entire header tail),
+    // so mixed-quote headers like {'descr': "<f4", 'other': ...} work.
+    let trimmed = value_str.trim_start();
+    let quote_char = match trimmed.as_bytes().first() {
+        Some(b'\'') => '\'',
+        Some(b'"') => '"',
+        _ => {
+            return Err(AnamnesisError::Parse {
+                reason: "NPY header 'descr' value not quoted".into(),
+            });
+        }
+    };
+    let inner = trimmed.get(1..).ok_or_else(|| AnamnesisError::Parse {
+        reason: "NPY header 'descr' value truncated after opening quote".into(),
+    })?;
+    let closing = inner
         .find(quote_char)
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "NPY header 'descr' value missing closing quote".into(),
         })?;
-    let descr = inner
-        .get(..second_quote)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "NPY header 'descr' extraction failed".into(),
-        })?;
+    let descr = inner.get(..closing).ok_or_else(|| AnamnesisError::Parse {
+        reason: "NPY header 'descr' extraction failed".into(),
+    })?;
 
     parse_descr(descr)
 }
@@ -310,6 +315,8 @@ fn parse_descr(descr: &str) -> crate::Result<(NpzDtype, bool)> {
     #[allow(clippy::indexing_slicing)]
     let type_str = &descr[1..];
 
+    // EXPLICIT: '=' (native endian) is treated as little-endian. All modern ML
+    // platforms (x86-64, ARM64) are LE; a BE-native machine would need '>' explicitly.
     let big_endian = endian_char == b'>';
 
     let dtype = match type_str {
@@ -344,7 +351,11 @@ fn parse_descr(descr: &str) -> crate::Result<(NpzDtype, bool)> {
 
 /// Extracts the `fortran_order` field from the `NPY` header dict.
 ///
-/// Returns `false` if the field is not found (defaults to C-order).
+/// Returns `false` if the field is not found or has any value other than
+/// `True` (defaults to C-order).
+// EXPLICIT: returns false (C-order) for missing or malformed fortran_order
+// fields. The NPY spec mandates this field, but defaulting to C-order is
+// the safe choice — Fortran-order is rejected by parse_npz anyway.
 fn extract_fortran_order(header: &str) -> bool {
     // Look for 'fortran_order': True
     header
@@ -455,6 +466,12 @@ fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<
 ///
 /// Each contiguous `element_size`-byte chunk is reversed, converting
 /// big-endian to little-endian (or vice versa).
+// VECTORIZED: scalar fallback — chunk.reverse() on a runtime-variable
+// element_size prevents auto-vectorization. This is the big-endian path
+// (<0.01% of ML files), so scalar performance is acceptable.
+// EXPLICIT: in-place mutation on the read buffer avoids allocating a second
+// buffer of equal size. CONVENTIONS Rule 6 (separate in/out) is waived here
+// because the data is already in a dedicated Vec<u8> that serves as the output.
 fn byteswap_inplace(data: &mut [u8], element_size: usize) {
     for chunk in data.chunks_exact_mut(element_size) {
         chunk.reverse();
@@ -651,6 +668,17 @@ mod tests {
         let header = "{\"descr\": \"<i4\", \"fortran_order\": False, \"shape\": (10,), }";
         let (dtype, _) = extract_descr(header).unwrap();
         assert_eq!(dtype, NpzDtype::I32);
+    }
+
+    #[test]
+    fn extract_descr_mixed_quotes() {
+        // Double-quoted descr value followed by single-quoted keys.
+        // Previously broken: the quote-char detection scanned the entire
+        // header tail, picking up the wrong quote character.
+        let header = "{'descr': \"<f4\", 'fortran_order': False, 'shape': (2, 3), }";
+        let (dtype, be) = extract_descr(header).unwrap();
+        assert_eq!(dtype, NpzDtype::F32);
+        assert!(!be);
     }
 
     // -- extract_fortran_order ------------------------------------------------

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/// `NPZ`/`NPY` archive parsing — wraps `npyz` for framework-agnostic tensor extraction.
+/// `NPZ`/`NPY` archive parsing — custom `NPY` header parser with bulk `read_exact`.
 #[cfg(feature = "npz")]
 pub mod npz;
 

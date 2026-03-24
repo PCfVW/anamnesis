@@ -13,30 +13,40 @@
     clippy::cast_precision_loss
 )]
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
-const GEMMA_SCOPE_PATH: &str = concat!(
-    "C:/Users/Eric JACOPIN/.cache/huggingface/hub/",
-    "models--google--gemma-scope-2b-pt-res/snapshots/",
-    "fd571b47c1c64851e9b1989792367b9babb4af63/",
-    "layer_0/width_16k/average_l0_105/params.npz"
-);
+/// Relative path under the `HuggingFace` cache to the Gemma Scope SAE weights.
+const GEMMA_SCOPE_RELATIVE: &str = ".cache/huggingface/hub/\
+    models--google--gemma-scope-2b-pt-res/snapshots/\
+    fd571b47c1c64851e9b1989792367b9babb4af63/\
+    layer_0/width_16k/average_l0_105/params.npz";
+
+/// Resolve the Gemma Scope file path from the user's home directory.
+fn gemma_scope_path() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let path = PathBuf::from(home).join(GEMMA_SCOPE_RELATIVE);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
 
 #[test]
 #[ignore = "requires local 302 MB Gemma Scope file"]
 fn bench_npz_real() {
-    if !Path::new(GEMMA_SCOPE_PATH).exists() {
-        eprintln!("SKIP: Gemma Scope file not found at {GEMMA_SCOPE_PATH}");
+    let Some(path) = gemma_scope_path() else {
+        eprintln!("SKIP: Gemma Scope file not found under $HOME/{GEMMA_SCOPE_RELATIVE}");
         return;
-    }
+    };
 
     // Warm up filesystem cache
-    let _ = anamnesis::parse_npz(GEMMA_SCOPE_PATH);
+    let _ = anamnesis::parse_npz(&path);
 
     // Timed run
     let start = Instant::now();
-    let tensors = anamnesis::parse_npz(GEMMA_SCOPE_PATH).unwrap();
+    let tensors = anamnesis::parse_npz(&path).unwrap();
     let elapsed = start.elapsed();
 
     let total_bytes: usize = tensors.values().map(|t| t.data.len()).sum();
@@ -59,7 +69,7 @@ fn bench_npz_real() {
 
     // Baseline: raw file read (no ZIP, no parsing — just I/O throughput)
     let start2 = Instant::now();
-    let raw = std::fs::read(GEMMA_SCOPE_PATH).unwrap();
+    let raw = std::fs::read(&path).unwrap();
     let elapsed2 = start2.elapsed();
     let throughput2 = raw.len() as f64 / elapsed2.as_secs_f64() / 1_000_000.0;
     eprintln!(
