@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for format parsing, adds `BF16` interpretation layer (JAX `V2` void dtype).
   Feature-gated behind `npz`. Supports `F16`/`F32`/`F64`, all integer types,
   `Bool`, and `BF16`
+- **NPZ cross-validation** against Gemma Scope 2B SAE weights (`params.npz`,
+  5 `F32` arrays). Byte-exact match against `NumPy` reference on all arrays
 - **GPTQ dequantization** (`src/remember/gptq.rs`) — INT4 and INT8 with
   group-wise scale + zero-point, activation-order via `g_idx`. Feature-gated
   behind `gptq`. Bit-exact against PyTorch on 4 real models from 2 quantizers

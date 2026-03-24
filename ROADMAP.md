@@ -227,10 +227,10 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Build on `npyz`, don't reimplement.** The `npyz` crate (v0.8.4, 4.6M downloads) is a mature, standalone NPY/NPZ parser with f16 support via the `half` feature. It handles header parsing, endianness, Fortran vs C order, and ZIP extraction — reimplementing this would be significant work for no benefit. The one gap is **bf16** (bfloat16): `npyz` has no bf16 support. anamnesis adds a thin interpretation layer on top: read as raw `u16` bytes via `npyz`, reinterpret as `half::bf16`.
 
-- [ ] NPZ integration module (`src/parse/npz.rs`) — wraps `npyz` to provide an anamnesis-native API. `parse_npz(path) -> HashMap<String, NpzTensor>`. Delegates format parsing to `npyz`, adds bf16 interpretation layer (read as u16, cast via `half::bf16`) — **commit**
-- [ ] `NpzTensor` type — framework-agnostic struct bridging `npyz`'s output to anamnesis consumers: `name: String`, `shape: Vec<usize>`, `dtype: NpzDtype`, `data: Vec<u8>`. The dtype enum includes `BF16` which `npyz` cannot represent natively — **commit**
-- [ ] Feature-gated behind `npz` feature (adds `npyz` with its `npz` feature, which pulls `zip` transitively) — **commit**
-- [ ] Validation against Gemma Scope SAE weights — already cached locally at `~/.cache/huggingface/hub/models--google--gemma-scope-2b-pt-res/` (`params.npz`, 302 MB, 5 F32 arrays: `W_dec` [16384×2304], `W_enc` [2304×16384], `b_dec` [2304], `b_enc` [16384], `threshold` [16384]). Parse, verify shapes and values match Python reference — **commit** — **PUSH**
+- [x] NPZ integration module (`src/parse/npz.rs`) — wraps `npyz` to provide an anamnesis-native API. `parse_npz(path) -> HashMap<String, NpzTensor>`. Delegates format parsing to `npyz`, adds bf16 interpretation layer (read as u16, cast via `half::bf16`) — **commit**
+- [x] `NpzTensor` type — framework-agnostic struct bridging `npyz`'s output to anamnesis consumers: `name: String`, `shape: Vec<usize>`, `dtype: NpzDtype`, `data: Vec<u8>`. The dtype enum includes `BF16` which `npyz` cannot represent natively — **commit**
+- [x] Feature-gated behind `npz` feature (adds `npyz` with its `npz` feature, which pulls `zip` transitively) — **commit**
+- [x] Validation against Gemma Scope SAE weights — already cached locally at `~/.cache/huggingface/hub/models--google--gemma-scope-2b-pt-res/` (`params.npz`, 302 MB, 5 F32 arrays: `W_dec` [16384×2304], `W_enc` [2304×16384], `b_dec` [2304], `b_enc` [16384], `threshold` [16384]). Parse, verify shapes and values match Python reference — **commit** — **PUSH**
 
 **Deliverable:** `anamnesis` v0.3.0 — NPZ parsing works. candle-mi can migrate its NPZ dependency from internal to `anamnesis`. — **PUSH + tag `v0.3.0`**
 
