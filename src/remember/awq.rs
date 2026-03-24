@@ -323,12 +323,12 @@ pub fn dequantize_awq_to_bf16(
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {i} offset overflow"),
             })?;
-        let out_row_end =
-            out_row_start
-                .checked_add(out_features * 2)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("output row {i} end overflow"),
-                })?;
+        let out_row_end = out_features
+            .checked_mul(2)
+            .and_then(|row_bytes| out_row_start.checked_add(row_bytes))
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("output row {i} end overflow"),
+            })?;
         let out_row =
             output
                 .get_mut(out_row_start..out_row_end)

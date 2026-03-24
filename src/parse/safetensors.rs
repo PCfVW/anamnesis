@@ -196,7 +196,7 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
         return TensorRole::Scale;
     }
 
-    // GPTQ / AWQ shared tensor patterns (both use .qweight, .qzeros, .scales)
+    // GPTQ / AWQ shared tensor patterns (both use `.qweight`, `.qzeros`, `.scales`)
     #[cfg(any(feature = "gptq", feature = "awq"))]
     {
         if name.ends_with(".qweight") {
@@ -210,7 +210,7 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
         }
     }
 
-    // GPTQ-only: g_idx maps input features to groups (AWQ uses sequential groups)
+    // GPTQ-only: `.g_idx` maps input features to groups (AWQ uses sequential groups)
     #[cfg(feature = "gptq")]
     if name.ends_with(".g_idx") {
         return TensorRole::GroupIndex;
