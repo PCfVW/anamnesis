@@ -91,7 +91,8 @@ impl From<&SafetensorsHeader> for InspectInfo {
                 | TensorRole::ZeroPoint
                 | TensorRole::GroupIndex
                 | TensorRole::QuantMap
-                | TensorRole::NestedScale => {
+                | TensorRole::NestedScale
+                | TensorRole::QuantState => {
                     // Companion tensors are consumed during dequantization,
                     // not written to the output file.
                 }

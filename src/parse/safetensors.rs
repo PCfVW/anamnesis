@@ -183,6 +183,9 @@ pub enum TensorRole {
     QuantMap,
     /// Nested absmax scale (`BnB` double-quant `.weight.nested_absmax`).
     NestedScale,
+    /// `BnB` quantization state metadata (`.quant_state.bitsandbytes__nf4` / `__fp4`).
+    /// Contains a `JSON` blob with the original tensor shape, block size, and dtype.
+    QuantState,
 }
 
 /// Classify a tensor based on its name and dtype.
@@ -219,6 +222,12 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
     // BitsAndBytes tensor patterns (name-based, feature-gated)
     #[cfg(feature = "bnb")]
     {
+        // Quantization state metadata (JSON blob with original shape, blocksize, dtype).
+        // Checked first — the name contains `.weight.quant_state.bitsandbytes__` which
+        // would otherwise match the `.weight` suffix check below.
+        if name.contains(".quant_state.bitsandbytes__") {
+            return TensorRole::QuantState;
+        }
         // NF4/FP4 companions (checked before weight to avoid false positives)
         if name.ends_with(".weight.nested_quant_map") || name.ends_with(".weight.quant_map") {
             return TensorRole::QuantMap;
@@ -470,6 +479,9 @@ pub struct Bnb4Companions<'a> {
     pub nested_absmax: Option<&'a TensorEntry>,
     /// Nested lookup table for double quantization (`.weight.nested_quant_map`, `F32[256]`).
     pub nested_quant_map: Option<&'a TensorEntry>,
+    /// Quantization state metadata (`.weight.quant_state.bitsandbytes__nf4` / `__fp4`).
+    /// Contains a `JSON` blob with the original tensor shape.
+    pub quant_state: Option<&'a TensorEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +698,8 @@ impl SafetensorsHeader {
         let quant_map_name = format!("{weight_name}.quant_map");
         let nested_absmax_name = format!("{weight_name}.nested_absmax");
         let nested_quant_map_name = format!("{weight_name}.nested_quant_map");
+        // quant_state tensor name varies: `.quant_state.bitsandbytes__nf4` or `__fp4`
+        let quant_state_prefix = format!("{weight_name}.quant_state.bitsandbytes__");
 
         let absmax = self.tensors.iter().find(|e| e.name == absmax_name)?;
         let quant_map = self.tensors.iter().find(|e| e.name == quant_map_name)?;
@@ -694,12 +708,17 @@ impl SafetensorsHeader {
             .tensors
             .iter()
             .find(|e| e.name == nested_quant_map_name);
+        let quant_state = self
+            .tensors
+            .iter()
+            .find(|e| e.name.starts_with(&quant_state_prefix));
 
         Some(Bnb4Companions {
             absmax,
             quant_map,
             nested_absmax,
             nested_quant_map,
+            quant_state,
         })
     }
 

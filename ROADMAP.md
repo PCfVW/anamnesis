@@ -219,7 +219,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Goal:** BnB4 weights are stored flattened (`[N, 1]`). The current dequantization emits a 1D `[total_elements]` output shape (see `model.rs`). The original 2D shape (`[out_features, in_features]`) must be recovered from `config.json` for downstream consumers that expect shaped weight tensors.
 
-- [ ] Read `config.json` (when available alongside the safetensors file) to recover the original weight shape for BnB4 tensors — **commit**
+- [x] Recover original weight shape for `BnB4` tensors from `quant_state.bitsandbytes__nf4`/`__fp4` companion tensor (`JSON` blob with `"shape"` field). No `config.json` needed — the shape is stored inside the safetensors file itself — **commit**
 
 ### Phase 3: NPZ/NPY Parsing
 

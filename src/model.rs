@@ -618,9 +618,18 @@ impl ParsedModel {
                                 )?
                             };
 
-                            // BnB4 weights are flattened to [N, 1]. Output as flat [total_elements].
-                            // Shape recovery from config.json is deferred to a future commit.
-                            let output_shape = vec![total_elements];
+                            // BnB4 weights are stored flattened to [N, 1]. Recover the original
+                            // 2D shape from the quant_state companion tensor (JSON blob with
+                            // "shape" field), falling back to flat [total_elements] if absent.
+                            let output_shape = if let Some(qs_entry) = companions.quant_state {
+                                let qs_data = self.tensor_data(
+                                    qs_entry.data_offsets.0,
+                                    qs_entry.data_offsets.1,
+                                )?;
+                                parse_bnb_quant_state_shape(qs_data, total_elements, &entry.name)?
+                            } else {
+                                vec![total_elements]
+                            };
 
                             dequantized_data.push((entry.name.clone(), bf16_data, output_shape));
                             on_tensor();
@@ -682,7 +691,8 @@ impl ParsedModel {
                 | TensorRole::ZeroPoint
                 | TensorRole::GroupIndex
                 | TensorRole::QuantMap
-                | TensorRole::NestedScale => {
+                | TensorRole::NestedScale
+                | TensorRole::QuantState => {
                     // Companion tensors are consumed during dequantization; skip.
                 }
                 TensorRole::Passthrough => {
@@ -740,6 +750,75 @@ impl ParsedModel {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// BnB4 quant_state shape recovery
+// ---------------------------------------------------------------------------
+
+/// Parses the original tensor shape from a `BnB` `quant_state` companion tensor.
+///
+/// The `quant_state.bitsandbytes__nf4` (or `__fp4`) tensor stores a `JSON` blob
+/// as raw `U8` bytes. The blob contains a `"shape"` field with the original
+/// 2D tensor dimensions (e.g., `[2048, 8192]`).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the `JSON` is malformed, the `"shape"`
+/// field is missing, or the recovered shape does not match `total_elements`.
+#[cfg(feature = "bnb")]
+fn parse_bnb_quant_state_shape(
+    qs_data: &[u8],
+    total_elements: usize,
+    weight_name: &str,
+) -> crate::Result<Vec<usize>> {
+    let qs_str = std::str::from_utf8(qs_data).map_err(|e| AnamnesisError::Parse {
+        reason: format!("quant_state for `{weight_name}` is not valid UTF-8: {e}"),
+    })?;
+
+    let qs_json: serde_json::Value =
+        serde_json::from_str(qs_str).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to parse quant_state JSON for `{weight_name}`: {e}"),
+        })?;
+
+    let shape_arr = qs_json
+        .get("shape")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("quant_state for `{weight_name}` missing \"shape\" array"),
+        })?;
+
+    let shape: Vec<usize> = shape_arr
+        .iter()
+        .map(|v| {
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!(
+                        "quant_state shape dimension not a valid usize for `{weight_name}`"
+                    ),
+                })
+        })
+        .collect::<crate::Result<_>>()?;
+
+    // Validate: product of recovered shape must equal total_elements.
+    let product: usize = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("quant_state shape overflow for `{weight_name}`"),
+        })?;
+
+    if product != total_elements {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "quant_state shape {shape:?} product {product} != total_elements {total_elements} \
+                 for `{weight_name}`"
+            ),
+        });
+    }
+
+    Ok(shape)
 }
 
 #[cfg(test)]

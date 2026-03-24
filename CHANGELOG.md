@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **BnB4 output shape recovery** — `NF4`/`FP4` dequantized weights now have their
+  original 2D shape (e.g., `[2048, 8192]`) instead of flat `[total_elements]`.
+  Shape is recovered from the `quant_state.bitsandbytes__nf4`/`__fp4` companion
+  tensor's `JSON` blob, which is stored inside the safetensors file itself (no
+  `config.json` needed). Falls back to 1D if the companion is absent
+
 ## [0.3.0] - 2026-03-24
 
 ### Added
