@@ -215,6 +215,12 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **New dependencies:** None expected (pure bit manipulation), but feature-gated if any arise.
 
+### Pre-Phase 3: BnB4 output shape recovery
+
+**Goal:** BnB4 weights are stored flattened (`[N, 1]`). The current dequantization emits a 1D `[total_elements]` output shape (see `model.rs`). The original 2D shape (`[out_features, in_features]`) must be recovered from `config.json` for downstream consumers that expect shaped weight tensors.
+
+- [ ] Read `config.json` (when available alongside the safetensors file) to recover the original weight shape for BnB4 tensors — **commit**
+
 ### Phase 3: NPZ/NPY Parsing
 
 **Goal:** Extend the `parse/` layer to NumPy archives. This is the case where parsing alone suffices — nothing was forgotten, the weights just need extracting from a foreign container. Migrates candle-mi's tightly-coupled NPZ parser into anamnesis as a reusable, framework-agnostic module.

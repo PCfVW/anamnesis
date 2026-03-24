@@ -70,10 +70,11 @@ pub fn dequantize_bnb4_to_bf16(
             reason: "BnB block_size must be > 0".into(),
         });
     }
-    let expected_weight_bytes =
-        total_elements
-            .checked_mul(1)
-            .and_then(|n| if n % 2 == 0 { Some(n / 2) } else { None });
+    let expected_weight_bytes = if total_elements.is_multiple_of(2) {
+        Some(total_elements / 2)
+    } else {
+        None
+    };
     if expected_weight_bytes != Some(weight_data.len()) {
         return Err(AnamnesisError::Parse {
             reason: format!(

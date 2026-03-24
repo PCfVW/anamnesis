@@ -82,6 +82,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wildcard that would silently produce broken paths for future variants
 - Simplified `shape_to_rows_cols` 2D arm: direct indexing with `// INDEX:`
   annotation instead of redundant `Option` unwrapping
+- **`classify_tensor` AWQ-only builds** — `.qweight`/`.qzeros`/`.scales` were
+  gated on the `gptq` feature only; AWQ-only builds silently misclassified all
+  quantized tensors as passthrough. Now gated on `any(gptq, awq)` with `.g_idx`
+  remaining `gptq`-only
+- **`detect_scheme` silent fallthrough** — `return` statements inside the
+  GPTQ/AWQ detection block were feature-gated, causing misdetection when only
+  one scheme was enabled. Detection is now unconditional; feature-disabled
+  errors are handled downstream in `model.rs`
+- `derive_output_path` now strips GPTQ, AWQ, and BitsAndBytes suffixes
+  (e.g., `-GPTQ-Int4`, `-awq`, `-bnb-4bit`) in addition to FP8 suffixes
+- `read_scale_f32` now uses `checked_add` for all byte offset computations,
+  consistent with `read_u32_le` in the same codebase
+- Extracted duplicated `read_u32_le` and `read_scale_f32` from `gptq.rs` and
+  `awq.rs` into shared `remember/quant_utils.rs` module
+- Replaced dead-code `checked_mul(1)` in `bnb.rs` with direct parity check
+- GPTQ/AWQ outer loop offsets (`i * out_features * 2`) now use `checked_mul`
+  for consistency with the codebase's zero-panic discipline
+- `parse_g_idx` offset (`i * 4`) now uses `checked_mul`
+- Updated GPTQ docstring memory estimate from "~1 MB" to "up to ~8 MB per
+  weight tensor" to reflect fine-grained group configurations
 
 ## [0.1.0] — FP8 Dequantization
 
