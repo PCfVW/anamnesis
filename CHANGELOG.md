@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Shape is recovered from the `quant_state.bitsandbytes__nf4`/`__fp4` companion
   tensor's `JSON` blob, which is stored inside the safetensors file itself (no
   `config.json` needed). Falls back to 1D if the companion is absent
+- **`extract_descr` mixed-quote header bug** — quote character detection now reads
+  the first character of the value, not the entire header tail. Fixes silent
+  mis-extraction for mixed-quote headers (e.g., `{'descr': "<f4", ...}`)
+- Added mandatory `// VECTORIZED:`, `// EXPLICIT:` annotations on
+  `byteswap_inplace`, `extract_fortran_order`, native-endian `=` treatment,
+  and unused minor version byte
+- Removed hardcoded absolute path from `bench_npz_adhoc.rs` — now resolves
+  from `USERPROFILE`/`HOME` environment variables
+- Added missing `[0.2.0]` changelog section for Phase 2 (GPTQ, AWQ, BnB)
 
 ## [0.2.0] - 2026-03-24
 
