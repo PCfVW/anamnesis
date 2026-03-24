@@ -691,7 +691,8 @@ impl SafetensorsHeader {
     /// `.weight` tensor name.
     ///
     /// Looks up `{name}.absmax`, `{name}.quant_map`, and optionally
-    /// `{name}.nested_absmax` and `{name}.nested_quant_map`.
+    /// `{name}.nested_absmax`, `{name}.nested_quant_map`, and
+    /// `{name}.quant_state.bitsandbytes__*`.
     #[must_use]
     pub fn find_bnb4_companions(&self, weight_name: &str) -> Option<Bnb4Companions<'_>> {
         let absmax_name = format!("{weight_name}.absmax");
