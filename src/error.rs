@@ -33,5 +33,14 @@ impl From<safetensors::SafeTensorError> for AnamnesisError {
     }
 }
 
+#[cfg(feature = "npz")]
+impl From<zip::result::ZipError> for AnamnesisError {
+    fn from(e: zip::result::ZipError) -> Self {
+        Self::Parse {
+            reason: format!("failed to read ZIP archive: {e}"),
+        }
+    }
+}
+
 /// A convenience alias for `Result<T, AnamnesisError>`.
 pub type Result<T> = std::result::Result<T, AnamnesisError>;

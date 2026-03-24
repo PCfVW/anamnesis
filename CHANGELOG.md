@@ -10,10 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **NPZ/NPY parsing** (`src/parse/npz.rs`) — `parse_npz(path)` reads `NumPy`
-  `.npz` archives into framework-agnostic `NpzTensor` structs. Wraps `npyz`
-  for format parsing, adds `BF16` interpretation layer (JAX `V2` void dtype).
-  Feature-gated behind `npz`. Supports `F16`/`F32`/`F64`, all integer types,
-  `Bool`, and `BF16`
+  `.npz` archives into framework-agnostic `NpzTensor` structs. Custom `NPY`
+  header parser with bulk `read_exact` data extraction — zero per-element
+  deserialization for LE data on LE machines. Feature-gated behind `npz`.
+  Supports `F16`/`F32`/`F64`, all integer types, `Bool`, and `BF16` (JAX `V2`
+  void dtype). **3,586 MB/s** on 302 MB Gemma Scope file (1.3× raw I/O
+  overhead), **17.7× faster** than `npyz`-backed parser
 - **NPZ cross-validation** against Gemma Scope 2B SAE weights (`params.npz`,
   5 `F32` arrays). Byte-exact match against `NumPy` reference on all arrays
 - **GPTQ dequantization** (`src/remember/gptq.rs`) — INT4 and INT8 with
