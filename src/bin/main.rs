@@ -161,10 +161,44 @@ fn run_remember(
     Ok(())
 }
 
+/// Known quantization suffixes stripped from input filenames when deriving output paths.
+///
+/// Case-sensitive: common conventions use lowercase, uppercase, or mixed-case.
+/// Ordered longest-first so that e.g. `-GPTQ-Int4` is tried before `-gptq`.
+const QUANT_SUFFIXES: &[&str] = &[
+    // GPTQ
+    "-GPTQ-Int4",
+    "-GPTQ-Int8",
+    "-gptq-int4",
+    "-gptq-int8",
+    "-gptq4",
+    "-gptq8",
+    "-GPTQ",
+    "-gptq",
+    "_gptq",
+    // AWQ
+    "-AWQ",
+    "-awq",
+    "_awq",
+    // BitsAndBytes
+    "-bnb-4bit",
+    "-bnb-int8",
+    "-bnb",
+    "_bnb",
+    "-4bit",
+    "-int4",
+    "-int8",
+    // FP8
+    "-fp8",
+    "_fp8",
+    "-FP8",
+];
+
 /// Derive an output path from the input path and target dtype.
 ///
-/// `model-fp8.safetensors` → `model-bf16.safetensors`
-/// `weights.safetensors`   → `weights-bf16.safetensors`
+/// `model-fp8.safetensors`  → `model-bf16.safetensors`
+/// `model-GPTQ-Int4.safetensors` → `model-bf16.safetensors`
+/// `weights.safetensors`    → `weights-bf16.safetensors`
 fn derive_output_path(input: &std::path::Path, target: TargetDtype) -> PathBuf {
     let stem = input
         .file_stem()
@@ -173,10 +207,9 @@ fn derive_output_path(input: &std::path::Path, target: TargetDtype) -> PathBuf {
     let suffix = target.to_string().to_lowercase();
 
     // Strip known quantization suffixes before appending target.
-    let clean_stem = stem
-        .strip_suffix("-fp8")
-        .or_else(|| stem.strip_suffix("_fp8"))
-        .or_else(|| stem.strip_suffix("-FP8"))
+    let clean_stem = QUANT_SUFFIXES
+        .iter()
+        .find_map(|qs| stem.strip_suffix(qs))
         .unwrap_or(stem);
 
     let new_name = format!("{clean_stem}-{suffix}.safetensors");

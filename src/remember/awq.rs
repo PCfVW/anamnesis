@@ -13,101 +13,7 @@
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
-
-// ---------------------------------------------------------------------------
-// Helpers (reuse patterns from GPTQ)
-// ---------------------------------------------------------------------------
-
-/// Reads a little-endian `u32` from a byte slice at the given byte offset.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if the slice is too short.
-fn read_u32_le(data: &[u8], byte_offset: usize) -> crate::Result<u32> {
-    let end = byte_offset
-        .checked_add(4)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "u32 byte offset overflow".into(),
-        })?;
-    let slice = data
-        .get(byte_offset..end)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: format!(
-                "u32 read out of bounds: need bytes {byte_offset}..{end}, have {}",
-                data.len()
-            ),
-        })?;
-    let arr: [u8; 4] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-        reason: "u32 slice is not 4 bytes".into(),
-    })?;
-    Ok(u32::from_le_bytes(arr))
-}
-
-/// Reads a scale factor as `f32` from a byte slice at the given byte offset.
-///
-/// Supports `F16`, `BF16`, and `F32` scale dtypes.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if the slice is too short or the dtype
-/// is unsupported for scale factors.
-fn read_scale_f32(data: &[u8], byte_offset: usize, dtype: Dtype) -> crate::Result<f32> {
-    match dtype {
-        Dtype::F16 => {
-            let end = byte_offset + 2;
-            let slice = data
-                .get(byte_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("F16 scale read out of bounds at offset {byte_offset}"),
-                })?;
-            let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-                reason: "F16 scale slice is not 2 bytes".into(),
-            })?;
-            // BITWISE: F16 → f32 via half crate's IEEE 754 conversion
-            Ok(half::f16::from_le_bytes(arr).to_f32())
-        }
-        Dtype::BF16 => {
-            let end = byte_offset + 2;
-            let slice = data
-                .get(byte_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("BF16 scale read out of bounds at offset {byte_offset}"),
-                })?;
-            let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-                reason: "BF16 scale slice is not 2 bytes".into(),
-            })?;
-            // BITWISE: BF16 → f32 by shifting into upper 16 bits of IEEE 754
-            Ok(f32::from_bits(u32::from(u16::from_le_bytes(arr)) << 16))
-        }
-        Dtype::F32 => {
-            let end = byte_offset + 4;
-            let slice = data
-                .get(byte_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("F32 scale read out of bounds at offset {byte_offset}"),
-                })?;
-            let arr: [u8; 4] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-                reason: "F32 scale slice is not 4 bytes".into(),
-            })?;
-            Ok(f32::from_le_bytes(arr))
-        }
-        Dtype::F8E4M3
-        | Dtype::F8E5M2
-        | Dtype::F64
-        | Dtype::Bool
-        | Dtype::U8
-        | Dtype::I8
-        | Dtype::U16
-        | Dtype::I16
-        | Dtype::U32
-        | Dtype::I32
-        | Dtype::U64
-        | Dtype::I64 => Err(AnamnesisError::Unsupported {
-            format: dtype.to_string(),
-            detail: "AWQ scale dtype must be F16, BF16, or F32".into(),
-        }),
-    }
-}
+use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 
 // ---------------------------------------------------------------------------
 // Precomputation
@@ -411,8 +317,18 @@ pub fn dequantize_awq_to_bf16(
                 })?;
 
         // Output row.
-        let out_row_start = i * out_features * 2;
-        let out_row_end = out_row_start + out_features * 2;
+        let out_row_start = i
+            .checked_mul(out_features)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("output row {i} offset overflow"),
+            })?;
+        let out_row_end =
+            out_row_start
+                .checked_add(out_features * 2)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("output row {i} end overflow"),
+                })?;
         let out_row =
             output
                 .get_mut(out_row_start..out_row_end)

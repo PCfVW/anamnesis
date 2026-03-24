@@ -13,6 +13,8 @@ pub mod bnb;
 pub mod fp8;
 #[cfg(feature = "gptq")]
 pub mod gptq;
+#[cfg(any(feature = "gptq", feature = "awq"))]
+mod quant_utils;
 
 #[cfg(feature = "awq")]
 pub use awq::dequantize_awq_to_bf16;
