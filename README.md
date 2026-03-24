@@ -18,6 +18,7 @@
   - [GPTQ Dequantization](#gptq-dequantization)
   - [AWQ Dequantization](#awq-dequantization)
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
+- [NPZ/NPY Parsing](#npznpy-parsing)
 - [Development](#development)
 
 ## Tested Models
@@ -68,6 +69,19 @@ Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-
 | Llama-3.2-1B-BNB-INT8 | INT8 | 65,536 | 1.2x faster |
 
 > **Note:** INT8 speedup is modest because the operation is trivially simple (`i8→f32→multiply`). Both PyTorch and anamnesis are near memory bandwidth limits at ~0.7–0.8 ns/element. The AVX2 hot loop is fully vectorized — the 1.2× reflects the inherent ceiling, not a missed optimization.
+
+### NPZ/NPY Parsing
+
+Feature-gated behind `npz`. Custom NPY header parser with bulk `read_exact` — zero per-element deserialization for little-endian data on little-endian machines. Cross-validated byte-exact against NumPy on Gemma Scope 2B SAE weights.
+
+| Metric | Value |
+|---|---|
+| Throughput (302 MB Gemma Scope, F32) | **3,586 MB/s** |
+| Overhead vs raw I/O | 1.3x |
+| vs `npyz` crate | **17.7x faster** |
+| Supported dtypes | F16, BF16, F32, F64, Bool, U8–U64, I8–I64 |
+
+BF16 support via JAX `V2` void-dtype convention. Big-endian NPY files handled with in-place byte-swap.
 
 ## Development
 
