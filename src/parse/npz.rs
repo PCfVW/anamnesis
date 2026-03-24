@@ -295,6 +295,7 @@ fn extract_descr(header: &str) -> crate::Result<(NpzDtype, bool)> {
 /// Returns [`AnamnesisError::Unsupported`] if the descriptor is not recognized.
 fn parse_descr(descr: &str) -> crate::Result<(NpzDtype, bool)> {
     // First character is endianness: '<' = LE, '>' = BE, '|' = N/A, '=' = native.
+    // BORROW: explicit .as_bytes() to inspect endianness prefix byte
     let bytes = descr.as_bytes();
     if bytes.len() < 2 {
         return Err(AnamnesisError::Unsupported {
@@ -352,7 +353,7 @@ fn extract_fortran_order(header: &str) -> bool {
         .is_some_and(|pos| {
             header
                 .get(pos..)
-                .and_then(|s| s.find(':').map(|i| &s[i + 1..]))
+                .and_then(|s| s.find(':').and_then(|i| s.get(i + 1..)))
                 .is_some_and(|val| val.trim_start().starts_with("True"))
         })
 }
@@ -498,8 +499,10 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
         })?;
 
         // Strip .npy suffix; skip non-.npy entries (e.g., __MACOSX/).
+        // BORROW: .to_owned() converts &str from zip entry to owned String
         let full_name = entry.name().to_owned();
         let name = match full_name.strip_suffix(".npy") {
+            // BORROW: .to_owned() converts &str slice to owned String for HashMap key
             Some(n) => n.to_owned(),
             None => continue,
         };
@@ -510,7 +513,7 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
             return Err(AnamnesisError::Unsupported {
                 format: "NPZ".into(),
                 detail: format!(
-                    "Fortran-order arrays not supported (array '{name}'). \
+                    "fortran-order arrays not supported (array '{name}'). \
                      ML frameworks save C-order by default"
                 ),
             });
