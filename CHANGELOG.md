@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NPZ/NPY parsing** (`src/parse/npz.rs`) — `parse_npz(path)` reads `NumPy`
+  `.npz` archives into framework-agnostic `NpzTensor` structs. Wraps `npyz`
+  for format parsing, adds `BF16` interpretation layer (JAX `V2` void dtype).
+  Feature-gated behind `npz`. Supports `F16`/`F32`/`F64`, all integer types,
+  `Bool`, and `BF16`
 - **GPTQ dequantization** (`src/remember/gptq.rs`) — INT4 and INT8 with
   group-wise scale + zero-point, activation-order via `g_idx`. Feature-gated
   behind `gptq`. Bit-exact against PyTorch on 4 real models from 2 quantizers

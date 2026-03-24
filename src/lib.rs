@@ -57,6 +57,8 @@ pub mod remember;
 pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
+#[cfg(feature = "npz")]
+pub use parse::{parse_npz, NpzDtype, NpzTensor};
 pub use parse::{
     AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
     QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,

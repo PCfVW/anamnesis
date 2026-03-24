@@ -26,7 +26,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 float8 = "0.7"
 half = "2"
 indicatif = { version = "0.17", optional = true }
-npyz = { version = "0.8", features = ["npz"], optional = true }
+npyz = { version = "0.8", features = ["npz", "half"], optional = true }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
