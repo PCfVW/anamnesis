@@ -196,8 +196,8 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
         return TensorRole::Scale;
     }
 
-    // GPTQ tensor patterns (name-based, feature-gated)
-    #[cfg(feature = "gptq")]
+    // GPTQ / AWQ shared tensor patterns (both use .qweight, .qzeros, .scales)
+    #[cfg(any(feature = "gptq", feature = "awq"))]
     {
         if name.ends_with(".qweight") {
             return TensorRole::Quantized;
@@ -208,9 +208,12 @@ fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
         if name.ends_with(".scales") {
             return TensorRole::Scale;
         }
-        if name.ends_with(".g_idx") {
-            return TensorRole::GroupIndex;
-        }
+    }
+
+    // GPTQ-only: g_idx maps input features to groups (AWQ uses sequential groups)
+    #[cfg(feature = "gptq")]
+    if name.ends_with(".g_idx") {
+        return TensorRole::GroupIndex;
     }
 
     // BitsAndBytes tensor patterns (name-based, feature-gated)
@@ -316,28 +319,24 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
     // GPTQ / AWQ: both use `.qweight` tensors. Distinguish by packing direction.
     // GPTQ packs along rows: qweight.cols == scales.cols (both = out_features).
     // AWQ packs along cols: qweight.cols < scales.cols (qweight.cols * pack_factor = scales.cols).
-    #[cfg(any(feature = "gptq", feature = "awq"))]
+    // Detection is unconditional — feature-disabled errors are handled in model.rs.
+    for entry in entries
+        .iter()
+        .filter(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"))
     {
-        for entry in entries
-            .iter()
-            .filter(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"))
-        {
-            let base = entry.name.strip_suffix(".qweight");
-            if let Some(base) = base {
-                let scales_name = format!("{base}.scales");
-                if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
-                    let qw_cols = entry.shape.last().copied().unwrap_or(0);
-                    let sc_cols = scales.shape.last().copied().unwrap_or(0);
+        let base = entry.name.strip_suffix(".qweight");
+        if let Some(base) = base {
+            let scales_name = format!("{base}.scales");
+            if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
+                let qw_cols = entry.shape.last().copied().unwrap_or(0);
+                let sc_cols = scales.shape.last().copied().unwrap_or(0);
 
-                    if qw_cols > 0 && sc_cols > 0 && qw_cols == sc_cols {
-                        // qweight.cols == scales.cols → GPTQ (packed along rows)
-                        #[cfg(feature = "gptq")]
-                        return QuantScheme::Gptq;
-                    } else if qw_cols > 0 && sc_cols > 0 && qw_cols < sc_cols {
-                        // qweight.cols < scales.cols → AWQ (packed along cols)
-                        #[cfg(feature = "awq")]
-                        return QuantScheme::Awq;
-                    }
+                if qw_cols > 0 && sc_cols > 0 && qw_cols == sc_cols {
+                    // qweight.cols == scales.cols → GPTQ (packed along rows)
+                    return QuantScheme::Gptq;
+                } else if qw_cols > 0 && sc_cols > 0 && qw_cols < sc_cols {
+                    // qweight.cols < scales.cols → AWQ (packed along cols)
+                    return QuantScheme::Awq;
                 }
             }
         }
