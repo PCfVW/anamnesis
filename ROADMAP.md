@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated March 21, 2026)
-**Status:** Phase 1 complete. FP8 dequantization works end-to-end — 3 schemes (fine-grained, per-channel, per-tensor), 3 scale dtypes (F32, BF16, F16), validated against 7 real models from 5 quantizers, bit-exact against PyTorch, 2.7–9.7× faster. Ready for v0.1.0 push.
+**Date:** March 20, 2026 (updated April 1, 2026)
+**Status:** Phases 1–3 complete (v0.3.0 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing. Next: Phase 4 (GGUF).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -22,7 +22,9 @@
   - [Phase 1: FP8 Dequantization](#phase-1-fp8-dequantization)
   - [Phase 2: Additional Quantization Schemes](#phase-2-additional-quantization-schemes)
   - [Phase 3: NPZ/NPY Parsing](#phase-3-npznpy-parsing)
-  - [Phase 4: Quantization (Lethe)](#phase-4-quantization-lethe)
+  - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
+  - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
+  - [Phase 6: Emerging Quantization Formats](#phase-6-emerging-quantization-formats)
 - [4. Key Design Decisions](#4-key-design-decisions)
 - [5. Relationship to Other Projects](#5-relationship-to-other-projects)
 
@@ -53,7 +55,9 @@ This blocks candle, candle-mi, burn, and tch. The entire Rust ML ecosystem stops
 | [candle](https://github.com/huggingface/candle) v0.9.2+ | Added `F8E4M3` DType. [DeepSeek V3 PR #2745](https://github.com/huggingface/candle/pull/2745) implements block-wise FP8 dequant with `scale_inv` | Dequant logic is **model-specific** (DeepSeek V3 only), embedded in `candle-transformers`. Not a reusable library. No E5M2. Still fails on generic FP8 safetensors: `unsupported safetensor dtype F8_E4M3`. |
 | [mistralrs-quant](https://lib.rs/crates/mistralrs-quant) | GPTQ, AWQ, HQQ, BnB, FP8 via `QuantMethod` trait with `dequantize_w()` | **CUDA-only** for GPTQ/AWQ. Tightly coupled to mistral.rs inference (742K SLoC, depends on candle-core, tokio, rayon). Not reusable as a standalone library. |
 | [pmetal-gguf](https://docs.rs/pmetal-gguf) | Standalone GGUF dequantization with SIMD (`dequant::dequantize()`) | **GGUF-specific.** Does not handle safetensors FP8, GPTQ, AWQ, or NPZ. |
-| [`npyz`](https://crates.io/crates/npyz) v0.8.4 | Mature NPY/NPZ parser (4.6M downloads). f16 support via `half` feature. Full read/write. | **No bf16.** But robust enough that anamnesis should **depend on it** for NPZ parsing rather than reimplement, adding a thin bf16 interpretation layer. See Phase 3. |
+| [`gguf-rs-lib`](https://crates.io/crates/gguf-rs-lib) v0.2.5 | Type-safe GGUF reader/writer. Pure safe Rust. | Parsing only — no dequantization. Potential Phase 4 dependency (TBD). |
+| [`llama-gguf`](https://crates.io/crates/llama-gguf) v0.14.0 | Pure Rust llama.cpp reimplementation with GPU dequant kernels (CUDA/Metal/DX12/Vulkan). | Full inference engine, not a standalone library. K-quant dequant math is a useful reference. |
+| [`npyz`](https://crates.io/crates/npyz) v0.8.4 | Mature NPY/NPZ parser (4.6M downloads). f16 support via `half` feature. Full read/write. | **No bf16.** Initial Phase 3 approach wrapped `npyz`, but benchmarking revealed 23× overhead vs raw I/O. Replaced with anamnesis's own fast parser (17.7× faster). |
 | [`ndarray-npy`](https://crates.io/crates/ndarray-npy) v0.10.0 | Most popular NPY/NPZ crate (7.2M downloads). Actively maintained. | **No f16/bf16.** Tightly coupled to ndarray. Less suitable than `npyz` for framework-agnostic use. |
 | [safetensors](https://crates.io/crates/safetensors) | Reads/writes safetensors files | No quantization awareness. Pure format I/O. |
 | [burn](https://github.com/tracel-ai/burn) v0.14.0+ | INT8 quantization (beta) | No FP8, no GPTQ, no AWQ. Own internal format only. |
@@ -102,13 +106,14 @@ anamnesis (library crate)
 ├── parse/              ← decode + validate any tensor format
 │   ├── safetensors        safetensors (including quantized metadata)
 │   ├── npz                NPZ/NPY archives (feature-gated)
-│   └── (future)           GGUF, etc.
+│   └── gguf               GGUF (feature-gated, Phase 4)
 │
 ├── remember/           ← built on parse: precision recovery (dequantize)
 │   ├── fp8                fine-grained, per-channel, per-tensor FP8 (E4M3, E5M2)
 │   ├── gptq               GPTQ dequantization
 │   ├── awq                AWQ dequantization
-│   └── bnb                BitsAndBytes (NF4, INT8) dequantization
+│   ├── bnb                BitsAndBytes (NF4, INT8) dequantization
+│   └── gguf               GGUF K-quant dequantization (Phase 4)
 │
 ├── lethe/              ← built on parse: precision reduction (quantize)
 │
@@ -123,7 +128,7 @@ anamnesis (library crate)
 ### 2.3 Ecosystem Fit
 
 ```
-safetensors / npz       ← file formats
+safetensors / npz / gguf  ← file formats
     ↓
 anamnesis (library)     ← parse, remember, lethe
 anamnesis / amn (CLI)   ← amn parse, amn inspect, amn remember, amn forget
@@ -236,16 +241,58 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **New dependencies:** `zip` v2 with `deflate` feature (direct dependency, no `npyz`). Feature-gated behind anamnesis's `npz` feature.
 
-### Phase 4: Quantization (Lethe)
+### Phase 4: GGUF Parsing & Dequantization
 
-**Goal:** The opposite direction — take full-precision weights and quantize them. Built on parse (read the source) + lethe (compress). Lower priority; the ecosystem's immediate pain is loading quantized models, not creating them.
+**Goal:** Add support for GGUF, the dominant format for local inference (~166,000 models on HuggingFace as of March 2026). GGUF is to llama.cpp/Ollama/LM Studio what safetensors is to HuggingFace Transformers. No standalone, framework-agnostic Rust crate exists for GGUF dequantization — candle-core has GGUF support but it is tightly coupled to candle's tensor types and inference pipeline.
+
+**Approach:** Parse GGUF metadata and tensor layout. Dequantize K-quant types (Q2_K through Q8_K) and legacy types (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0) to BF16 using the same loop-fission + auto-vectorization strategy as GPTQ/AWQ/BnB. Feature-gated behind `gguf`.
+
+**Key projects to study:**
+- **candle-core `quantized`** (`k_quants.rs`) — clean K-quant dequantization algorithms, the math reference
+- **gguf-rs-lib** — pure safe Rust GGUF reader/writer, potential parsing dependency (4.8K downloads, active)
+- **llama-gguf (Lexmata)** — pure Rust reimplementation of llama.cpp with GPU dequant kernels
+
+- [ ] GGUF file parser (`src/parse/gguf.rs`) — header, metadata key-value pairs, tensor info table (name, shape, dtype, offset). Evaluate whether to depend on `gguf-rs-lib` or write a lean parser — **commit**
+- [ ] K-quant dequantization (`src/remember/gguf.rs`) — Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. Each type has a block structure with scales, mins, and packed quantized values. Loop fission: pass 1 unpacks block structure → f32 scratch, pass 2 applies scales → BF16 — **commit**
+- [ ] Legacy quant types — Q4_0, Q4_1, Q5_0, Q5_1, Q8_0. Simpler block layouts (single scale + optional min per block) — **commit**
+- [ ] Feature-gated behind `gguf` feature — **commit**
+- [ ] Cross-validation against llama.cpp reference dequantization on real GGUF models — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.4.0 — GGUF parsing + dequantization works. anamnesis becomes the only Rust crate that can parse *both* safetensors-based (GPTQ/AWQ/BnB/FP8) and GGUF-based quantized models and dequantize everything to BF16. — **PUSH + tag `v0.4.0`**
+
+**New dependencies:** Possibly `gguf-rs-lib` for parsing (TBD — may write own lean parser instead). Feature-gated behind `gguf`.
+
+### Phase 5: Quantization (Lethe)
+
+**Goal:** The opposite direction — take full-precision weights and quantize them. Built on parse (read the source) + lethe (compress). With Phase 4 complete, this enables **cross-format conversion** via the dequantize-then-requantize path (e.g., GPTQ safetensors → BF16 → GGUF Q4_K_M). No Rust tool can do this today.
 
 - [ ] FP8 quantization (`src/lethe/fp8.rs`) — BF16/F32 → FP8 E4M3 with fine-grained block scale factors — **commit**
 - [ ] INT8/INT4 quantization — per-channel and group-wise schemes — **commit**
 - [ ] `ParsedModel::forget()` public API + `forget` CLI subcommand (alias `quantize`) — **commit**
 - [ ] Round-trip validation — quantize then dequantize, measure lethe distance — **commit** — **PUSH**
 
-**Deliverable:** `anamnesis` v0.4.0 — full quantize + dequantize cycle. — **PUSH + tag `v0.4.0`**
+**Deliverable:** `anamnesis` v0.5.0 — full quantize + dequantize cycle. — **PUSH + tag `v0.5.0`**
+
+### Phase 6: Emerging Quantization Formats
+
+**Goal:** Extend coverage to newer quantization formats that currently have zero Rust implementations. Prioritized by ecosystem adoption (HuggingFace model count as of March 2026).
+
+**Landscape (March 2026):**
+
+| Format | HF Models | Ecosystem | Rust Status |
+|--------|-----------|-----------|-------------|
+| EXL2 | ~4,775 | ExLlamaV2-only (GPU, hobbyist/local) | None |
+| HQQ | ~190 | Transformers, vLLM (calibration-free) | mistral.rs only (inference-coupled) |
+| AQLM | ~120 | Transformers, vLLM (academic, sub-2-bit) | None |
+
+**Note:** EXL2's successor (EXL3) is emerging. HQQ and AQLM have strong technical merits but very low adoption. These formats are monitored; implementation is deferred until adoption grows or a concrete downstream need arises.
+
+- [ ] EXL2 dequantization — mixed-bitrate (2–8 bpw), ExLlamaV2 binary format — **commit**
+- [ ] HQQ dequantization — half-quadratic quantization, 1–8 bit, calibration-free — **commit**
+- [ ] AQLM dequantization — additive quantization, sub-2-bit with vector codebooks — **commit**
+- [ ] Cross-validation for each format — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.6.0 — emerging format coverage. — **PUSH + tag `v0.6.0`**
 
 ---
 
