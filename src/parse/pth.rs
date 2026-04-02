@@ -17,7 +17,7 @@
 //! Unlike Python's `pickle.load()`, this parser **never executes arbitrary
 //! code**. Only allowlisted `GLOBAL` references (`torch._utils`,
 //! `torch.*Storage`, `collections.OrderedDict`) are accepted. Unrecognized
-//! globals produce [`AnamnesisError::Parse`].
+//! globals produce `AnamnesisError::Parse`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -159,8 +159,8 @@ pub struct PthTensor<'a> {
     pub dtype: PthDtype,
     /// Raw bytes in row-major, native-endian order.
     ///
-    /// `Borrowed` when the tensor data is contiguous and little-endian
-    /// (zero-copy slice from the mmap). `Owned` when a layout
+    /// `Cow::Borrowed` when the tensor data is contiguous and little-endian
+    /// (zero-copy slice from the mmap). `Cow::Owned` when a layout
     /// transformation was required (non-contiguous strides or
     /// big-endian byte-swap).
     pub data: Cow<'a, [u8]>,
@@ -639,6 +639,10 @@ impl<'a> PickleVm<'a> {
     ///
     /// Returns [`AnamnesisError::Parse`] on malformed opcodes, stack
     /// underflow, non-allowlisted globals, or unrecognized opcodes.
+    // BORROW: throughout this function, `.to_owned()` and `.to_vec()` convert
+    // borrowed slices from the pickle byte stream (which borrows from the mmap)
+    // into owned `PickleValue` variants. The pickle VM's stack must own its
+    // values because the VM outlives individual opcode reads.
     fn execute(&mut self) -> crate::Result<PickleValue> {
         loop {
             let opcode = self.read_u8()?;
@@ -1181,6 +1185,7 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
     let st2 = storage_tuple.get(2).ok_or_else(|| AnamnesisError::Parse {
         reason: format!("tensor `{name}`: missing storage_tuple[2]"),
     })?;
+    // BORROW: owned copy needed — TensorMeta outlives the PickleValue borrow
     let storage_key = as_str(st2)?.to_owned();
 
     // items[1]: storage offset (in elements, not bytes)
@@ -1205,6 +1210,7 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
     let strides = tuple_to_usize_vec(it3)?;
 
     Ok(TensorRef {
+        // BORROW: owned copy — TensorRef outlives the PickleValue borrow
         name: name.to_owned(),
         storage_key,
         dtype,
@@ -1444,10 +1450,12 @@ fn copy_to_contiguous(
 ///
 /// # Memory
 ///
-/// Memory-maps the file. Tensor data is **not** copied during parsing —
-/// [`ParsedPth::tensors()`] slices directly from the mmap (zero-copy for
-/// contiguous little-endian tensors, which is >99% of real files).
-/// Peak memory ≈ mapped file + metadata.
+/// Memory-maps the file with `memmap2` (page prefaulting). Tensor data
+/// is **not** copied during parsing — [`ParsedPth::tensors()`] slices
+/// directly from the mmap (zero-copy for contiguous little-endian tensors,
+/// which is >99% of real files). Peak memory during parsing ≈ file size
+/// (mapped, not heap-allocated) + ~1 KB metadata per tensor. The mmap is
+/// released when the returned `ParsedPth` is dropped.
 #[allow(unsafe_code)]
 pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
     let file = std::fs::File::open(path.as_ref())?;
@@ -1588,6 +1596,8 @@ fn build_entry_index(
 
         // Strip the archive prefix to get the suffix key.
         // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0"
+        // BORROW: owned copy — entry name borrows from ZipArchive, but
+        // the HashMap key must outlive the entry borrow.
         let full_name = entry.name().to_owned();
         let suffix = full_name
             .find('/')
