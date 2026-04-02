@@ -226,7 +226,9 @@ fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
 
 #[cfg(feature = "npz")]
 fn run_parse_npz(path: &std::path::Path) -> anamnesis::Result<()> {
-    let tensors = anamnesis::parse_npz(path)?;
+    // Use inspect_npz (header-only) instead of parse_npz — avoids loading
+    // all tensor data into memory for a display-only operation.
+    let info = anamnesis::inspect_npz(path)?;
 
     println!(
         "Parsed {} (NPZ archive)",
@@ -234,55 +236,31 @@ fn run_parse_npz(path: &std::path::Path) -> anamnesis::Result<()> {
             .and_then(|n| n.to_str())
             .unwrap_or("(unknown)")
     );
-    println!("  Tensors: {}", tensors.len());
-
-    // Sort by name for stable output.
-    let mut names: Vec<&String> = tensors.keys().collect();
-    names.sort();
-    // CAST: usize → u64, tensor byte lengths fit in u64
-    #[allow(clippy::as_conversions)]
-    let total_bytes: u64 = tensors.values().map(|t| t.data.len() as u64).sum();
-    println!("  Total size: {}", format_bytes(total_bytes));
+    println!("  Tensors:    {}", info.tensors.len());
+    println!("  Total size: {}", format_bytes(info.total_bytes));
     println!();
 
-    for name in &names {
-        if let Some(t) = tensors.get(*name) {
-            let shape_str = format!("{:?}", t.shape);
-            // CAST: usize → u64, tensor byte lengths fit
-            #[allow(clippy::as_conversions)]
-            let byte_len = t.data.len() as u64;
-            println!(
-                "  {:<30} {:<6} {:<15} {}",
-                name,
-                t.dtype,
-                shape_str,
-                format_bytes(byte_len)
-            );
-        }
+    for t in &info.tensors {
+        let shape_str = format!("{:?}", t.shape);
+        // CAST: usize → u64, tensor byte lengths fit
+        #[allow(clippy::as_conversions)]
+        let byte_len = t.byte_len as u64;
+        println!(
+            "  {:<30} {:<6} {:<15} {}",
+            t.name,
+            t.dtype,
+            shape_str,
+            format_bytes(byte_len)
+        );
     }
     Ok(())
 }
 
 #[cfg(feature = "npz")]
 fn run_inspect_npz(path: &std::path::Path) -> anamnesis::Result<()> {
-    let tensors = anamnesis::parse_npz(path)?;
-
-    // CAST: usize → u64, tensor byte lengths fit in u64
-    #[allow(clippy::as_conversions)]
-    let total_bytes: u64 = tensors.values().map(|t| t.data.len() as u64).sum();
-
-    let mut dtypes: Vec<String> = Vec::new();
-    for t in tensors.values() {
-        let s = t.dtype.to_string();
-        if !dtypes.contains(&s) {
-            dtypes.push(s);
-        }
-    }
-
-    println!("Format:      NPZ archive");
-    println!("Tensors:     {}", tensors.len());
-    println!("Total size:  {}", format_bytes(total_bytes));
-    println!("Dtypes:      {}", dtypes.join(", "));
+    // Header-only — no tensor data loaded.
+    let info = anamnesis::inspect_npz(path)?;
+    println!("{info}");
     Ok(())
 }
 

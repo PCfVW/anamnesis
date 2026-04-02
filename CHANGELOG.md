@@ -48,10 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dtype, `byte_len`) for display paths that don't need tensor data
 - **`PthDtype::to_safetensors_dtype()`** — direct single-hop conversion
   to `safetensors::Dtype`, bypassing the intermediate anamnesis `Dtype`
+- **`inspect_npz()`** (`src/parse/npz.rs`) — header-only `NPZ` inspection
+  that reads only `NPY` headers (~128 bytes per array), no tensor data.
+  Returns `NpzInspectInfo` + `NpzTensorInfo` (name, shape, dtype,
+  `byte_len`). For a 300 MB file, uses kilobytes instead of 300 MB
 - **CLI `.npz` support** — `amn parse` and `amn inspect` now accept
-  `.npz` files when built with `--features npz`. `amn remember` for
-  `.npz` returns a clear unsupported error (tensors are already
-  full-precision)
+  `.npz` files when built with `--features npz`, using the header-only
+  `inspect_npz` path. `amn remember` for `.npz` returns a clear
+  unsupported error (tensors are already full-precision)
 
 ### Changed
 

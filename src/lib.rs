@@ -70,7 +70,7 @@ pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "npz")]
-pub use parse::{parse_npz, NpzDtype, NpzTensor};
+pub use parse::{inspect_npz, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo};
 #[cfg(feature = "pth")]
 pub use parse::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
 pub use parse::{

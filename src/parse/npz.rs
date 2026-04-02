@@ -464,8 +464,151 @@ fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<
 }
 
 // ---------------------------------------------------------------------------
+// NpzTensorInfo / NpzInspectInfo (lightweight, header-only)
+// ---------------------------------------------------------------------------
+
+/// Lightweight per-tensor metadata from an `NPZ` archive.
+///
+/// Produced by [`inspect_npz`]. Contains only `NPY` header information —
+/// no tensor data is read from the archive.
+#[derive(Debug, Clone)]
+pub struct NpzTensorInfo {
+    /// Tensor name (without `.npy` extension).
+    pub name: String,
+    /// Tensor dimensions (e.g., `[16384, 2304]`).
+    pub shape: Vec<usize>,
+    /// Element data type (e.g., `F32`, `BF16`).
+    pub dtype: NpzDtype,
+    /// Total byte length (`product(shape) * dtype.byte_size()`).
+    pub byte_len: usize,
+}
+
+/// Summary information about an `NPZ` archive, derived from headers only.
+///
+/// Produced by [`inspect_npz`]. No tensor data is loaded — peak memory
+/// is proportional to the number of tensors (metadata only), not the
+/// file size.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct NpzInspectInfo {
+    /// Per-tensor metadata.
+    pub tensors: Vec<NpzTensorInfo>,
+    /// Total size of all tensor data in bytes.
+    pub total_bytes: u64,
+    /// Distinct dtypes found (in order of first occurrence).
+    pub dtypes: Vec<NpzDtype>,
+}
+
+impl fmt::Display for NpzInspectInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Format:      NPZ archive")?;
+        write!(f, "\nTensors:     {}", self.tensors.len())?;
+        write!(
+            f,
+            "\nTotal size:  {}",
+            crate::inspect::format_bytes(self.total_bytes)
+        )?;
+        let dtype_list: String = self
+            .dtypes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "\nDtypes:      {dtype_list}")?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Inspects an `NPZ` archive, returning metadata for all arrays without
+/// reading tensor data.
+///
+/// Reads only `NPY` headers (~128 bytes per array) — no bulk data
+/// extraction. For a 300 MB file this uses kilobytes of memory instead
+/// of 300 MB.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the file cannot be opened or read.
+///
+/// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed or
+/// an `NPY` header is invalid.
+///
+/// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
+/// or an unsupported dtype.
+///
+/// # Memory
+///
+/// Allocates only per-tensor metadata (name, shape, dtype). No tensor
+/// data is read or allocated. Peak memory ≈ kilobytes for typical models.
+pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    let mut tensors = Vec::with_capacity(archive.len());
+    let mut total_bytes: u64 = 0;
+    let mut dtypes: Vec<NpzDtype> = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to read ZIP entry {i}: {e}"),
+        })?;
+
+        // Strip .npy suffix; skip non-.npy entries (e.g., __MACOSX/).
+        // BORROW: .to_owned() converts &str from zip entry to owned String
+        let full_name = entry.name().to_owned();
+        let name = match full_name.strip_suffix(".npy") {
+            // BORROW: .to_owned() converts &str slice to owned String
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+
+        let header = parse_npy_header(&mut entry)?;
+
+        if header.fortran_order {
+            return Err(AnamnesisError::Unsupported {
+                format: "NPZ".into(),
+                detail: format!(
+                    "fortran-order arrays not supported (array '{name}'). \
+                     ML frameworks save C-order by default"
+                ),
+            });
+        }
+
+        let n_elements: usize = header
+            .shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .unwrap_or(usize::MAX);
+        let byte_len = n_elements.saturating_mul(header.dtype.byte_size());
+
+        // CAST: usize → u64, byte lengths fit in u64
+        #[allow(clippy::as_conversions)]
+        {
+            total_bytes = total_bytes.saturating_add(byte_len as u64);
+        }
+
+        if !dtypes.contains(&header.dtype) {
+            dtypes.push(header.dtype);
+        }
+
+        tensors.push(NpzTensorInfo {
+            name,
+            shape: header.shape,
+            dtype: header.dtype,
+            byte_len,
+        });
+    }
+
+    Ok(NpzInspectInfo {
+        tensors,
+        total_bytes,
+        dtypes,
+    })
+}
 
 /// Parses an `NPZ` archive, returning all arrays as a name-to-tensor map.
 ///
