@@ -311,7 +311,20 @@ fn run_remember(
     match detect_format(path) {
         Format::Safetensors => run_remember_safetensors(path, to, output),
         #[cfg(feature = "pth")]
-        Format::Pth => run_remember_pth(path, output),
+        Format::Pth => {
+            let to_lower = to.to_ascii_lowercase();
+            if to_lower != "safetensors" && to_lower != "bf16" {
+                return Err(anamnesis::AnamnesisError::Unsupported {
+                    format: "pth".into(),
+                    detail: format!(
+                        "unsupported --to value `{to}` for .pth files \
+                         (supported: `safetensors`, `bf16` — .pth conversion \
+                         always produces safetensors)"
+                    ),
+                });
+            }
+            run_remember_pth(path, output)
+        }
         #[cfg(feature = "npz")]
         Format::Npz => Err(anamnesis::AnamnesisError::Unsupported {
             format: "NPZ".into(),

@@ -327,15 +327,12 @@ impl ParsedPth {
         let mut total_bytes: u64 = 0;
         let mut dtypes: Vec<PthDtype> = Vec::new();
         for m in &self.meta {
+            // CAST: usize → u64, element counts fit in u64
+            #[allow(clippy::as_conversions)]
             let n_elements: u64 = m
                 .shape
                 .iter()
-                .try_fold(1u64, |acc, &d| {
-                    // CAST: usize → u64, element counts fit in u64
-                    #[allow(clippy::as_conversions)]
-                    acc.checked_mul(d as u64)
-                })
-                .unwrap_or(0);
+                .fold(1u64, |acc, &d| acc.saturating_mul(d as u64));
             // CAST: usize → u64, byte sizes fit
             #[allow(clippy::as_conversions)]
             let byte_size = m.dtype.byte_size() as u64;
@@ -1010,7 +1007,12 @@ impl<'a> PickleVm<'a> {
                         })?
                         .clone();
                     self.memo.insert(self.next_memo_id, val);
-                    self.next_memo_id += 1;
+                    self.next_memo_id =
+                        self.next_memo_id
+                            .checked_add(1)
+                            .ok_or_else(|| AnamnesisError::Parse {
+                                reason: "pickle memo table overflow (>2^32 MEMOIZE opcodes)".into(),
+                            })?;
                 }
 
                 _ => {
@@ -1484,6 +1486,7 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
         });
     }
 
+    // INDEX: full-slice — raw is the complete mmap; [..] is always in bounds
     let cursor = std::io::Cursor::new(&raw[..]);
     let mut archive = zip::ZipArchive::new(cursor)?;
 
@@ -1578,15 +1581,17 @@ fn build_entry_index(
             continue;
         }
 
-        // CAST: u64 → usize, ZIP offsets/sizes fit in usize for model files.
-        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-        let data_start = entry.data_start() as usize;
-        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-        let data_len = entry.size() as usize;
-
         // BORROW: owned copy — entry name borrows from ZipArchive, but
         // the HashMap key and error messages must outlive the entry borrow.
         let full_name = entry.name().to_owned();
+
+        let data_start =
+            usize::try_from(entry.data_start()).map_err(|_| AnamnesisError::Parse {
+                reason: format!("ZIP entry `{full_name}`: data_start overflows usize"),
+            })?;
+        let data_len = usize::try_from(entry.size()).map_err(|_| AnamnesisError::Parse {
+            reason: format!("ZIP entry `{full_name}`: size overflows usize"),
+        })?;
 
         // Validate range.
         let data_end = data_start
