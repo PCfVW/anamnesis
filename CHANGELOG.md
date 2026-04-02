@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PyTorch `.pth` pickle VM + tensor extraction** (`src/parse/pth.rs`) —
+  minimal pickle interpreter (~36 opcodes) that parses `PyTorch` ≥ 1.6
+  state_dict ZIP archives. Explicit `GLOBAL` allowlist rejects
+  non-`torch.*` callables (security boundary equivalent to
+  `weights_only=True`). Handles shared storage, non-contiguous strides,
+  and big-endian byte order. Feature-gated behind `pth`. Supports `F16`,
+  `BF16`, `F32`, `F64`, `I8`–`I64`, `U8`, `Bool` storage types
+
+### Changed
+
+- Extracted `byteswap_inplace` from `src/parse/npz.rs` to shared
+  `src/parse/utils.rs` module (`pub(crate)`) so that multiple format
+  parsers (`NPZ`, `.pth`) can reuse it without duplication
+- Widened `From<ZipError>` impl in `error.rs` from `npz`-only to
+  `any(npz, pth)` feature gate
+
 ## [0.3.0] - 2026-03-24
 
 ### Added

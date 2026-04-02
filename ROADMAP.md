@@ -3,7 +3,7 @@
 > *Parse any format, recover any precision.*
 
 **Date:** March 20, 2026 (updated April 1, 2026)
-**Status:** Phases 1–3 complete (v0.3.0 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing. Next: Phase 4 (GGUF).
+**Status:** Phases 1–3 complete (v0.3.0 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing. Next: Phase 3.5 (PyTorch `.pth` parsing, v0.3.1).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -22,6 +22,7 @@
   - [Phase 1: FP8 Dequantization](#phase-1-fp8-dequantization)
   - [Phase 2: Additional Quantization Schemes](#phase-2-additional-quantization-schemes)
   - [Phase 3: NPZ/NPY Parsing](#phase-3-npznpy-parsing)
+  - [Phase 3.5: PyTorch `.pth` Parsing](#phase-35-pytorch-pth-parsing)
   - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Emerging Quantization Formats](#phase-6-emerging-quantization-formats)
@@ -106,6 +107,7 @@ anamnesis (library crate)
 ├── parse/              ← decode + validate any tensor format
 │   ├── safetensors        safetensors (including quantized metadata)
 │   ├── npz                NPZ/NPY archives (feature-gated)
+│   ├── pth                PyTorch .pth state_dict (feature-gated, Phase 3.5)
 │   └── gguf               GGUF (feature-gated, Phase 4)
 │
 ├── remember/           ← built on parse: precision recovery (dequantize)
@@ -240,6 +242,27 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 **Deliverable:** `anamnesis` v0.3.0 — NPZ parsing works. candle-mi can migrate its NPZ dependency from internal to `anamnesis`. — **PUSH + tag `v0.3.0`**
 
 **New dependencies:** `zip` v2 with `deflate` feature (direct dependency, no `npyz`). Feature-gated behind anamnesis's `npz` feature.
+
+### Phase 3.5: PyTorch `.pth` Parsing
+
+**Goal:** Add PyTorch `.pth` (state_dict) parsing and lossless conversion to safetensors. This enables loading pre-trained weights from repositories that only ship `.pth` files (e.g., AlgZoo's 400+ tiny models on GCS, plus thousands of older HuggingFace models). Unlike Phases 1–2, no dequantization is needed — `.pth` tensors are already full-precision (F32/F64/BF16/F16).
+
+**Approach:** Implement a minimal pickle VM (~36 opcodes, not the full protocol) that interprets the `data.pkl` stream inside the ZIP archive, extracts tensor metadata (shape, dtype, storage reference), and reads raw bytes from `data/{index}` entries. Security boundary: explicit GLOBAL allowlist rejects non-`torch.*` callables. Lossless format conversion to safetensors via `safetensors::tensor::serialize_to_file`. Feature-gated behind `pth`.
+
+**Detailed plan:** See `PLAN-PTH-v0.3.1.md`.
+
+- [x] Extract `byteswap_inplace` from `npz.rs` to shared `src/parse/utils.rs` — **commit**
+- [x] Pickle VM + tensor extraction (`src/parse/pth.rs`) — minimal stack machine, GLOBAL allowlist, storage cache for shared storage, stride handling — **commit**
+- [ ] Test fixtures (`tests/fixtures/generate_pth.py`) — generate `.pth` + reference `.safetensors` fixtures, commit binaries — **commit**
+- [ ] Unit + security tests (`tests/pth_parsing.rs`) — parse, reject legacy, reject malicious globals, byte-exact roundtrip — **commit**
+- [ ] Safetensors conversion (`src/remember/pth.rs`) — lossless format writer — **commit**
+- [ ] `ParsedPth` + `PthInspectInfo` in `model.rs` — separate type from `ParsedModel` — **commit**
+- [ ] CLI integration (`src/bin/main.rs`) — format dispatch by extension + ZIP magic, `parse`/`inspect`/`remember` for `.pth` — **commit**
+- [ ] Module wiring — `mod.rs`, `lib.rs`, `Cargo.toml` feature gate, `error.rs` cfg update — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.3.1 — PyTorch `.pth` state_dict parsing + safetensors conversion. — **PUSH + tag `v0.3.1`**
+
+**New dependencies:** None (reuses `zip` v2 from `npz`). Feature-gated behind `pth`.
 
 ### Phase 4: GGUF Parsing & Dequantization
 

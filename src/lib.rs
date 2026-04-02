@@ -68,6 +68,8 @@ pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "npz")]
 pub use parse::{parse_npz, NpzDtype, NpzTensor};
+#[cfg(feature = "pth")]
+pub use parse::{parse_pth, PthDtype, PthTensor};
 pub use parse::{
     AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
     QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,

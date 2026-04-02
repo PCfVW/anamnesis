@@ -25,6 +25,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::error::AnamnesisError;
+use crate::parse::utils::byteswap_inplace;
 
 // ---------------------------------------------------------------------------
 // NPY magic
@@ -462,22 +463,6 @@ fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<
     Ok(buf)
 }
 
-/// Reverses the byte order of each element in `data` in-place.
-///
-/// Each contiguous `element_size`-byte chunk is reversed, converting
-/// big-endian to little-endian (or vice versa).
-// VECTORIZED: scalar fallback — chunk.reverse() on a runtime-variable
-// element_size prevents auto-vectorization. This is the big-endian path
-// (<0.01% of ML files), so scalar performance is acceptable.
-// EXPLICIT: in-place mutation on the read buffer avoids allocating a second
-// buffer of equal size. CONVENTIONS Rule 6 (separate in/out) is waived here
-// because the data is already in a dedicated Vec<u8> that serves as the output.
-fn byteswap_inplace(data: &mut [u8], element_size: usize) {
-    for chunk in data.chunks_exact_mut(element_size) {
-        chunk.reverse();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -729,29 +714,6 @@ mod tests {
         let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3, 4), }";
         let shape = extract_shape(header).unwrap();
         assert_eq!(shape, vec![2, 3, 4]);
-    }
-
-    // -- byteswap_inplace ----------------------------------------------------
-
-    #[test]
-    fn byteswap_2byte() {
-        let mut data = vec![0x01, 0x02, 0x03, 0x04];
-        byteswap_inplace(&mut data, 2);
-        assert_eq!(data, vec![0x02, 0x01, 0x04, 0x03]);
-    }
-
-    #[test]
-    fn byteswap_4byte() {
-        let mut data = vec![0x01, 0x02, 0x03, 0x04];
-        byteswap_inplace(&mut data, 4);
-        assert_eq!(data, vec![0x04, 0x03, 0x02, 0x01]);
-    }
-
-    #[test]
-    fn byteswap_8byte() {
-        let mut data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        byteswap_inplace(&mut data, 8);
-        assert_eq!(data, vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
     }
 
     // -- NPY header roundtrip ------------------------------------------------

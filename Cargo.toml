@@ -19,6 +19,7 @@ gptq = []
 awq = []
 bnb = []
 npz = ["dep:zip"]
+pth = ["dep:zip"]
 indicatif = ["dep:indicatif"]
 
 [dependencies]

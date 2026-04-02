@@ -33,7 +33,7 @@ impl From<safetensors::SafeTensorError> for AnamnesisError {
     }
 }
 
-#[cfg(feature = "npz")]
+#[cfg(any(feature = "npz", feature = "pth"))]
 impl From<zip::result::ZipError> for AnamnesisError {
     fn from(e: zip::result::ZipError) -> Self {
         Self::Parse {
