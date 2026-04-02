@@ -7,34 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-02
+
 ### Added
 
-- **PyTorch `.pth` pickle VM + tensor extraction** (`src/parse/pth.rs`) —
-  minimal pickle interpreter (~36 opcodes) that parses `PyTorch` ≥ 1.6
-  state_dict ZIP archives. Explicit `GLOBAL` allowlist rejects
-  non-`torch.*` callables (security boundary equivalent to
-  `weights_only=True`). Handles shared storage, non-contiguous strides,
-  and big-endian byte order. Dynamic ZIP prefix discovery supports both
-  newer (`archive/`) and older (`{model_name}/`) `PyTorch` formats.
-  Feature-gated behind `pth`. Supports `F16`, `BF16`, `F32`, `F64`,
-  `I8`–`I64`, `U8`, `Bool` storage types
+- **PyTorch `.pth` parsing** (`src/parse/pth.rs`) — minimal pickle
+  interpreter (~36 opcodes) that parses `PyTorch` ≥ 1.6 `state_dict` ZIP
+  archives with a safe, explicit `GLOBAL` allowlist (rejects non-`torch.*`
+  callables — equivalent to `weights_only=True` but stricter). Zero-copy
+  I/O via `memmap2` with `Cow::Borrowed` tensor data sliced directly from
+  the mmap. Handles shared storage, non-contiguous strides, big-endian
+  byte order, and both newer (`archive/`) and older (`{model_name}/`)
+  `PyTorch` ZIP prefix conventions. Feature-gated behind `pth`. Supports
+  `F16`, `BF16`, `F32`, `F64`, `I8`–`I64`, `U8`, `Bool` storage types.
+  **11–31× faster** than `torch.load()` on torchvision models (resnet18,
+  resnet50, ViT-B/16)
+- **`.pth` → safetensors conversion** (`src/remember/pth.rs`) — lossless
+  format conversion preserving original dtypes (no dequantization). The
+  conversion pipeline writes directly from mmap slices to the output file
+  — zero intermediate data copies. Byte-exact roundtrip verified against
+  `PyTorch` reference on all 3 test models
 - **`.pth` cross-validation** against `PyTorch` on 3 real
   [AlgZoo](https://github.com/alignment-research-center/alg-zoo) models
   (MIT-0 license): `2nd_argmax_2_2` RNN (10 params), `longest_cycle_2_3`
   Transformer (50 params), `one_layer_16_hidden` RNN blog example (432
   params). Byte-exact match on all tensors against `PyTorch` reference
-- **CLI `.pth` support** — `amn parse`, `amn inspect`, and `amn remember` now
-  accept `.pth`, `.pt`, and `.bin` files when built with `--features pth`.
-  Format detection by extension with ZIP magic fallback for `.bin` files.
-  `amn remember model.pth` converts to safetensors; `amn parse model.pth`
-  shows per-tensor details (name, dtype, shape, size)
-- **`PthInspectInfo`** — summary struct (tensor count, total bytes, dtypes, byte
-  order) with `Display` impl. `ParsedPth::inspect()` derives it from metadata.
-  `ParsedPth::to_safetensors()` convenience method for the full conversion pipeline
-- **`.pth` → safetensors conversion** (`src/remember/pth.rs`) — lossless format
-  conversion preserving original dtypes. No dequantization needed. Byte-exact
-  roundtrip verified: `.pth` → `.safetensors` → read back matches `PyTorch`
-  reference on all 3 `AlgZoo` models
+- **CLI `.pth` support** — `amn parse`, `amn inspect`, and `amn remember`
+  now accept `.pth`, `.pt`, and `.bin` files when built with
+  `--features pth`. Format detection by extension with ZIP magic fallback
+  for `.bin` files. `amn remember model.pth` converts to safetensors;
+  `amn parse model.pth` shows per-tensor details (name, dtype, shape,
+  size)
+- **`ParsedPth`** container — owns the mmap, provides zero-copy
+  `tensors()`, `inspect()` → `PthInspectInfo`, and `to_safetensors()`
+  convenience method
+- **`PthInspectInfo`** — summary struct (tensor count, total bytes,
+  dtypes, byte order) with `Display` impl
 
 ### Changed
 
@@ -43,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsers (`NPZ`, `.pth`) can reuse it without duplication
 - Widened `From<ZipError>` impl in `error.rs` from `npz`-only to
   `any(npz, pth)` feature gate
+- Changed `unsafe_code` lint from `forbid` to `deny` to allow
+  feature-gated `memmap2` usage in the `pth` module (with `// SAFETY:`
+  annotation)
+
+### New dependencies
+
+- `memmap2` v0.9 (optional, `pth` feature only) — memory-mapped file I/O
 
 ## [0.3.0] - 2026-03-24
 
