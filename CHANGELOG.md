@@ -39,10 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `amn parse model.pth` shows per-tensor details (name, dtype, shape,
   size)
 - **`ParsedPth`** container — owns the mmap, provides zero-copy
-  `tensors()`, `inspect()` → `PthInspectInfo`, and `to_safetensors()`
-  convenience method
+  `tensors()`, `inspect()` → `PthInspectInfo`, `tensor_info()` →
+  `PthTensorInfo` (metadata only, no data access), and
+  `to_safetensors()` convenience method
 - **`PthInspectInfo`** — summary struct (tensor count, total bytes,
   dtypes, byte order) with `Display` impl
+- **`PthTensorInfo`** — lightweight per-tensor metadata (name, shape,
+  dtype, `byte_len`) for display paths that don't need tensor data
+- **`PthDtype::to_safetensors_dtype()`** — direct single-hop conversion
+  to `safetensors::Dtype`, bypassing the intermediate anamnesis `Dtype`
+- **CLI `.npz` support** — `amn parse` and `amn inspect` now accept
+  `.npz` files when built with `--features npz`. `amn remember` for
+  `.npz` returns a clear unsupported error (tensors are already
+  full-precision)
 
 ### Changed
 
@@ -54,6 +63,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changed `unsafe_code` lint from `forbid` to `deny` to allow
   feature-gated `memmap2` usage in the `pth` module (with `// SAFETY:`
   annotation)
+
+### Fixed
+
+- **`has_zip_magic`** now reads only 4 bytes via `read_exact` instead of
+  loading the entire file into heap (prevented 7 GB allocation on large
+  `.bin` files)
+- **`build_entry_index`** now returns `AnamnesisError::Parse` for corrupt
+  ZIP entries whose data range exceeds the file size, instead of silently
+  skipping them
+- **`extract_dict_pairs`** unreachable `Reduced{OrderedDict}` branch now
+  returns `Err` instead of `Ok(&[])`, preventing silent data loss
+- **MEMOIZE** opcode uses `checked_add(1)` instead of plain `+= 1`,
+  preventing silent `u32` wraparound on adversarial pickles
+- **`build_entry_index`** `u64`→`usize` casts replaced with `TryFrom`,
+  consistent with codebase conventions (no truncation on 32-bit)
+- **`inspect()`** element count uses `saturating_mul` instead of
+  `checked_mul().unwrap_or(0)`, avoiding silently wrong `total_bytes`
+- **`--to`** argument for `.pth` files is now validated: accepts
+  `safetensors` or `bf16`, errors on unsupported values
+- **`copy_to_contiguous`** uses the two-level bounds pattern from
+  `CONVENTIONS.md` — pre-validates max source offset once before the
+  loop, removing 6 per-element `checked_*` calls
 
 ### New dependencies
 
