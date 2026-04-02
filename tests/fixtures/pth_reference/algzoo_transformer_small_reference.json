@@ -1,0 +1,70 @@
+{
+  "source": "algzoo_transformer_small.pth",
+  "torch_version": "2.10.0+cu130",
+  "num_tensors": 7,
+  "tensors": [
+    {
+      "name": "embed.weight",
+      "shape": [
+        3,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "c304a53d6e5fb63f7d26debf33834f3f0930f4be6fb25f3e"
+    },
+    {
+      "name": "pos_embed.weight",
+      "shape": [
+        3,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "58a0183f235e0e415c16593e518a5cbe179f7fbf67504ebf"
+    },
+    {
+      "name": "attns.0.in_proj_weight",
+      "shape": [
+        6,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "4c411abf5e17544157b57d3f65a7b33e0521e64056d78dbe51ed2240847598bee16ec23fcaf78c3ecba85d3f12ae003f"
+    },
+    {
+      "name": "attns.0.out_proj.weight",
+      "shape": [
+        2,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "e6018dbf1cce3ebfb4e676be42f0eabe"
+    },
+    {
+      "name": "attns.1.in_proj_weight",
+      "shape": [
+        6,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "343128c0c2b7744036c35f3fd6e099c0ef3693c0cf2412be64bf2e41a0d91f3ffa6a5fbf4b13b3bd1f9b123c2a142fc0"
+    },
+    {
+      "name": "attns.1.out_proj.weight",
+      "shape": [
+        2,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "017837bfb241e0be60101fbe24800640"
+    },
+    {
+      "name": "unembed.weight",
+      "shape": [
+        3,
+        2
+      ],
+      "dtype": "F32",
+      "data_hex": "7763a740e3475dbdf151c5bfeb88dc3f6cb5f94043f6a941"
+    }
+  ]
+}

@@ -253,8 +253,8 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 - [x] Extract `byteswap_inplace` from `npz.rs` to shared `src/parse/utils.rs` — **commit**
 - [x] Pickle VM + tensor extraction (`src/parse/pth.rs`) — minimal stack machine, GLOBAL allowlist, storage cache for shared storage, stride handling — **commit**
-- [ ] Test fixtures (`tests/fixtures/generate_pth.py`) — generate `.pth` + reference `.safetensors` fixtures, commit binaries — **commit**
-- [ ] Unit + security tests (`tests/pth_parsing.rs`) — parse, reject legacy, reject malicious globals, byte-exact roundtrip — **commit**
+- [x] Test fixtures — 3 AlgZoo `.pth` models (2–3.5 KB each) from GCS + Python-generated JSON reference manifests — **commit**
+- [x] Cross-validation tests (`tests/cross_validation_pth.rs`) — byte-exact comparison against `PyTorch` on 3 AlgZoo models (RNN + Transformer, newer and older ZIP formats) — **commit**
 - [ ] Safetensors conversion (`src/remember/pth.rs`) — lossless format writer — **commit**
 - [ ] `ParsedPth` + `PthInspectInfo` in `model.rs` — separate type from `ParsedModel` — **commit**
 - [ ] CLI integration (`src/bin/main.rs`) — format dispatch by extension + ZIP magic, `parse`/`inspect`/`remember` for `.pth` — **commit**

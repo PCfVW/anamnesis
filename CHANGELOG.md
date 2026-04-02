@@ -14,8 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state_dict ZIP archives. Explicit `GLOBAL` allowlist rejects
   non-`torch.*` callables (security boundary equivalent to
   `weights_only=True`). Handles shared storage, non-contiguous strides,
-  and big-endian byte order. Feature-gated behind `pth`. Supports `F16`,
-  `BF16`, `F32`, `F64`, `I8`–`I64`, `U8`, `Bool` storage types
+  and big-endian byte order. Dynamic ZIP prefix discovery supports both
+  newer (`archive/`) and older (`{model_name}/`) `PyTorch` formats.
+  Feature-gated behind `pth`. Supports `F16`, `BF16`, `F32`, `F64`,
+  `I8`–`I64`, `U8`, `Bool` storage types
+- **`.pth` cross-validation** against `PyTorch` on 3 real
+  [AlgZoo](https://github.com/alignment-research-center/alg-zoo) models
+  (MIT-0 license): `2nd_argmax_2_2` RNN (10 params), `longest_cycle_2_3`
+  Transformer (50 params), `one_layer_16_hidden` RNN blog example (432
+  params). Byte-exact match on all tensors against `PyTorch` reference
 
 ### Changed
 

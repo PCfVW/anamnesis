@@ -235,6 +235,19 @@ fn is_allowed_global(module: &str, name: &str) -> bool {
     )
 }
 
+/// Returns `true` if this is a `REDUCE(OrderedDict, ())` call that should
+/// produce an empty `Dict` instead of a `Reduced` node.
+fn is_ordered_dict_constructor(callable: &PickleValue, args: &PickleValue) -> bool {
+    if let PickleValue::Global { module, name } = callable {
+        if module == "collections" && name == "OrderedDict" {
+            if let PickleValue::Tuple(items) = args {
+                return items.is_empty();
+            }
+        }
+    }
+    false
+}
+
 /// Minimal pickle VM state.
 struct PickleVm<'a> {
     /// Raw pickle bytes.
@@ -657,10 +670,17 @@ impl<'a> PickleVm<'a> {
                 b'R' | 0x81 => {
                     let args = self.pop()?;
                     let callable = self.pop()?;
-                    self.stack.push(PickleValue::Reduced {
-                        callable: Box::new(callable),
-                        args: Box::new(args),
-                    });
+                    // Semantic interpretation: REDUCE(OrderedDict, ()) → empty Dict.
+                    // Python actually calls OrderedDict() here, producing a real dict
+                    // that SETITEMS will later populate. Without this, SETITEMS fails.
+                    if is_ordered_dict_constructor(&callable, &args) {
+                        self.stack.push(PickleValue::Dict(Vec::new()));
+                    } else {
+                        self.stack.push(PickleValue::Reduced {
+                            callable: Box::new(callable),
+                            args: Box::new(args),
+                        });
+                    }
                 }
                 // BUILD (pop state, peek obj → Built)
                 b'b' => {
@@ -991,13 +1011,10 @@ fn extract_dict_pairs(root: &PickleValue) -> crate::Result<&[(PickleValue, Pickl
                 reason: format!("top-level pickle value is not a dict: {root:?}"),
             })
         }
-        PickleValue::Built { obj, state } => {
-            // OrderedDict with SETITEMS: BUILD(REDUCE(OrderedDict,()), dict_state)
-            // The state is a Dict with the items set via SETITEMS.
-            if let PickleValue::Dict(pairs) = state.as_ref() {
-                return Ok(pairs);
-            }
-            // Try the inner object
+        PickleValue::Built { obj, state: _ } => {
+            // BUILD(obj, state) sets obj.__dict__ = state. The tensor data
+            // lives in obj (the OrderedDict), not in state (which is the
+            // __dict__ containing _metadata). Always recurse into obj.
             extract_dict_pairs(obj)
         }
         _ => Err(AnamnesisError::Parse {
@@ -1336,8 +1353,9 @@ fn find_entry_name(
 
 /// Reads a ZIP entry's full contents into a `Vec<u8>`.
 ///
-/// Tries the exact name first, then with the `archive/` prefix that
-/// `PyTorch` adds to ZIP entries.
+/// Uses suffix-based lookup via [`find_entry_name`] to handle any ZIP prefix
+/// convention: `archive/` (newer `PyTorch`), `{model_name}/` (older
+/// `PyTorch`), or bare filenames.
 ///
 /// # Errors
 ///
@@ -1346,18 +1364,15 @@ fn read_zip_entry_bytes(
     archive: &mut zip::ZipArchive<std::io::Cursor<&Vec<u8>>>,
     name: &str,
 ) -> crate::Result<Vec<u8>> {
-    // Try exact name first, then with "archive/" prefix.
-    // Probe existence first to avoid borrow-checker issues with
-    // two `by_name` calls on the same archive.
-    let resolved_name = if archive.by_name(name).is_ok() {
-        name.to_owned()
-    } else {
-        format!("archive/{name}")
-    };
+    // Discover the full entry name by suffix matching. This handles
+    // "archive/data.pkl", "my_model/data.pkl", or just "data.pkl".
+    let resolved_name = find_entry_name(archive, name).ok_or_else(|| AnamnesisError::Parse {
+        reason: format!("ZIP entry `{name}` not found in archive"),
+    })?;
     let mut entry = archive
         .by_name(&resolved_name)
         .map_err(|e| AnamnesisError::Parse {
-            reason: format!("ZIP entry `{name}` not found: {e}"),
+            reason: format!("failed to open ZIP entry `{resolved_name}`: {e}"),
         })?;
 
     // CAST: u64 → usize, ZIP entry sizes for model files fit in usize.
@@ -1368,7 +1383,7 @@ fn read_zip_entry_bytes(
     entry
         .read_to_end(&mut buf)
         .map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to read ZIP entry `{name}`: {e}"),
+            reason: format!("failed to read ZIP entry `{resolved_name}`: {e}"),
         })?;
     Ok(buf)
 }
