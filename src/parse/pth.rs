@@ -216,21 +216,22 @@ enum PickleValue {
 fn is_allowed_global(module: &str, name: &str) -> bool {
     matches!(
         (module, name),
-        ("torch._utils", "_rebuild_tensor_v2")
-            | (
-                "torch",
-                "FloatStorage"
-                    | "DoubleStorage"
-                    | "HalfStorage"
-                    | "BFloat16Storage"
-                    | "LongStorage"
-                    | "IntStorage"
-                    | "ShortStorage"
-                    | "CharStorage"
-                    | "ByteStorage"
-                    | "BoolStorage"
-            )
-            | ("collections", "OrderedDict")
+        (
+            "torch._utils",
+            "_rebuild_tensor_v2" | "_rebuild_parameter" | "_rebuild_parameter_with_state"
+        ) | (
+            "torch",
+            "FloatStorage"
+                | "DoubleStorage"
+                | "HalfStorage"
+                | "BFloat16Storage"
+                | "LongStorage"
+                | "IntStorage"
+                | "ShortStorage"
+                | "CharStorage"
+                | "ByteStorage"
+                | "BoolStorage"
+        ) | ("collections", "OrderedDict")
             | ("torch.nn.parameter", "Parameter")
     )
 }
@@ -969,15 +970,29 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
 
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
 #[allow(clippy::wildcard_enum_match_arm)]
-/// Unwraps `Built { Reduced { _rebuild_tensor_v2, args }, state }` into
-/// the inner `Reduced`, which is the common wrapping when `nn.Parameter`
-/// is used.
+/// Unwraps nested pickle structures to find the inner `_rebuild_tensor_v2` call.
+///
+/// Handles:
+/// - Direct: `Reduced { _rebuild_tensor_v2, args }`
+/// - Parameter-wrapped: `Reduced { _rebuild_parameter, Tuple([Reduced { _rebuild_tensor_v2, args }, ...]) }`
+/// - `Built`-wrapped: `Built { obj, state }` → recurse into `obj`
 fn unwrap_to_rebuild(val: &PickleValue) -> Option<(&PickleValue, &PickleValue)> {
     match val {
         PickleValue::Reduced { callable, args, .. } => {
             if let PickleValue::Global { module, name } = callable.as_ref() {
                 if module == "torch._utils" && name == "_rebuild_tensor_v2" {
                     return Some((callable, args));
+                }
+                // _rebuild_parameter wraps _rebuild_tensor_v2 as first arg:
+                // REDUCE(_rebuild_parameter, TUPLE(REDUCE(_rebuild_tensor_v2, ...), ...))
+                if module == "torch._utils"
+                    && (name == "_rebuild_parameter" || name == "_rebuild_parameter_with_state")
+                {
+                    if let PickleValue::Tuple(items) = args.as_ref() {
+                        if let Some(first) = items.first() {
+                            return unwrap_to_rebuild(first);
+                        }
+                    }
                 }
             }
             None

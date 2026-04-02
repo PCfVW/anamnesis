@@ -1,2 +1,6 @@
 /target
 CLAUDE.md
+
+# Large .pth benchmark files (torchvision models, download instructions in bench_pth_adhoc.rs)
+tests/fixtures/pth_benchmark/
+tests/bench_pth_adhoc.rs
