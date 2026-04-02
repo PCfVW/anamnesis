@@ -4,8 +4,10 @@
 //!
 //! `anamnesis` is a framework-agnostic Rust library for dequantizing
 //! quantized model weights and parsing tensor archives. It handles
-//! `.safetensors` (read once, classify, dequantize to `BF16`) and
-//! `.npz` (bulk extraction at near-I/O speed) — all without `unsafe` code.
+//! `.safetensors` (read once, classify, dequantize to `BF16`),
+//! `.npz` (bulk extraction at near-I/O speed), and `PyTorch` `.pth`
+//! (zero-copy mmap with lossless safetensors conversion, 11–31× faster
+//! than `torch.load()`).
 //!
 //! # Supported Quantization Schemes
 //!
@@ -26,6 +28,13 @@
 //! `read_exact` — zero per-element deserialization for LE data on LE
 //! machines. Supports `F16`, `BF16`, `F32`, `F64`, all integer types,
 //! and `Bool`. **3,586 MB/s** on a 302 MB file (1.3× raw I/O overhead).
+//!
+//! # `PyTorch` `.pth` Parsing
+//!
+//! Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with
+//! security allowlist. Memory-mapped I/O with zero-copy `Cow::Borrowed`
+//! tensor data. Lossless `.pth` → `.safetensors` conversion.
+//! **11–31× faster** than `torch.load()` on torchvision models.
 //!
 //! # Quick Start
 //!
@@ -49,6 +58,8 @@
 //!   and write a standard `.safetensors` file
 //! - `parse_npz()` — read an `.npz` archive into a `HashMap<String, NpzTensor>`
 //!   (requires `npz` feature)
+//! - `parse_pth()` — parse a `PyTorch` `.pth` file into a `ParsedPth`
+//!   with zero-copy `tensors()` (requires `pth` feature)
 //!
 //! The [`remember`] module contains one submodule per quantization family
 //! ([`remember::fp8`], [`remember::gptq`], [`remember::awq`],

@@ -26,6 +26,7 @@ The fixture format is scheme-specific (documented in each generator script). All
 | `gptq_reference/` | 4 models (Falcon3, Llama-3.2) | 256x256 | `generate_gptq.py` |
 | `awq_reference/` | 2 models (Llama-3.2, Falcon3) | 256x256 | `generate_awq.py` |
 | `bnb_reference/` | 4 models (Llama-3.2 NF4/FP4/INT8) | 4096 elements (NF4/FP4), 256x256 (INT8) | `generate_bnb.py` |
+| `npz_reference/` | Gemma Scope 2B SAE (small slice) | 5 F32 arrays | `generate_npz.py` |
 | `pth_reference/` | 3 AlgZoo models (see below) | Full model (10–432 params) | `generate_pth_reference.py` |
 
 ### AlgZoo `.pth` Fixtures

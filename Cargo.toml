@@ -3,12 +3,12 @@ name = "anamnesis"
 version = "0.3.1"
 edition = "2021"
 rust-version = "1.88"
-description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ/BnB dequantization and NPZ parsing for Rust"
+description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ/BnB dequantization, NPZ parsing, and PyTorch .pth conversion for Rust"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/PCfVW/anamnesis"
 homepage = "https://github.com/PCfVW/anamnesis"
 documentation = "https://docs.rs/anamnesis"
-keywords = ["safetensors", "dequantization", "gptq", "awq", "machine-learning"]
+keywords = ["safetensors", "dequantization", "pytorch", "gptq", "machine-learning"]
 categories = ["science", "parser-implementations"]
 default-run = "anamnesis"
 
