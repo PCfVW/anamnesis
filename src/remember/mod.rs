@@ -13,6 +13,8 @@ pub mod bnb;
 pub mod fp8;
 #[cfg(feature = "gptq")]
 pub mod gptq;
+#[cfg(feature = "pth")]
+pub mod pth;
 #[cfg(any(feature = "gptq", feature = "awq"))]
 mod quant_utils;
 
@@ -25,3 +27,5 @@ pub use fp8::{
 };
 #[cfg(feature = "gptq")]
 pub use gptq::dequantize_gptq_to_bf16;
+#[cfg(feature = "pth")]
+pub use pth::pth_to_safetensors;

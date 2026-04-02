@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (MIT-0 license): `2nd_argmax_2_2` RNN (10 params), `longest_cycle_2_3`
   Transformer (50 params), `one_layer_16_hidden` RNN blog example (432
   params). Byte-exact match on all tensors against `PyTorch` reference
+- **`.pth` → safetensors conversion** (`src/remember/pth.rs`) — lossless format
+  conversion preserving original dtypes. No dequantization needed. Byte-exact
+  roundtrip verified: `.pth` → `.safetensors` → read back matches `PyTorch`
+  reference on all 3 `AlgZoo` models
 
 ### Changed
 

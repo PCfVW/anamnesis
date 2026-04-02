@@ -155,3 +155,63 @@ fn cross_validate_algzoo_transformer_small() {
 fn cross_validate_algzoo_rnn_blog() {
     cross_validate("algzoo_rnn_blog.pth", "algzoo_rnn_blog_reference.json");
 }
+
+// -- Roundtrip: .pth → .safetensors → read back → compare ------------------
+
+/// Parse a `.pth`, convert to `.safetensors`, read the `.safetensors` back,
+/// and verify all tensor data matches the `PyTorch` reference byte-for-byte.
+fn roundtrip_to_safetensors(pth_name: &str, json_name: &str) {
+    let pth_path = fixture_dir().join(pth_name);
+    let tensors = parse_pth(&pth_path).unwrap();
+
+    // Write to a temporary .safetensors file.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    anamnesis::pth_to_safetensors(&tensors, tmp.path()).unwrap();
+
+    // Read the .safetensors back.
+    let st_data = std::fs::read(tmp.path()).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&st_data).unwrap();
+
+    // Compare against Python reference.
+    let reference = load_reference(json_name);
+    assert_eq!(st.len(), reference.num_tensors);
+
+    for py_ref in &reference.tensors {
+        let st_tensor = st
+            .tensor(&py_ref.name)
+            .unwrap_or_else(|e| panic!("tensor `{}` not in safetensors: {e}", py_ref.name));
+
+        assert_eq!(
+            st_tensor.shape().to_vec(),
+            py_ref.shape,
+            "shape mismatch after roundtrip for tensor `{}`",
+            py_ref.name
+        );
+
+        let expected_bytes = hex_to_bytes(&py_ref.data_hex);
+        assert_eq!(
+            st_tensor.data(),
+            expected_bytes.as_slice(),
+            "DATA MISMATCH after roundtrip for tensor `{}`",
+            py_ref.name
+        );
+    }
+}
+
+#[test]
+fn roundtrip_algzoo_rnn_small() {
+    roundtrip_to_safetensors("algzoo_rnn_small.pth", "algzoo_rnn_small_reference.json");
+}
+
+#[test]
+fn roundtrip_algzoo_transformer_small() {
+    roundtrip_to_safetensors(
+        "algzoo_transformer_small.pth",
+        "algzoo_transformer_small_reference.json",
+    );
+}
+
+#[test]
+fn roundtrip_algzoo_rnn_blog() {
+    roundtrip_to_safetensors("algzoo_rnn_blog.pth", "algzoo_rnn_blog_reference.json");
+}
