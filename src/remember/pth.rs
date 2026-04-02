@@ -36,7 +36,7 @@ pub fn pth_to_safetensors(
         Vec::with_capacity(tensors.len());
 
     for tensor in tensors {
-        let st_dtype = tensor.dtype.to_dtype()?.to_safetensors_dtype()?;
+        let st_dtype = tensor.dtype.to_safetensors_dtype()?;
         // Cow<[u8]> derefs to &[u8] — zero-copy when Borrowed (from mmap).
         let view =
             safetensors::tensor::TensorView::new(st_dtype, tensor.shape.clone(), &tensor.data)

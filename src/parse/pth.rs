@@ -94,6 +94,28 @@ impl PthDtype {
         }
     }
 
+    /// Converts directly to `safetensors::Dtype`, skipping the intermediate
+    /// anamnesis `Dtype`. Used by `pth_to_safetensors` for efficiency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
+    /// exists (currently all variants map successfully).
+    pub fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
+        match self {
+            Self::F16 => Ok(safetensors::Dtype::F16),
+            Self::BF16 => Ok(safetensors::Dtype::BF16),
+            Self::F32 => Ok(safetensors::Dtype::F32),
+            Self::F64 => Ok(safetensors::Dtype::F64),
+            Self::U8 => Ok(safetensors::Dtype::U8),
+            Self::I8 => Ok(safetensors::Dtype::I8),
+            Self::I16 => Ok(safetensors::Dtype::I16),
+            Self::I32 => Ok(safetensors::Dtype::I32),
+            Self::I64 => Ok(safetensors::Dtype::I64),
+            Self::Bool => Ok(safetensors::Dtype::BOOL),
+        }
+    }
+
     /// Parses a `PyTorch` storage class name into a `PthDtype`.
     ///
     /// # Errors
@@ -1303,15 +1325,18 @@ fn extract_dict_pairs(root: &PickleValue) -> crate::Result<&[(PickleValue, Pickl
     match root {
         PickleValue::Dict(pairs) => Ok(pairs),
         PickleValue::Reduced { callable, args: _ } => {
-            // OrderedDict is constructed as REDUCE(GLOBAL("collections","OrderedDict"), args)
-            // where args is a Tuple containing a List of Tuple(key, value) pairs,
-            // or an empty Tuple (with SETITEMS populating later — already handled by BUILD).
+            // REDUCE(OrderedDict, ()) is converted to Dict by
+            // is_ordered_dict_constructor() in execute(). If a Reduced
+            // {OrderedDict} reaches here, it indicates a bug in the VM
+            // or an unrecognized opcode sequence. Returning Ok(&[]) would
+            // silently lose all tensors — always error instead.
             if let PickleValue::Global { module, name } = callable.as_ref() {
                 if module == "collections" && name == "OrderedDict" {
-                    // The result of REDUCE(OrderedDict, ()) + SETITEMS is a Dict
-                    // via BUILD. But if it arrived as Reduced, the args may contain
-                    // the data. Return empty and let the caller handle Built.
-                    return Ok(&[]);
+                    return Err(AnamnesisError::Parse {
+                        reason: "OrderedDict arrived as Reduced (expected Dict \
+                                 after REDUCE rewrite); possible pickle VM bug"
+                            .into(),
+                    });
                 }
             }
             Err(AnamnesisError::Parse {
@@ -1341,6 +1366,10 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
         // .get() returns Some because i < ndim-1 ⇒ i+1 < ndim
         if let (Some(&prev), Some(&dim)) = (strides.get(i + 1), shape.get(i + 1)) {
             if let Some(s) = strides.get_mut(i) {
+                // saturating_mul: overflow on astronomic shapes produces
+                // usize::MAX, causing is_contiguous() to return false
+                // and copy_to_contiguous() to fail with a checked error
+                // — safe but intentional degradation.
                 *s = prev.saturating_mul(dim);
             }
         }
@@ -1664,6 +1693,9 @@ fn build_entry_index(
 
         // Strip the archive prefix to get the suffix key.
         // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0"
+        // EXPLICIT: '/' is always byte 0x2F in UTF-8, so pos+1 is a valid
+        // char boundary. unwrap_or(&full_name) is a defensive fallback for
+        // non-ASCII names (impossible in PyTorch archives, but safe).
         let suffix = full_name
             .find('/')
             .map_or(full_name.as_str(), |pos| {
