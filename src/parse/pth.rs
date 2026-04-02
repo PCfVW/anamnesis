@@ -363,6 +363,44 @@ impl ParsedPth {
         let tensors = self.tensors()?;
         crate::remember::pth::pth_to_safetensors(&tensors, output)
     }
+
+    /// Returns lightweight per-tensor metadata (name, shape, dtype, byte
+    /// length) without materializing tensor data.
+    ///
+    /// Use this for display-only paths (e.g., `amn parse`) where the raw
+    /// bytes are not needed. Avoids the per-tensor entry-index lookup and
+    /// bounds checking that [`tensors()`](Self::tensors) performs.
+    #[must_use]
+    pub fn tensor_info(&self) -> Vec<PthTensorInfo> {
+        self.meta
+            .iter()
+            .map(|m| {
+                let n_elements: usize = m.shape.iter().copied().product();
+                PthTensorInfo {
+                    name: m.name.clone(),
+                    shape: m.shape.clone(),
+                    dtype: m.dtype,
+                    byte_len: n_elements.saturating_mul(m.dtype.byte_size()),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Lightweight per-tensor metadata from a parsed `.pth` file.
+///
+/// Produced by [`ParsedPth::tensor_info`]. Contains only metadata —
+/// no data access, no mmap slicing.
+#[derive(Debug, Clone)]
+pub struct PthTensorInfo {
+    /// Tensor name (`state_dict` key).
+    pub name: String,
+    /// Tensor shape.
+    pub shape: Vec<usize>,
+    /// Element data type.
+    pub dtype: PthDtype,
+    /// Total byte length (`product(shape) * dtype.byte_size()`).
+    pub byte_len: usize,
 }
 
 /// Summary information about a parsed `.pth` file.
@@ -1324,6 +1362,11 @@ fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
 /// This is the slow path for tensors with non-standard strides (e.g.,
 /// transposed views). Rare in `state_dict` files but must be handled for
 /// correctness.
+///
+/// Uses the two-level bounds pattern from CONVENTIONS.md: validate the
+/// maximum reachable source byte offset **once** before the loop, then
+/// use plain arithmetic inside. The output buffer is pre-allocated to
+/// the exact size, so destination writes are also bounds-safe.
 fn copy_to_contiguous(
     storage: &[u8],
     offset: usize,
@@ -1342,69 +1385,79 @@ fn copy_to_contiguous(
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "output size overflow".into(),
         })?;
-    let mut out = vec![0u8; out_bytes];
 
-    // Multi-dimensional index iteration: walk every element by incrementing
-    // a coordinate vector, computing the source offset from strides.
+    // -- Pre-validation: compute max reachable source byte offset -----------
+    //
+    // The maximum element offset (in elements) is sum(stride[i] * (shape[i]-1))
+    // across all dimensions. The maximum byte offset is:
+    //   offset + max_elem_offset * elem_size + elem_size
+    // If this fits within storage, every inner-loop access is in bounds.
+    let max_elem_offset: usize = shape
+        .iter()
+        .zip(strides.iter())
+        .try_fold(0usize, |acc, (&dim, &stride)| {
+            dim.checked_sub(1)
+                .and_then(|d| d.checked_mul(stride))
+                .and_then(|ds| acc.checked_add(ds))
+        })
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "max stride offset overflow".into(),
+        })?;
+    let max_src_end = offset
+        .checked_add(max_elem_offset.checked_mul(elem_size).ok_or_else(|| {
+            AnamnesisError::Parse {
+                reason: "max source byte offset overflow".into(),
+            }
+        })?)
+        .and_then(|b| b.checked_add(elem_size))
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "max source end offset overflow".into(),
+        })?;
+    if max_src_end > storage.len() {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "non-contiguous tensor: max source byte [{max_src_end}] \
+                 exceeds storage len {}",
+                storage.len()
+            ),
+        });
+    }
+
+    // -- Inner loop: plain arithmetic, no per-element bounds checks ----------
+    let mut out = vec![0u8; out_bytes];
     let ndim = shape.len();
     let mut coords = vec![0usize; ndim];
+
     for flat_idx in 0..n_elements {
-        // Compute source offset from strides and coordinates.
+        // Compute source element offset from strides and coordinates.
+        // All values are bounded by the pre-validation above.
         let src_elem_offset: usize = coords
             .iter()
             .zip(strides.iter())
-            .try_fold(0usize, |acc, (&c, &s)| {
-                c.checked_mul(s).and_then(|cs| acc.checked_add(cs))
-            })
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "stride offset overflow".into(),
-            })?;
-        let src_byte = offset
-            .checked_add(src_elem_offset.checked_mul(elem_size).ok_or_else(|| {
-                AnamnesisError::Parse {
-                    reason: "source byte offset overflow".into(),
-                }
-            })?)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "source byte offset overflow".into(),
-            })?;
-        let src_end = src_byte
-            .checked_add(elem_size)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "source end offset overflow".into(),
-            })?;
-        let src_slice = storage
-            .get(src_byte..src_end)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!(
-                    "storage read out of bounds at [{src_byte}..{src_end}], \
-                     storage len = {}",
-                    storage.len()
-                ),
-            })?;
+            .map(|(&c, &s)| c * s)
+            .sum();
+        let src_byte = offset + src_elem_offset * elem_size;
+        let dst_byte = flat_idx * elem_size;
 
-        let dst_byte = flat_idx
-            .checked_mul(elem_size)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "destination offset overflow".into(),
-            })?;
-        let dst_end = dst_byte
-            .checked_add(elem_size)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "destination end offset overflow".into(),
-            })?;
-        let dst_slice = out
-            .get_mut(dst_byte..dst_end)
+        // INDEX: src_byte + elem_size ≤ max_src_end ≤ storage.len(),
+        // validated before the loop. dst_byte + elem_size ≤ out_bytes = out.len().
+        out.get_mut(dst_byte..dst_byte + elem_size)
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: "destination write out of bounds".into(),
-            })?;
-        dst_slice.copy_from_slice(src_slice);
+            })?
+            .copy_from_slice(storage.get(src_byte..src_byte + elem_size).ok_or_else(|| {
+                AnamnesisError::Parse {
+                    reason: format!(
+                        "storage read out of bounds at [{src_byte}..{}]",
+                        src_byte + elem_size
+                    ),
+                }
+            })?);
 
         // Increment coordinates (rightmost dimension first).
         // EXPLICIT: manual coordinate increment; iterator-based
         // multi-index generation would allocate per-element.
         for d in (0..ndim).rev() {
-            // d < ndim guaranteed by loop range; coords and shape have length ndim
             if let (Some(c), Some(&s)) = (coords.get_mut(d), shape.get(d)) {
                 *c += 1;
                 if *c < s {

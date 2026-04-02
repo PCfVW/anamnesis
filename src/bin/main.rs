@@ -181,7 +181,9 @@ fn run_parse_safetensors(path: &std::path::Path) -> anamnesis::Result<()> {
 fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
     let parsed = anamnesis::parse_pth(path)?;
     let info = parsed.inspect();
-    let tensors = parsed.tensors()?;
+    // Use tensor_info() (metadata only) instead of tensors() — avoids
+    // materializing tensor data just for the display path.
+    let tensor_info = parsed.tensor_info();
 
     println!(
         "Parsed {} (PyTorch state_dict)",
@@ -206,11 +208,11 @@ fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
     println!("  Byte order: {endian}");
     println!();
 
-    for t in &tensors {
+    for t in &tensor_info {
         let shape_str = format!("{:?}", t.shape);
         // CAST: usize → u64, tensor byte lengths fit in u64
         #[allow(clippy::as_conversions)]
-        let byte_len = t.data.len() as u64;
+        let byte_len = t.byte_len as u64;
         println!(
             "  {:<30} {:<6} {:<15} {}",
             t.name,

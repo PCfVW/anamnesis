@@ -18,7 +18,7 @@ pub(crate) mod utils;
 #[cfg(feature = "npz")]
 pub use npz::{parse_npz, NpzDtype, NpzTensor};
 #[cfg(feature = "pth")]
-pub use pth::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor};
+pub use pth::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
 pub use safetensors::{
     AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
     QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
