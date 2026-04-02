@@ -349,13 +349,13 @@ impl ParsedPth {
         let mut total_bytes: u64 = 0;
         let mut dtypes: Vec<PthDtype> = Vec::new();
         for m in &self.meta {
-            // CAST: usize → u64, element counts fit in u64
+            // CAST: usize → u64, element counts and byte sizes fit in u64
             #[allow(clippy::as_conversions)]
             let n_elements: u64 = m
                 .shape
                 .iter()
-                .fold(1u64, |acc, &d| acc.saturating_mul(d as u64));
-            // CAST: usize → u64, byte sizes fit
+                .copied()
+                .fold(1u64, |acc, d| acc.saturating_mul(d as u64));
             #[allow(clippy::as_conversions)]
             let byte_size = m.dtype.byte_size() as u64;
             total_bytes = total_bytes.saturating_add(n_elements.saturating_mul(byte_size));

@@ -28,6 +28,14 @@ use crate::parse::pth::PthTensor;
 ///
 /// Returns [`AnamnesisError::Parse`] if safetensors serialization fails
 /// (e.g., duplicate tensor names, shape/data mismatch).
+///
+/// # Memory
+///
+/// Allocates a `Vec` of `TensorView` references (one per tensor, metadata
+/// only — no data copy). The `safetensors::serialize_to_file` call writes
+/// the entire output file in one pass, reading tensor data directly from
+/// the input slices. When tensors are `Cow::Borrowed` (zero-copy from an
+/// mmap), peak heap usage ≈ output file header + view metadata.
 pub fn pth_to_safetensors(
     tensors: &[PthTensor<'_>],
     output: impl AsRef<Path>,
