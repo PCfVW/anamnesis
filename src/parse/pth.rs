@@ -1143,6 +1143,10 @@ struct TensorRef {
 }
 
 /// Attempts to extract an `i64` from a `PickleValue::Int`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the value is not an `Int`.
 fn as_i64(val: &PickleValue) -> crate::Result<i64> {
     if let PickleValue::Int(v) = val {
         Ok(*v)
@@ -1154,6 +1158,11 @@ fn as_i64(val: &PickleValue) -> crate::Result<i64> {
 }
 
 /// Attempts to extract a `usize` from a `PickleValue::Int`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the value is not an `Int` or
+/// does not fit in `usize`.
 fn as_usize(val: &PickleValue) -> crate::Result<usize> {
     let v = as_i64(val)?;
     usize::try_from(v).map_err(|_| AnamnesisError::Parse {
@@ -1162,6 +1171,10 @@ fn as_usize(val: &PickleValue) -> crate::Result<usize> {
 }
 
 /// Attempts to extract a `&str` from a `PickleValue::String`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the value is not a `String`.
 fn as_str(val: &PickleValue) -> crate::Result<&str> {
     if let PickleValue::String(s) = val {
         Ok(s.as_str())
@@ -1173,6 +1186,11 @@ fn as_str(val: &PickleValue) -> crate::Result<&str> {
 }
 
 /// Converts a `PickleValue::Tuple` into a `Vec<usize>` (for shape/strides).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the value is not a `Tuple` or
+/// any element is not a non-negative integer fitting in `usize`.
 fn tuple_to_usize_vec(val: &PickleValue) -> crate::Result<Vec<usize>> {
     if let PickleValue::Tuple(items) = val {
         items.iter().map(as_usize).collect()
@@ -1341,6 +1359,12 @@ fn unwrap_to_rebuild(val: &PickleValue, depth: u32) -> Option<(&PickleValue, &Pi
 ///
 /// Handles both a raw `Dict` and a `Reduced { OrderedDict, ... }`.
 /// `depth` guards against stack overflow from adversarial pickle nesting.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the root value is not a `Dict`,
+/// `Built`, or recognized `Reduced`, or if nesting exceeds
+/// [`MAX_PICKLE_NESTING`].
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
 #[allow(clippy::wildcard_enum_match_arm)]
 fn extract_dict_pairs(
@@ -1689,6 +1713,11 @@ fn build_entry_index(
             reason: format!("failed to read ZIP entry {i}: {e}"),
         })?;
 
+        // EXPLICIT: PyTorch ZIP archives use STORED (no compression)
+        // exclusively. Compressed entries indicate a non-PyTorch ZIP or
+        // manual re-compression — skip them rather than error, since they
+        // are metadata entries (e.g., .format_version) that the parser
+        // does not need. Tensor data entries are always STORED.
         if entry.compression() != zip::CompressionMethod::Stored {
             continue;
         }
