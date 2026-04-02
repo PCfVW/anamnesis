@@ -28,12 +28,16 @@ use crate::parse::pth::PthTensor;
 ///
 /// Returns [`AnamnesisError::Parse`] if safetensors serialization fails
 /// (e.g., duplicate tensor names, shape/data mismatch).
-pub fn pth_to_safetensors(tensors: &[PthTensor], output: impl AsRef<Path>) -> crate::Result<()> {
+pub fn pth_to_safetensors(
+    tensors: &[PthTensor<'_>],
+    output: impl AsRef<Path>,
+) -> crate::Result<()> {
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(tensors.len());
 
     for tensor in tensors {
         let st_dtype = tensor.dtype.to_dtype()?.to_safetensors_dtype()?;
+        // Cow<[u8]> derefs to &[u8] — zero-copy when Borrowed (from mmap).
         let view =
             safetensors::tensor::TensorView::new(st_dtype, tensor.shape.clone(), &tensor.data)
                 .map_err(|e| AnamnesisError::Parse {
@@ -62,30 +66,32 @@ pub fn pth_to_safetensors(tensors: &[PthTensor], output: impl AsRef<Path>) -> cr
 mod tests {
     use super::*;
     use crate::parse::pth::PthDtype;
+    use std::borrow::Cow;
 
     #[test]
     fn roundtrip_simple() {
+        let weight_data: Vec<u8> = vec![
+            0x00, 0x00, 0x80, 0x3F, // 1.0f32 LE
+            0x00, 0x00, 0x00, 0x40, // 2.0f32 LE
+            0x00, 0x00, 0x40, 0x40, // 3.0f32 LE
+            0x00, 0x00, 0x80, 0x40, // 4.0f32 LE
+        ];
+        let bias_data: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x3F, // 0.5f32 LE
+            0x00, 0x00, 0x00, 0xBF, // -0.5f32 LE
+        ];
         let tensors = vec![
             PthTensor {
                 name: "weight".into(),
                 shape: vec![2, 2],
                 dtype: PthDtype::F32,
-                // 4 floats: 1.0, 2.0, 3.0, 4.0
-                data: vec![
-                    0x00, 0x00, 0x80, 0x3F, // 1.0f32 LE
-                    0x00, 0x00, 0x00, 0x40, // 2.0f32 LE
-                    0x00, 0x00, 0x40, 0x40, // 3.0f32 LE
-                    0x00, 0x00, 0x80, 0x40, // 4.0f32 LE
-                ],
+                data: Cow::Borrowed(&weight_data),
             },
             PthTensor {
                 name: "bias".into(),
                 shape: vec![2],
                 dtype: PthDtype::F32,
-                data: vec![
-                    0x00, 0x00, 0x00, 0x3F, // 0.5f32 LE
-                    0x00, 0x00, 0x00, 0xBF, // -0.5f32 LE
-                ],
+                data: Cow::Borrowed(&bias_data),
             },
         ];
 
@@ -101,17 +107,17 @@ mod tests {
         let w = st.tensor("weight").unwrap();
         assert_eq!(w.shape(), &[2, 2]);
         assert_eq!(w.dtype(), safetensors::Dtype::F32);
-        assert_eq!(w.data(), &tensors[0].data);
+        assert_eq!(w.data(), weight_data.as_slice());
 
         let b = st.tensor("bias").unwrap();
         assert_eq!(b.shape(), &[2]);
         assert_eq!(b.dtype(), safetensors::Dtype::F32);
-        assert_eq!(b.data(), &tensors[1].data);
+        assert_eq!(b.data(), bias_data.as_slice());
     }
 
     #[test]
     fn empty_tensors() {
-        let tensors: Vec<PthTensor> = vec![];
+        let tensors: Vec<PthTensor<'_>> = vec![];
         let tmp = tempfile::NamedTempFile::new().unwrap();
         pth_to_safetensors(&tensors, tmp.path()).unwrap();
 

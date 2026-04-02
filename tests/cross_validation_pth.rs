@@ -69,8 +69,9 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 /// compare every tensor against the Python-generated reference.
 fn cross_validate(pth_name: &str, json_name: &str) {
     let pth_path = fixture_dir().join(pth_name);
-    let tensors =
+    let parsed =
         parse_pth(&pth_path).unwrap_or_else(|e| panic!("parse_pth({pth_name}) failed: {e}"));
+    let tensors = parsed.tensors().unwrap();
 
     let reference = load_reference(json_name);
 
@@ -117,8 +118,8 @@ fn cross_validate(pth_name: &str, json_name: &str) {
             expected_bytes.len()
         );
         assert_eq!(
-            rust_tensor.data,
-            expected_bytes,
+            rust_tensor.data.as_ref(),
+            expected_bytes.as_slice(),
             "DATA MISMATCH for tensor `{}` in {pth_name}: \
              first differing byte at position {}",
             rust_tensor.name,
@@ -162,7 +163,8 @@ fn cross_validate_algzoo_rnn_blog() {
 /// and verify all tensor data matches the `PyTorch` reference byte-for-byte.
 fn roundtrip_to_safetensors(pth_name: &str, json_name: &str) {
     let pth_path = fixture_dir().join(pth_name);
-    let tensors = parse_pth(&pth_path).unwrap();
+    let parsed = parse_pth(&pth_path).unwrap();
+    let tensors = parsed.tensors().unwrap();
 
     // Write to a temporary .safetensors file.
     let tmp = tempfile::NamedTempFile::new().unwrap();

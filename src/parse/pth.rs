@@ -19,6 +19,7 @@
 //! `torch.*Storage`, `collections.OrderedDict`) are accepted. Unrecognized
 //! globals produce [`AnamnesisError::Parse`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -144,13 +145,12 @@ impl fmt::Display for PthDtype {
 // PthTensor
 // ---------------------------------------------------------------------------
 
-/// A single tensor extracted from a `.pth` file.
+/// A single tensor view from a parsed `.pth` file.
 ///
-/// Contains the tensor's name (the `state_dict` key), shape, dtype, and raw
-/// data in row-major, native-endian layout. Ready for direct conversion to
-/// safetensors or in-memory use.
+/// Borrows raw data from the memory-mapped file (zero-copy for contiguous
+/// little-endian tensors) or owns a copy (non-contiguous / big-endian).
 #[derive(Debug, Clone)]
-pub struct PthTensor {
+pub struct PthTensor<'a> {
     /// Tensor name (`state_dict` key, e.g. `"linear.weight"`).
     pub name: String,
     /// Tensor shape (e.g. `[16, 10]` for a 16-by-10 matrix).
@@ -159,8 +159,165 @@ pub struct PthTensor {
     pub dtype: PthDtype,
     /// Raw bytes in row-major, native-endian order.
     ///
-    /// Length equals `product(shape) * dtype.byte_size()`.
-    pub data: Vec<u8>,
+    /// `Borrowed` when the tensor data is contiguous and little-endian
+    /// (zero-copy slice from the mmap). `Owned` when a layout
+    /// transformation was required (non-contiguous strides or
+    /// big-endian byte-swap).
+    pub data: Cow<'a, [u8]>,
+}
+
+/// Tensor metadata extracted from the pickle stream (no data).
+#[derive(Debug)]
+struct TensorMeta {
+    name: String,
+    shape: Vec<usize>,
+    dtype: PthDtype,
+    /// Data file index in the ZIP archive (e.g., `"0"` → `data/0`).
+    storage_key: String,
+    /// Byte offset into the storage file.
+    storage_offset: usize,
+    strides: Vec<usize>,
+}
+
+/// A parsed `.pth` file — owns the memory-mapped data and provides
+/// zero-copy tensor access.
+#[derive(Debug)]
+///
+/// Created by [`parse_pth`]. Call [`tensors()`](ParsedPth::tensors) to get
+/// `PthTensor` views that borrow directly from the mapped file region.
+pub struct ParsedPth {
+    /// Memory-mapped file.
+    mmap: memmap2::Mmap,
+    /// Per-tensor metadata (name, shape, dtype, storage location).
+    meta: Vec<TensorMeta>,
+    /// ZIP entry index: suffix → `(data_start, data_len)` in the mmap.
+    entry_index: HashMap<String, (usize, usize)>,
+    /// Whether the file uses big-endian storage.
+    big_endian: bool,
+}
+
+impl ParsedPth {
+    /// Returns tensor views borrowing directly from the mmap.
+    ///
+    /// For contiguous little-endian tensors (>99% of real files), the
+    /// data is a zero-copy `&[u8]` slice from the mmap — no heap
+    /// allocation. Non-contiguous or big-endian tensors get an owned copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if a storage entry is missing
+    /// or a tensor's byte range exceeds the storage.
+    pub fn tensors(&self) -> crate::Result<Vec<PthTensor<'_>>> {
+        let mut tensors = Vec::with_capacity(self.meta.len());
+        for m in &self.meta {
+            let storage_suffix = format!("data/{}", m.storage_key);
+            let &(storage_start, storage_len) = self
+                .entry_index
+                .get(storage_suffix.as_str())
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("ZIP entry `{storage_suffix}` not found"),
+                })?;
+            let storage = self
+                .mmap
+                .get(storage_start..storage_start + storage_len)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("storage `{}`: mmap slice out of bounds", m.storage_key),
+                })?;
+
+            let elem_size = m.dtype.byte_size();
+            let data: Cow<'_, [u8]> = if is_contiguous(&m.shape, &m.strides) && !self.big_endian {
+                // Zero-copy: borrow directly from the mmap.
+                let n_elements: usize = m
+                    .shape
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("tensor `{}`: element count overflow", m.name),
+                    })?;
+                let n_bytes =
+                    n_elements
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: byte count overflow", m.name),
+                        })?;
+                let end =
+                    m.storage_offset
+                        .checked_add(n_bytes)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
+                        })?;
+                Cow::Borrowed(storage.get(m.storage_offset..end).ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: format!(
+                            "tensor `{}`: storage read out of bounds \
+                             ([{}..{}], storage len = {})",
+                            m.name,
+                            m.storage_offset,
+                            end,
+                            storage.len()
+                        ),
+                    }
+                })?)
+            } else if is_contiguous(&m.shape, &m.strides) {
+                // Contiguous but big-endian: copy + byte-swap.
+                let n_elements: usize = m
+                    .shape
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("tensor `{}`: element count overflow", m.name),
+                    })?;
+                let n_bytes =
+                    n_elements
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: byte count overflow", m.name),
+                        })?;
+                let end =
+                    m.storage_offset
+                        .checked_add(n_bytes)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
+                        })?;
+                let mut buf = storage
+                    .get(m.storage_offset..end)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("tensor `{}`: storage read out of bounds", m.name),
+                    })?
+                    .to_vec();
+                byteswap_inplace(&mut buf, elem_size);
+                Cow::Owned(buf)
+            } else {
+                // Non-contiguous: copy to contiguous layout.
+                let mut buf =
+                    copy_to_contiguous(storage, m.storage_offset, &m.shape, &m.strides, elem_size)?;
+                if self.big_endian && elem_size > 1 {
+                    byteswap_inplace(&mut buf, elem_size);
+                }
+                Cow::Owned(buf)
+            };
+
+            tensors.push(PthTensor {
+                name: m.name.clone(),
+                shape: m.shape.clone(),
+                dtype: m.dtype,
+                data,
+            });
+        }
+        Ok(tensors)
+    }
+
+    /// Returns the number of tensors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// Returns `true` if the file contained no tensors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.meta.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,11 +1354,12 @@ fn copy_to_contiguous(
 ///
 /// # Memory
 ///
-/// Memory-maps the file with page prefaulting. Tensor data is sliced
-/// directly from the mapped region and copied once into owned `Vec<u8>`
-/// per tensor. Peak memory ≈ mapped file + tensor data.
+/// Memory-maps the file. Tensor data is **not** copied during parsing —
+/// [`ParsedPth::tensors()`] slices directly from the mmap (zero-copy for
+/// contiguous little-endian tensors, which is >99% of real files).
+/// Peak memory ≈ mapped file + metadata.
 #[allow(unsafe_code)]
-pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
+pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
     let file = std::fs::File::open(path.as_ref())?;
     // SAFETY: memmap2::Mmap requires unsafe because the OS could modify the
     // mapped region if another process writes to the file concurrently.
@@ -1276,92 +1434,31 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
     let mut vm = PickleVm::new(pkl_data);
     let root = vm.execute()?;
 
-    // 4. Extract tensor references from the pickle structure.
+    // 4. Extract tensor metadata from the pickle structure.
+    //    Data is NOT copied here — tensors() will borrow from the mmap.
     let dict_pairs = extract_dict_pairs(&root)?;
-    let mut tensor_refs = Vec::new();
+    let mut meta = Vec::new();
     for (key, value) in dict_pairs {
         let name = as_str(key)?;
         if let Some((_callable, args)) = unwrap_to_rebuild(value) {
             let tref = parse_rebuild_args(name, args)?;
-            tensor_refs.push(tref);
+            meta.push(TensorMeta {
+                name: tref.name,
+                shape: tref.shape,
+                dtype: tref.dtype,
+                storage_key: tref.storage_key,
+                storage_offset: tref.storage_offset,
+                strides: tref.strides,
+            });
         }
     }
 
-    // 5. Extract tensor data — single copy from mmap into per-tensor Vec.
-    let mut tensors = Vec::with_capacity(tensor_refs.len());
-
-    for tref in tensor_refs {
-        let storage_suffix = format!("data/{}", tref.storage_key);
-        let &(storage_start, storage_len) =
-            entry_index
-                .get(storage_suffix.as_str())
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("ZIP entry `{storage_suffix}` not found"),
-                })?;
-        let storage = raw
-            .get(storage_start..storage_start + storage_len)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("storage `{}`: mmap slice out of bounds", tref.storage_key),
-            })?;
-
-        let elem_size = tref.dtype.byte_size();
-        let mut data = if is_contiguous(&tref.shape, &tref.strides) {
-            let n_elements: usize = tref
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("tensor `{}`: element count overflow", tref.name),
-                })?;
-            let n_bytes =
-                n_elements
-                    .checked_mul(elem_size)
-                    .ok_or_else(|| AnamnesisError::Parse {
-                        reason: format!("tensor `{}`: byte count overflow", tref.name),
-                    })?;
-            let end =
-                tref.storage_offset
-                    .checked_add(n_bytes)
-                    .ok_or_else(|| AnamnesisError::Parse {
-                        reason: format!("tensor `{}`: storage end offset overflow", tref.name),
-                    })?;
-            storage
-                .get(tref.storage_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!(
-                        "tensor `{}`: storage read out of bounds \
-                         ([{}..{}], storage len = {})",
-                        tref.name,
-                        tref.storage_offset,
-                        end,
-                        storage.len()
-                    ),
-                })?
-                .to_vec()
-        } else {
-            copy_to_contiguous(
-                storage,
-                tref.storage_offset,
-                &tref.shape,
-                &tref.strides,
-                elem_size,
-            )?
-        };
-
-        // 6. Byte-swap if big-endian.
-        if big_endian && elem_size > 1 {
-            byteswap_inplace(&mut data, elem_size);
-        }
-
-        tensors.push(PthTensor {
-            name: tref.name,
-            shape: tref.shape,
-            dtype: tref.dtype,
-            data,
-        });
-    }
-
-    Ok(tensors)
+    Ok(ParsedPth {
+        mmap: raw,
+        meta,
+        entry_index,
+        big_endian,
+    })
 }
 
 /// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`.
