@@ -397,7 +397,11 @@ impl ParsedPth {
         self.meta
             .iter()
             .map(|m| {
-                let n_elements: usize = m.shape.iter().copied().product();
+                let n_elements: usize = m
+                    .shape
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .unwrap_or(usize::MAX);
                 PthTensorInfo {
                     name: m.name.clone(),
                     shape: m.shape.clone(),
@@ -1282,6 +1286,10 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
     })
 }
 
+/// Maximum nesting depth for recursive pickle value extraction.
+/// Real `.pth` files have at most 2–3 levels; 32 is generous.
+const MAX_PICKLE_NESTING: u32 = 32;
+
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
 #[allow(clippy::wildcard_enum_match_arm)]
 /// Unwraps nested pickle structures to find the inner `_rebuild_tensor_v2` call.
@@ -1290,7 +1298,12 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
 /// - Direct: `Reduced { _rebuild_tensor_v2, args }`
 /// - Parameter-wrapped: `Reduced { _rebuild_parameter, Tuple([Reduced { _rebuild_tensor_v2, args }, ...]) }`
 /// - `Built`-wrapped: `Built { obj, state }` → recurse into `obj`
-fn unwrap_to_rebuild(val: &PickleValue) -> Option<(&PickleValue, &PickleValue)> {
+///
+/// `depth` guards against stack overflow from adversarial pickle nesting.
+fn unwrap_to_rebuild(val: &PickleValue, depth: u32) -> Option<(&PickleValue, &PickleValue)> {
+    if depth > MAX_PICKLE_NESTING {
+        return None;
+    }
     match val {
         PickleValue::Reduced { callable, args, .. } => {
             if let PickleValue::Global { module, name } = callable.as_ref() {
@@ -1304,14 +1317,14 @@ fn unwrap_to_rebuild(val: &PickleValue) -> Option<(&PickleValue, &PickleValue)> 
                 {
                     if let PickleValue::Tuple(items) = args.as_ref() {
                         if let Some(first) = items.first() {
-                            return unwrap_to_rebuild(first);
+                            return unwrap_to_rebuild(first, depth + 1);
                         }
                     }
                 }
             }
             None
         }
-        PickleValue::Built { obj, .. } => unwrap_to_rebuild(obj),
+        PickleValue::Built { obj, .. } => unwrap_to_rebuild(obj, depth + 1),
         _ => None,
     }
 }
@@ -1319,9 +1332,18 @@ fn unwrap_to_rebuild(val: &PickleValue) -> Option<(&PickleValue, &PickleValue)> 
 /// Extracts the dict of key→value pairs from the top-level pickle value.
 ///
 /// Handles both a raw `Dict` and a `Reduced { OrderedDict, ... }`.
+/// `depth` guards against stack overflow from adversarial pickle nesting.
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
 #[allow(clippy::wildcard_enum_match_arm)]
-fn extract_dict_pairs(root: &PickleValue) -> crate::Result<&[(PickleValue, PickleValue)]> {
+fn extract_dict_pairs(
+    root: &PickleValue,
+    depth: u32,
+) -> crate::Result<&[(PickleValue, PickleValue)]> {
+    if depth > MAX_PICKLE_NESTING {
+        return Err(AnamnesisError::Parse {
+            reason: "pickle nesting limit exceeded in extract_dict_pairs".into(),
+        });
+    }
     match root {
         PickleValue::Dict(pairs) => Ok(pairs),
         PickleValue::Reduced { callable, args: _ } => {
@@ -1347,7 +1369,7 @@ fn extract_dict_pairs(root: &PickleValue) -> crate::Result<&[(PickleValue, Pickl
             // BUILD(obj, state) sets obj.__dict__ = state. The tensor data
             // lives in obj (the OrderedDict), not in state (which is the
             // __dict__ containing _metadata). Always recurse into obj.
-            extract_dict_pairs(obj)
+            extract_dict_pairs(obj, depth + 1)
         }
         _ => Err(AnamnesisError::Parse {
             reason: format!("top-level pickle value is not a dict or OrderedDict: {root:?}"),
@@ -1619,11 +1641,11 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 
     // 4. Extract tensor metadata from the pickle structure.
     //    Data is NOT copied here — tensors() will borrow from the mmap.
-    let dict_pairs = extract_dict_pairs(&root)?;
+    let dict_pairs = extract_dict_pairs(&root, 0)?;
     let mut meta = Vec::new();
     for (key, value) in dict_pairs {
         let name = as_str(key)?;
-        if let Some((_callable, args)) = unwrap_to_rebuild(value) {
+        if let Some((_callable, args)) = unwrap_to_rebuild(value, 0) {
             let tref = parse_rebuild_args(name, args)?;
             meta.push(TensorMeta {
                 name: tref.name,
