@@ -257,7 +257,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [x] Cross-validation tests (`tests/cross_validation_pth.rs`) — byte-exact comparison against `PyTorch` on 3 AlgZoo models (RNN + Transformer, newer and older ZIP formats) — **commit**
 - [x] Safetensors conversion (`src/remember/pth.rs`) — lossless format writer, byte-exact roundtrip verified — **commit**
 - [x] `ParsedPth` + `PthInspectInfo` — inspect/to_safetensors methods, Display impl — **commit**
-- [ ] CLI integration (`src/bin/main.rs`) — format dispatch by extension + ZIP magic, `parse`/`inspect`/`remember` for `.pth` — **commit**
+- [x] CLI integration (`src/bin/main.rs`) — format dispatch by extension + ZIP magic, `parse`/`inspect`/`remember` for `.pth` — **commit**
 - [ ] Module wiring — `mod.rs`, `lib.rs`, `Cargo.toml` feature gate, `error.rs` cfg update — **commit** — **PUSH**
 
 **Deliverable:** `anamnesis` v0.3.1 — PyTorch `.pth` state_dict parsing + safetensors conversion. — **PUSH + tag `v0.3.1`**

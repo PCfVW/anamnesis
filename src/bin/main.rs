@@ -17,23 +17,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Parse and summarize a safetensors file.
+    /// Parse and summarize a model file.
     Parse {
-        /// Path to the safetensors file.
+        /// Path to the model file (`.safetensors`, `.pth`, `.pt`, `.bin`).
         path: PathBuf,
     },
     /// Inspect format, tensor counts, and size estimates.
     #[command(alias = "info")]
     Inspect {
-        /// Path to the safetensors file.
+        /// Path to the model file.
         path: PathBuf,
     },
-    /// Dequantize (recover precision) to a target dtype.
+    /// Dequantize (recover precision) or convert to a target format.
     #[command(alias = "dequantize")]
     Remember {
-        /// Path to the input safetensors file.
+        /// Path to the input model file.
         path: PathBuf,
-        /// Target dtype (currently only `bf16`).
+        /// Target dtype (currently only `bf16`) or `safetensors` for `.pth` conversion.
         #[arg(long, default_value = "bf16")]
         to: String,
         /// Output file path (derived from input if omitted).
@@ -41,6 +41,58 @@ enum Commands {
         output: Option<PathBuf>,
     },
 }
+
+// ---------------------------------------------------------------------------
+// Format detection
+// ---------------------------------------------------------------------------
+
+/// Detected model file format.
+enum Format {
+    Safetensors,
+    #[cfg(feature = "pth")]
+    Pth,
+}
+
+/// Detects the model format from file extension and magic bytes.
+///
+/// `.safetensors` → `Safetensors`. `.pth`/`.pt` → `Pth`.
+/// `.bin` → check ZIP magic (`PK\x03\x04`) to distinguish `PyTorch` ZIP
+/// from safetensors. Unknown extensions default to `Safetensors`.
+fn detect_format(path: &std::path::Path) -> Format {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "safetensors" => Format::Safetensors,
+        #[cfg(feature = "pth")]
+        "pth" | "pt" => Format::Pth,
+        #[cfg(feature = "pth")]
+        "bin" => {
+            if has_zip_magic(path) {
+                Format::Pth
+            } else {
+                Format::Safetensors
+            }
+        }
+        _ => Format::Safetensors,
+    }
+}
+
+/// Returns `true` if the file starts with the ZIP local header magic `PK\x03\x04`.
+#[cfg(feature = "pth")]
+fn has_zip_magic(path: &std::path::Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|data| data.get(..4).map(|m| m == b"PK\x03\x04"))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand runners
+// ---------------------------------------------------------------------------
 
 fn run() -> anamnesis::Result<()> {
     let cli = Cli::parse();
@@ -53,6 +105,14 @@ fn run() -> anamnesis::Result<()> {
 }
 
 fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
+    match detect_format(path) {
+        Format::Safetensors => run_parse_safetensors(path),
+        #[cfg(feature = "pth")]
+        Format::Pth => run_parse_pth(path),
+    }
+}
+
+fn run_parse_safetensors(path: &std::path::Path) -> anamnesis::Result<()> {
     let model = parse(path)?;
     let info = InspectInfo::from(&model.header);
     let total = model.header.tensors.len();
@@ -105,14 +165,81 @@ fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "pth")]
+fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
+    let parsed = anamnesis::parse_pth(path)?;
+    let info = parsed.inspect();
+    let tensors = parsed.tensors()?;
+
+    println!(
+        "Parsed {} (PyTorch state_dict)",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(unknown)")
+    );
+    println!("  Tensors:    {}", info.tensor_count);
+    println!("  Total size: {}", format_bytes(info.total_bytes));
+    let dtype_list: String = info
+        .dtypes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  Dtypes:     {dtype_list}");
+    let endian = if info.big_endian {
+        "big-endian"
+    } else {
+        "little-endian"
+    };
+    println!("  Byte order: {endian}");
+    println!();
+
+    for t in &tensors {
+        let shape_str = format!("{:?}", t.shape);
+        // CAST: usize → u64, tensor byte lengths fit in u64
+        #[allow(clippy::as_conversions)]
+        let byte_len = t.data.len() as u64;
+        println!(
+            "  {:<30} {:<6} {:<15} {}",
+            t.name,
+            t.dtype,
+            shape_str,
+            format_bytes(byte_len)
+        );
+    }
+    Ok(())
+}
+
 fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
-    let model = parse(path)?;
-    let info = InspectInfo::from(&model.header);
-    println!("{info}");
+    match detect_format(path) {
+        Format::Safetensors => {
+            let model = parse(path)?;
+            let info = InspectInfo::from(&model.header);
+            println!("{info}");
+        }
+        #[cfg(feature = "pth")]
+        Format::Pth => {
+            let parsed = anamnesis::parse_pth(path)?;
+            let info = parsed.inspect();
+            println!("{info}");
+        }
+    }
     Ok(())
 }
 
 fn run_remember(
+    path: &std::path::Path,
+    to: &str,
+    output: Option<&std::path::Path>,
+) -> anamnesis::Result<()> {
+    match detect_format(path) {
+        Format::Safetensors => run_remember_safetensors(path, to, output),
+        #[cfg(feature = "pth")]
+        Format::Pth => run_remember_pth(path, output),
+    }
+}
+
+fn run_remember_safetensors(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
@@ -160,6 +287,48 @@ fn run_remember(
     );
     Ok(())
 }
+
+#[cfg(feature = "pth")]
+fn run_remember_pth(
+    path: &std::path::Path,
+    output: Option<&std::path::Path>,
+) -> anamnesis::Result<()> {
+    let parsed = anamnesis::parse_pth(path)?;
+    let info = parsed.inspect();
+
+    let output_path = if let Some(p) = output {
+        p.to_owned()
+    } else {
+        // Replace extension: model.pth → model.safetensors
+        let mut out = path.to_owned();
+        out.set_extension("safetensors");
+        out
+    };
+
+    println!(
+        "Converting {} → {}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(input)"),
+        output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(output)")
+    );
+    println!(
+        "  {} tensors, {}",
+        info.tensor_count,
+        format_bytes(info.total_bytes)
+    );
+
+    parsed.to_safetensors(&output_path)?;
+    println!("  Done.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Output path derivation
+// ---------------------------------------------------------------------------
 
 /// Known quantization suffixes stripped from input filenames when deriving output paths.
 ///
