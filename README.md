@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/anamnesis/badge.svg)](https://docs.rs/anamnesis)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
 [![license](https://img.shields.io/crates/l/anamnesis.svg)](https://github.com/PCfVW/anamnesis#license)
-[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
+[![unsafe: deny](https://img.shields.io/badge/unsafe-deny_(mmap_only)-blue.svg)](https://github.com/rust-secure-code/safety-dance/)
 
 **ἀνάμνησις** — *Parse any format, recover any precision.*
 
@@ -19,6 +19,7 @@
   - [AWQ Dequantization](#awq-dequantization)
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
 - [NPZ/NPY Parsing](#npznpy-parsing)
+- [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [Development](#development)
 
 ## Tested Models
@@ -82,6 +83,20 @@ Feature-gated behind `npz`. Custom NPY header parser with bulk `read_exact` — 
 | Supported dtypes | F16, BF16, F32, F64, Bool, U8–U64, I8–I64 |
 
 BF16 support via JAX `V2` void-dtype convention. Big-endian NPY files handled with in-place byte-swap.
+
+### PyTorch `.pth` Parsing
+
+Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with security allowlist. Memory-mapped I/O with zero-copy tensor access (`Cow::Borrowed` from mmap). Cross-validated byte-exact against PyTorch `torch.load()` on 3 [AlgZoo](https://github.com/alignment-research-center/alg-zoo) models (MIT-0 license).
+
+| Model | Size | Tensors | vs `torch.load` |
+|---|---|---|---|
+| torchvision ResNet-18 | 45 MB | 102 | **11.2x faster** |
+| torchvision ResNet-50 | 98 MB | 267 | **12.7x faster** |
+| torchvision ViT-B/16 | 330 MB | 152 | **30.8x faster** |
+
+Lossless `.pth` → `.safetensors` conversion preserving original dtypes (F16, BF16, F32, F64, I8–I64, U8, Bool). The conversion pipeline writes directly from mmap slices to the output file — zero intermediate data copies.
+
+Handles both newer (`archive/` prefix) and older (`{model_name}/` prefix) PyTorch ZIP conventions. Legacy (pre-1.6) raw-pickle files are rejected with a clear error.
 
 ## Development
 
