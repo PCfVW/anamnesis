@@ -51,11 +51,13 @@ enum Format {
     Safetensors,
     #[cfg(feature = "pth")]
     Pth,
+    #[cfg(feature = "npz")]
+    Npz,
 }
 
 /// Detects the model format from file extension and magic bytes.
 ///
-/// `.safetensors` → `Safetensors`. `.pth`/`.pt` → `Pth`.
+/// `.safetensors` → `Safetensors`. `.pth`/`.pt` → `Pth`. `.npz` → `Npz`.
 /// `.bin` → check ZIP magic (`PK\x03\x04`) to distinguish `PyTorch` ZIP
 /// from safetensors. Unknown extensions default to `Safetensors`.
 fn detect_format(path: &std::path::Path) -> Format {
@@ -69,6 +71,8 @@ fn detect_format(path: &std::path::Path) -> Format {
         "safetensors" => Format::Safetensors,
         #[cfg(feature = "pth")]
         "pth" | "pt" => Format::Pth,
+        #[cfg(feature = "npz")]
+        "npz" => Format::Npz,
         #[cfg(feature = "pth")]
         "bin" => {
             if has_zip_magic(path) {
@@ -82,11 +86,17 @@ fn detect_format(path: &std::path::Path) -> Format {
 }
 
 /// Returns `true` if the file starts with the ZIP local header magic `PK\x03\x04`.
+///
+/// Reads only 4 bytes — does not load the file into memory.
 #[cfg(feature = "pth")]
 fn has_zip_magic(path: &std::path::Path) -> bool {
-    std::fs::read(path)
-        .ok()
-        .and_then(|data| data.get(..4).map(|m| m == b"PK\x03\x04"))
+    let mut buf = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .map(|()| buf == *b"PK\x03\x04")
         .unwrap_or(false)
 }
 
@@ -109,6 +119,8 @@ fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
         Format::Safetensors => run_parse_safetensors(path),
         #[cfg(feature = "pth")]
         Format::Pth => run_parse_pth(path),
+        #[cfg(feature = "npz")]
+        Format::Npz => run_parse_npz(path),
     }
 }
 
@@ -210,6 +222,68 @@ fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "npz")]
+fn run_parse_npz(path: &std::path::Path) -> anamnesis::Result<()> {
+    let tensors = anamnesis::parse_npz(path)?;
+
+    println!(
+        "Parsed {} (NPZ archive)",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(unknown)")
+    );
+    println!("  Tensors: {}", tensors.len());
+
+    // Sort by name for stable output.
+    let mut names: Vec<&String> = tensors.keys().collect();
+    names.sort();
+    // CAST: usize → u64, tensor byte lengths fit in u64
+    #[allow(clippy::as_conversions)]
+    let total_bytes: u64 = tensors.values().map(|t| t.data.len() as u64).sum();
+    println!("  Total size: {}", format_bytes(total_bytes));
+    println!();
+
+    for name in &names {
+        if let Some(t) = tensors.get(*name) {
+            let shape_str = format!("{:?}", t.shape);
+            // CAST: usize → u64, tensor byte lengths fit
+            #[allow(clippy::as_conversions)]
+            let byte_len = t.data.len() as u64;
+            println!(
+                "  {:<30} {:<6} {:<15} {}",
+                name,
+                t.dtype,
+                shape_str,
+                format_bytes(byte_len)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "npz")]
+fn run_inspect_npz(path: &std::path::Path) -> anamnesis::Result<()> {
+    let tensors = anamnesis::parse_npz(path)?;
+
+    // CAST: usize → u64, tensor byte lengths fit in u64
+    #[allow(clippy::as_conversions)]
+    let total_bytes: u64 = tensors.values().map(|t| t.data.len() as u64).sum();
+
+    let mut dtypes: Vec<String> = Vec::new();
+    for t in tensors.values() {
+        let s = t.dtype.to_string();
+        if !dtypes.contains(&s) {
+            dtypes.push(s);
+        }
+    }
+
+    println!("Format:      NPZ archive");
+    println!("Tensors:     {}", tensors.len());
+    println!("Total size:  {}", format_bytes(total_bytes));
+    println!("Dtypes:      {}", dtypes.join(", "));
+    Ok(())
+}
+
 fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
     match detect_format(path) {
         Format::Safetensors => {
@@ -223,6 +297,8 @@ fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
             let info = parsed.inspect();
             println!("{info}");
         }
+        #[cfg(feature = "npz")]
+        Format::Npz => run_inspect_npz(path)?,
     }
     Ok(())
 }
@@ -236,6 +312,13 @@ fn run_remember(
         Format::Safetensors => run_remember_safetensors(path, to, output),
         #[cfg(feature = "pth")]
         Format::Pth => run_remember_pth(path, output),
+        #[cfg(feature = "npz")]
+        Format::Npz => Err(anamnesis::AnamnesisError::Unsupported {
+            format: "NPZ".into(),
+            detail: "NPZ tensors are already full-precision; \
+                     no dequantization or conversion needed"
+                .into(),
+        }),
     }
 }
 

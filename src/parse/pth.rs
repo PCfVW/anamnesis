@@ -181,10 +181,10 @@ struct TensorMeta {
 
 /// A parsed `.pth` file — owns the memory-mapped data and provides
 /// zero-copy tensor access.
-#[derive(Debug)]
 ///
 /// Created by [`parse_pth`]. Call [`tensors()`](ParsedPth::tensors) to get
 /// `PthTensor` views that borrow directly from the mapped file region.
+#[derive(Debug)]
 pub struct ParsedPth {
     /// Memory-mapped file.
     mmap: memmap2::Mmap,
@@ -1584,21 +1584,28 @@ fn build_entry_index(
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
         let data_len = entry.size() as usize;
 
+        // BORROW: owned copy — entry name borrows from ZipArchive, but
+        // the HashMap key and error messages must outlive the entry borrow.
+        let full_name = entry.name().to_owned();
+
         // Validate range.
         let data_end = data_start
             .checked_add(data_len)
             .ok_or_else(|| AnamnesisError::Parse {
-                reason: "ZIP entry data range overflow".into(),
+                reason: format!("ZIP entry `{full_name}`: data range overflow"),
             })?;
         if data_end > raw.len() {
-            continue; // skip invalid entries silently
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "ZIP entry `{full_name}`: data range [{data_start}..{data_end}] \
+                     exceeds file size {}",
+                    raw.len()
+                ),
+            });
         }
 
         // Strip the archive prefix to get the suffix key.
         // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0"
-        // BORROW: owned copy — entry name borrows from ZipArchive, but
-        // the HashMap key must outlive the entry borrow.
-        let full_name = entry.name().to_owned();
         let suffix = full_name
             .find('/')
             .map_or(full_name.as_str(), |pos| {
