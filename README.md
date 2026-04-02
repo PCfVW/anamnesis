@@ -36,13 +36,13 @@ Installs both `anamnesis` and `amn` (short alias). Feature flags: `gptq`, `awq`,
 
 | Command | |
 |---------|---|
-| `amn parse <file>` | Parse and summarize a model file (safetensors or `.pth`) |
+| `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`) |
 | `amn inspect <file>` | Show format, tensor counts, size estimates, and byte order |
 | `amn remember <file>` | Dequantize to BF16 (safetensors) or convert `.pth` → `.safetensors` |
 
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`.
 
-Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser. `.bin` files are probed for ZIP magic to distinguish PyTorch from safetensors.
+Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser, `.npz` files go through the header-only NPZ inspector. `.bin` files are probed for ZIP magic to distinguish PyTorch from safetensors.
 
 ```
 $ amn parse model.pth
@@ -55,6 +55,12 @@ Parsed model.pth (PyTorch state_dict)
   rnn.weight_ih_l0               F32 [16, 1]         64 B
   rnn.weight_hh_l0               F32 [16, 16]        1.0 KB
   linear.weight                  F32 [10, 16]        640 B
+
+$ amn inspect weights.npz
+Format:      NPZ archive
+Tensors:     5
+Total size:  160 B
+Dtypes:      F32
 
 $ amn remember model.pth
 Converting model.pth → model.safetensors
