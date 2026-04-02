@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Read;
 use std::path::Path;
 
 use crate::error::AnamnesisError;
@@ -1198,11 +1197,18 @@ fn copy_to_contiguous(
 ///
 /// # Memory
 ///
-/// Reads the entire ZIP archive via the `zip` crate (random access).
-/// Tensor data is loaded per-storage-file and cached in a `HashMap` to
-/// handle shared storage. Peak memory ≈ file size + extracted tensor data.
+/// Memory-maps the file with page prefaulting. Tensor data is sliced
+/// directly from the mapped region and copied once into owned `Vec<u8>`
+/// per tensor. Peak memory ≈ mapped file + tensor data.
+#[allow(unsafe_code)]
 pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
-    let raw = std::fs::read(path.as_ref())?;
+    let file = std::fs::File::open(path.as_ref())?;
+    // SAFETY: memmap2::Mmap requires unsafe because the OS could modify the
+    // mapped region if another process writes to the file concurrently.
+    // Model files are read-only artifacts — this is the standard assumption
+    // for all tensor format parsers (same as safetensors crate's mmap path).
+    let raw =
+        unsafe { memmap2::MmapOptions::new().populate().map(&file) }.map_err(AnamnesisError::Io)?;
 
     // Legacy format detection: check ZIP magic before attempting to parse.
     let magic = raw.get(..4).ok_or_else(|| AnamnesisError::Parse {
@@ -1222,18 +1228,55 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
         });
     }
 
-    let cursor = std::io::Cursor::new(&raw);
+    let cursor = std::io::Cursor::new(&raw[..]);
     let mut archive = zip::ZipArchive::new(cursor)?;
 
-    // 1. Read byte order (default to little-endian).
-    let big_endian = read_byteorder(&mut archive)?;
+    // 1. Pre-index all ZIP entry names → (data_start, size) for O(1) lookup.
+    //    This replaces the O(n) find_entry_name scanning per tensor.
+    let entry_index = build_entry_index(&mut archive, &raw)?;
 
-    // 2. Read and execute the pickle stream.
-    let pkl_data = read_zip_entry_bytes(&mut archive, "data.pkl")?;
-    let mut vm = PickleVm::new(&pkl_data);
+    // 2. Read byte order (default to little-endian).
+    let big_endian = match entry_index.get("byteorder") {
+        Some(&(start, len)) => {
+            let bytes = raw
+                .get(start..start + len)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: "byteorder entry out of bounds".into(),
+                })?;
+            let text = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
+                reason: format!("byteorder entry is not UTF-8: {e}"),
+            })?;
+            match text.trim() {
+                "little" => false,
+                "big" => true,
+                other => {
+                    return Err(AnamnesisError::Parse {
+                        reason: format!(
+                            "unknown byte order `{other}` (expected `little` or `big`)"
+                        ),
+                    })
+                }
+            }
+        }
+        None => false, // default: little-endian
+    };
+
+    // 3. Read and execute the pickle stream.
+    let &(pkl_start, pkl_len) =
+        entry_index
+            .get("data.pkl")
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "ZIP entry `data.pkl` not found".into(),
+            })?;
+    let pkl_data =
+        raw.get(pkl_start..pkl_start + pkl_len)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "data.pkl slice out of bounds".into(),
+            })?;
+    let mut vm = PickleVm::new(pkl_data);
     let root = vm.execute()?;
 
-    // 3. Extract tensor references from the pickle structure.
+    // 4. Extract tensor references from the pickle structure.
     let dict_pairs = extract_dict_pairs(&root)?;
     let mut tensor_refs = Vec::new();
     for (key, value) in dict_pairs {
@@ -1242,28 +1285,25 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
             let tref = parse_rebuild_args(name, args)?;
             tensor_refs.push(tref);
         }
-        // Skip non-tensor entries (e.g., metadata keys). State_dicts
-        // typically contain only tensors, but robustness is free here.
     }
 
-    // 4. Load storage data (with cache for shared storage).
-    let mut storage_cache: HashMap<String, Vec<u8>> = HashMap::new();
+    // 5. Extract tensor data — single copy from mmap into per-tensor Vec.
     let mut tensors = Vec::with_capacity(tensor_refs.len());
 
-    for tref in &tensor_refs {
-        if !storage_cache.contains_key(&tref.storage_key) {
-            let entry_name = format!("data/{}", tref.storage_key);
-            let data = read_zip_entry_bytes(&mut archive, &entry_name)?;
-            storage_cache.insert(tref.storage_key.clone(), data);
-        }
-        let storage =
-            storage_cache
-                .get(&tref.storage_key)
+    for tref in tensor_refs {
+        let storage_suffix = format!("data/{}", tref.storage_key);
+        let &(storage_start, storage_len) =
+            entry_index
+                .get(storage_suffix.as_str())
                 .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("storage key `{}` not in cache", tref.storage_key),
+                    reason: format!("ZIP entry `{storage_suffix}` not found"),
                 })?;
+        let storage = raw
+            .get(storage_start..storage_start + storage_len)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("storage `{}`: mmap slice out of bounds", tref.storage_key),
+            })?;
 
-        // 5. Extract tensor bytes (contiguous or non-contiguous).
         let elem_size = tref.dtype.byte_size();
         let mut data = if is_contiguous(&tref.shape, &tref.strides) {
             let n_elements: usize = tref
@@ -1314,8 +1354,8 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
         }
 
         tensors.push(PthTensor {
-            name: tref.name.clone(),
-            shape: tref.shape.clone(),
+            name: tref.name,
+            shape: tref.shape,
             dtype: tref.dtype,
             data,
         });
@@ -1324,83 +1364,57 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<Vec<PthTensor>> {
     Ok(tensors)
 }
 
-/// Reads the `archive/byteorder` entry (or a bare `byteorder` entry).
+/// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`.
 ///
-/// Returns `true` if big-endian, `false` if little-endian (or if the entry
-/// is missing, which defaults to little-endian).
-fn read_byteorder(archive: &mut zip::ZipArchive<std::io::Cursor<&Vec<u8>>>) -> crate::Result<bool> {
-    // PyTorch uses either "archive/byteorder" or just "byteorder".
-    let entry_name = find_entry_name(archive, "byteorder");
-    let Some(name) = entry_name else {
-        return Ok(false); // default: little-endian
-    };
+/// Only indexes STORED entries (uncompressed). The suffix is the part after
+/// the archive prefix (e.g., `"data.pkl"`, `"data/0"`, `"byteorder"`).
+fn build_entry_index(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    raw: &[u8],
+) -> crate::Result<HashMap<String, (usize, usize)>> {
+    let mut index = HashMap::with_capacity(archive.len());
 
-    let bytes = read_zip_entry_bytes(archive, &name)?;
-    let text = std::str::from_utf8(&bytes).map_err(|e| AnamnesisError::Parse {
-        reason: format!("byteorder entry is not UTF-8: {e}"),
-    })?;
-    match text.trim() {
-        "little" => Ok(false),
-        "big" => Ok(true),
-        other => Err(AnamnesisError::Parse {
-            reason: format!("unknown byte order `{other}` (expected `little` or `big`)"),
-        }),
-    }
-}
-
-/// Finds a ZIP entry by suffix, handling the `archive/` prefix that `PyTorch` adds.
-///
-/// Returns the full entry name if found, or `None`.
-fn find_entry_name(
-    archive: &mut zip::ZipArchive<std::io::Cursor<&Vec<u8>>>,
-    suffix: &str,
-) -> Option<String> {
     for i in 0..archive.len() {
-        if let Ok(entry) = archive.by_index_raw(i) {
-            let n = entry.name();
-            if n == suffix || n.ends_with(&format!("/{suffix}")) {
-                return Some(n.to_owned());
-            }
+        let entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to read ZIP entry {i}: {e}"),
+        })?;
+
+        if entry.compression() != zip::CompressionMethod::Stored {
+            continue;
+        }
+
+        // CAST: u64 → usize, ZIP offsets/sizes fit in usize for model files.
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let data_start = entry.data_start() as usize;
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let data_len = entry.size() as usize;
+
+        // Validate range.
+        let data_end = data_start
+            .checked_add(data_len)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "ZIP entry data range overflow".into(),
+            })?;
+        if data_end > raw.len() {
+            continue; // skip invalid entries silently
+        }
+
+        // Strip the archive prefix to get the suffix key.
+        // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0"
+        let full_name = entry.name().to_owned();
+        let suffix = full_name
+            .find('/')
+            .map_or(full_name.as_str(), |pos| {
+                full_name.get(pos + 1..).unwrap_or(&full_name)
+            })
+            .to_owned();
+
+        if !suffix.is_empty() {
+            index.insert(suffix, (data_start, data_len));
         }
     }
-    None
-}
 
-/// Reads a ZIP entry's full contents into a `Vec<u8>`.
-///
-/// Uses suffix-based lookup via [`find_entry_name`] to handle any ZIP prefix
-/// convention: `archive/` (newer `PyTorch`), `{model_name}/` (older
-/// `PyTorch`), or bare filenames.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if the entry is not found or cannot be read.
-fn read_zip_entry_bytes(
-    archive: &mut zip::ZipArchive<std::io::Cursor<&Vec<u8>>>,
-    name: &str,
-) -> crate::Result<Vec<u8>> {
-    // Discover the full entry name by suffix matching. This handles
-    // "archive/data.pkl", "my_model/data.pkl", or just "data.pkl".
-    let resolved_name = find_entry_name(archive, name).ok_or_else(|| AnamnesisError::Parse {
-        reason: format!("ZIP entry `{name}` not found in archive"),
-    })?;
-    let mut entry = archive
-        .by_name(&resolved_name)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to open ZIP entry `{resolved_name}`: {e}"),
-        })?;
-
-    // CAST: u64 → usize, ZIP entry sizes for model files fit in usize.
-    // Fallback to 0 on theoretical 32-bit overflow (Vec will grow as needed).
-    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-    let capacity = entry.size() as usize;
-    let mut buf = Vec::with_capacity(capacity);
-    entry
-        .read_to_end(&mut buf)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to read ZIP entry `{resolved_name}`: {e}"),
-        })?;
-    Ok(buf)
+    Ok(index)
 }
 
 // ---------------------------------------------------------------------------

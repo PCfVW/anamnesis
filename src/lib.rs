@@ -54,7 +54,10 @@
 //! ([`remember::fp8`], [`remember::gptq`], [`remember::awq`],
 //! [`remember::bnb`]), each feature-gated independently.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) allows feature-gated modules to opt in to unsafe
+// where required by external APIs (e.g., memmap2 in the `pth` module).
+// See CONVENTIONS.md "// SAFETY:" rules for the policy.
+#![deny(unsafe_code)]
 #![deny(warnings)]
 
 pub mod error;
