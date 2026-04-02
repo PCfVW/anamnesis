@@ -318,6 +318,96 @@ impl ParsedPth {
     pub fn is_empty(&self) -> bool {
         self.meta.is_empty()
     }
+
+    /// Returns inspection info derived from the parsed metadata.
+    ///
+    /// No I/O — purely computed from the tensor metadata extracted during
+    /// [`parse_pth`].
+    pub fn inspect(&self) -> PthInspectInfo {
+        let mut total_bytes: u64 = 0;
+        let mut dtypes: Vec<PthDtype> = Vec::new();
+        for m in &self.meta {
+            let n_elements: u64 = m
+                .shape
+                .iter()
+                .try_fold(1u64, |acc, &d| {
+                    // CAST: usize → u64, element counts fit in u64
+                    #[allow(clippy::as_conversions)]
+                    acc.checked_mul(d as u64)
+                })
+                .unwrap_or(0);
+            // CAST: usize → u64, byte sizes fit
+            #[allow(clippy::as_conversions)]
+            let byte_size = m.dtype.byte_size() as u64;
+            total_bytes = total_bytes.saturating_add(n_elements.saturating_mul(byte_size));
+            if !dtypes.contains(&m.dtype) {
+                dtypes.push(m.dtype);
+            }
+        }
+        PthInspectInfo {
+            tensor_count: self.meta.len(),
+            total_bytes,
+            dtypes,
+            big_endian: self.big_endian,
+        }
+    }
+
+    /// Converts the parsed `.pth` tensors to a safetensors file.
+    ///
+    /// Equivalent to calling [`tensors()`](Self::tensors) followed by
+    /// `pth_to_safetensors` — but as a single convenience method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    /// Returns [`AnamnesisError::Parse`] if tensor extraction or
+    /// serialization fails.
+    pub fn to_safetensors(&self, output: impl AsRef<std::path::Path>) -> crate::Result<()> {
+        let tensors = self.tensors()?;
+        crate::remember::pth::pth_to_safetensors(&tensors, output)
+    }
+}
+
+/// Summary information about a parsed `.pth` file.
+///
+/// Produced by [`ParsedPth::inspect`]. No I/O — derived from metadata.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct PthInspectInfo {
+    /// Number of tensors in the `state_dict`.
+    pub tensor_count: usize,
+    /// Total size of raw tensor data in bytes.
+    pub total_bytes: u64,
+    /// Distinct dtypes found (in order of first occurrence).
+    pub dtypes: Vec<PthDtype>,
+    /// Whether the file uses big-endian storage.
+    pub big_endian: bool,
+}
+
+impl fmt::Display for PthInspectInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Format:      PyTorch state_dict (.pth)")?;
+        write!(f, "\nTensors:     {}", self.tensor_count)?;
+        write!(
+            f,
+            "\nTotal size:  {}",
+            crate::inspect::format_bytes(self.total_bytes)
+        )?;
+        let dtype_list: String = self
+            .dtypes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "\nDtypes:      {dtype_list}")?;
+        let endian = if self.big_endian {
+            "big-endian"
+        } else {
+            "little-endian"
+        };
+        write!(f, "\nByte order:  {endian}")?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
