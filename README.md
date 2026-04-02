@@ -13,6 +13,8 @@
 
 ## Table of Contents
 
+- [Install](#install)
+- [CLI Commands](#cli-commands)
 - [Tested Models](#tested-models)
   - [FP8 Dequantization](#fp8-dequantization)
   - [GPTQ Dequantization](#gptq-dequantization)
@@ -21,6 +23,44 @@
 - [NPZ/NPY Parsing](#npznpy-parsing)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [Development](#development)
+
+## Install
+
+```sh
+cargo install anamnesis --features cli,pth
+```
+
+Installs both `anamnesis` and `amn` (short alias). Feature flags: `gptq`, `awq`, `bnb`, `npz`, `pth`, `indicatif` (progress bars).
+
+## CLI Commands
+
+| Command | |
+|---------|---|
+| `amn parse <file>` | Parse and summarize a model file (safetensors or `.pth`) |
+| `amn inspect <file>` | Show format, tensor counts, size estimates, and byte order |
+| `amn remember <file>` | Dequantize to BF16 (safetensors) or convert `.pth` → `.safetensors` |
+
+Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`.
+
+Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser. `.bin` files are probed for ZIP magic to distinguish PyTorch from safetensors.
+
+```
+$ amn parse model.pth
+Parsed model.pth (PyTorch state_dict)
+  Tensors:    3
+  Total size: 1.7 KB
+  Dtypes:     F32
+  Byte order: little-endian
+
+  rnn.weight_ih_l0               F32 [16, 1]         64 B
+  rnn.weight_hh_l0               F32 [16, 16]        1.0 KB
+  linear.weight                  F32 [10, 16]        640 B
+
+$ amn remember model.pth
+Converting model.pth → model.safetensors
+  3 tensors, 1.7 KB
+  Done.
+```
 
 ## Tested Models
 
