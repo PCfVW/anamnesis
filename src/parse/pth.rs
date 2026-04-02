@@ -1287,7 +1287,15 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
 }
 
 /// Maximum nesting depth for recursive pickle value extraction.
-/// Real `.pth` files have at most 2–3 levels; 32 is generous.
+///
+/// Real `.pth` files have at most 2–3 levels of `Built`/`Reduced`
+/// wrapping:
+/// - **Level 0**: `Dict` (the `state_dict` itself)
+/// - **Level 1**: `Built { Dict, metadata }` (`OrderedDict` + `__dict__`)
+/// - **Level 2**: `Reduced { _rebuild_parameter, ... }` wrapping a tensor
+///
+/// 32 is generous — it prevents stack overflow from adversarial pickles
+/// with deeply nested `BUILD` opcodes while accepting any realistic file.
 const MAX_PICKLE_NESTING: u32 = 32;
 
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
