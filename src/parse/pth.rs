@@ -2511,6 +2511,24 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // G23: storage_offset exactly at storage boundary (tightest valid access)
+    #[test]
+    fn copy_to_contiguous_offset_at_boundary() {
+        // 4 bytes of storage, 1 element of 4 bytes at offset 0 → end = 4 = storage.len()
+        let storage = vec![0x01, 0x02, 0x03, 0x04];
+        let result = copy_to_contiguous(&storage, 0, &[1], &[1], 4).unwrap();
+        assert_eq!(result, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    // G23b: one byte past the boundary should fail
+    #[test]
+    fn copy_to_contiguous_one_past_boundary() {
+        // 4 bytes of storage, 1 element of 4 bytes at offset 1 → end = 5 > 4
+        let storage = vec![0x01, 0x02, 0x03, 0x04];
+        let result = copy_to_contiguous(&storage, 1, &[1], &[1], 4);
+        assert!(result.is_err());
+    }
+
     // G26: shape.len() != strides.len() → is_contiguous returns false
     #[test]
     fn is_contiguous_mismatched_dims() {
@@ -2570,6 +2588,37 @@ mod tests {
         assert!(
             msg.contains("data.pkl") && msg.contains("not found"),
             "expected 'data.pkl not found' (compressed entries are skipped), got: {msg}"
+        );
+    }
+
+    // G31: ZIP entry with zero data length (valid edge case)
+    #[test]
+    fn zip_zero_length_entry_accepted() {
+        // Build a ZIP with data.pkl (valid pickle) and an empty data/0 entry.
+        // parse_pth should succeed — the empty storage entry is valid for
+        // a model with no tensors (the pickle just needs to be parseable).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            // data.pkl: PROTO 2, EMPTY_DICT, STOP → valid empty state_dict
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap();
+
+            // Empty storage entry (0 bytes)
+            zip.start_file("archive/data/0", opts).unwrap();
+            // write nothing — zero-length entry
+
+            zip.finish().unwrap();
+        }
+        // Should parse successfully — empty dict, no tensors
+        let parsed = parse_pth(tmp.path()).unwrap();
+        assert!(
+            parsed.tensors().unwrap().is_empty(),
+            "empty state_dict should produce no tensors"
         );
     }
 }
