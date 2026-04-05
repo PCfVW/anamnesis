@@ -18,6 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`byteswap_inplace` missing `// VECTORIZED:` annotation** — added per CONVENTIONS.md
 - **NPZ `parse_descr` native-endian annotation** — added `// EXPLICIT:` for `=` prefix
 - **`bench_npz_adhoc.rs` hardcoded path** — replaced with `dirs::home_dir()` fallback
+- **`parse_pth` stale return-type doc** (D1) — claimed "Returns `Vec<PthTensor>`" but
+  actually returns `Result<ParsedPth>`. Updated to reference `ParsedPth` and
+  `ParsedPth::tensors()`
+- **`inspect_npz` overflow saturation undocumented** (D2) — added note explaining
+  `byte_len` saturates to `usize::MAX` on shape overflow (best-effort metadata),
+  unlike `parse_npz` which returns `Err`
+- **Misused `// EXPLICIT:` in `build_entry_index`** (D3) — was a char-boundary
+  assertion, not a no-op arm or stateful loop. Downgraded to plain comment
+- **Per-line `// BORROW:` annotations** — replaced single block-level annotation in
+  `execute()` with per-call annotations on all 12 `.to_owned()`/`.to_vec()` sites.
+  Added missing annotations in `build_entry_index`
+- **`// VECTORIZED:` on `copy_to_contiguous`** — added `scalar fallback` annotation
+  documenting why the inner loop cannot auto-vectorize (cross-iteration coords state)
+- **`# Memory` section on `ParsedPth::tensors`** — documents zero-copy vs owned
+  allocation paths
+- **`const fn` on `ParsedPth::len`/`is_empty`** — `Vec::len()`/`is_empty()` are
+  `const fn` since Rust 1.39
+- **`# Errors` sections** on `parse_rebuild_args`, `build_entry_index`, and
+  `copy_to_contiguous` — consistency with other private fallible functions
+- **`lib.rs` architecture doc** (D6) — added `pth_to_safetensors()` to bullet list
+- **`NpzDtype` `Display` doc** (D7) — documented as canonical uppercase string used
+  in inspection output and cross-validation tests
 
 ### Added
 
