@@ -2660,4 +2660,28 @@ mod tests {
             "empty state_dict should produce no tensors"
         );
     }
+
+    // T4 (post-review): tensors() contiguous-path overflow guards
+    // The contiguous branch of tensors() (lines ~260-280) uses the same
+    // try_fold + checked_mul + checked_add pattern as copy_to_contiguous.
+    // Testing it directly requires crafting a pickle with metadata claiming
+    // an astronomically large shape for a tiny storage — impractical without
+    // exposing ParsedPth internals. The overflow arithmetic is structurally
+    // identical and verified through copy_to_contiguous_element_count_overflow
+    // and copy_to_contiguous_offset_overflow.
+
+    // T5 (post-review): extract_dict_pairs nesting limit
+    #[test]
+    fn extract_dict_pairs_rejects_deep_nesting() {
+        let dict = PickleValue::Dict(Vec::new());
+        let result = extract_dict_pairs(&dict, MAX_PICKLE_NESTING + 1);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("nesting limit exceeded"),
+            "expected nesting limit error"
+        );
+    }
 }
