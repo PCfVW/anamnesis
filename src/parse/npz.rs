@@ -689,11 +689,14 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
     clippy::panic,
     clippy::indexing_slicing,
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::float_cmp
 )]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     // -- NpzDtype::byte_size -------------------------------------------------
@@ -972,5 +975,81 @@ mod tests {
         // a real NPZ file, but we can verify the extraction logic.
         let header = "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 3), }";
         assert!(extract_fortran_order(header));
+    }
+
+    // -- Gap tests (review findings G32–G36) ---------------------------------
+
+    // G32: Fortran-order rejection through parse_npz end-to-end
+    #[test]
+    fn fortran_order_rejected_end_to_end() {
+        // Build a minimal NPZ containing a single Fortran-order NPY entry.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("arr.npy", options).unwrap();
+
+            // Build NPY v1 with fortran_order: True
+            let header_str = "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 2), }";
+            let npy = make_npy_v1(header_str, &[0u8; 16]); // 4 f32 zeros
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+        let err = parse_npz(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Fortran-order") || msg.contains("fortran"),
+            "expected Fortran-order error, got: {msg}"
+        );
+    }
+
+    // G33: Empty NPZ archive
+    #[test]
+    fn empty_npz_archive() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let zip = zip::ZipWriter::new(file);
+            zip.finish().unwrap();
+        }
+        let result = parse_npz(tmp.path()).unwrap();
+        assert!(result.is_empty(), "empty NPZ should return empty map");
+    }
+
+    // G35: Native-endian '=' prefix in parse_descr
+    #[test]
+    fn parse_descr_native_endian() {
+        // '=' means native endian — treated as LE on all modern platforms
+        let (dtype, be) = parse_descr("=f4").unwrap();
+        assert_eq!(dtype, NpzDtype::F32);
+        assert!(!be, "'=' should not be treated as big-endian");
+    }
+
+    // G34: Big-endian array through parse_npz end-to-end
+    #[test]
+    fn big_endian_through_parse_npz() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("val.npy", options).unwrap();
+
+            // NPY with big-endian f32: 1.0 = [3F, 80, 00, 00] BE
+            let npy = make_npy_v1(
+                "{'descr': '>f4', 'fortran_order': False, 'shape': (1,), }",
+                &[0x3F, 0x80, 0x00, 0x00],
+            );
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+        let tensors = parse_npz(tmp.path()).unwrap();
+        let t = tensors.get("val").expect("val not found");
+        assert_eq!(t.dtype, NpzDtype::F32);
+        // After byteswap: [00, 00, 80, 3F] = 1.0 LE
+        assert_eq!(t.data, vec![0x00, 0x00, 0x80, 0x3F]);
     }
 }

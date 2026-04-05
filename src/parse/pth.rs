@@ -2034,4 +2034,320 @@ mod tests {
         let err = parse_pth(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("too small"));
     }
+
+    // -- Gap tests (review findings G1–G31) ----------------------------------
+
+    // G1: FRAME opcode (0x95) — skips 8-byte frame length, no-op
+    #[test]
+    fn vm_frame_opcode() {
+        // PROTO 4, FRAME (8 bytes length), BININT1 42, STOP
+        let pkl: &[u8] = &[
+            0x80, 0x04, // PROTO 4
+            0x95, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // FRAME(2)
+            b'K', 42,   // BININT1
+            b'.', // STOP
+        ];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(matches!(result, PickleValue::Int(42)));
+    }
+
+    // G2: NONE opcode
+    #[test]
+    fn vm_none() {
+        let pkl: &[u8] = &[0x80, 0x02, b'N', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(matches!(result, PickleValue::None));
+    }
+
+    // G3: NEWTRUE / NEWFALSE opcodes
+    #[test]
+    fn vm_newtrue_newfalse() {
+        // PROTO 2, NEWTRUE, NEWFALSE, TUPLE2, STOP
+        let pkl: &[u8] = &[0x80, 0x02, 0x88, 0x89, 0x86, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Tuple(items) = result {
+            assert!(matches!(items[0], PickleValue::Bool(true)));
+            assert!(matches!(items[1], PickleValue::Bool(false)));
+        } else {
+            panic!("expected Tuple");
+        }
+    }
+
+    // G4: BININT (4-byte signed)
+    #[test]
+    fn vm_binint() {
+        // PROTO 2, BININT 0x01020304 (little-endian = 67305985), STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'J', 0x04, 0x03, 0x02, 0x01, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(matches!(result, PickleValue::Int(0x0102_0304)));
+    }
+
+    // G4b: BININT negative
+    #[test]
+    fn vm_binint_negative() {
+        // PROTO 2, BININT -1 (0xFFFFFFFF LE), STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'J', 0xFF, 0xFF, 0xFF, 0xFF, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(matches!(result, PickleValue::Int(-1)));
+    }
+
+    // G5: BININT2 (2-byte unsigned)
+    #[test]
+    fn vm_binint2() {
+        // PROTO 2, BININT2 0x0100 (= 256 LE), STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'M', 0x00, 0x01, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(matches!(result, PickleValue::Int(256)));
+    }
+
+    // G6: BINUNICODE (4-byte length)
+    #[test]
+    fn vm_binunicode() {
+        // PROTO 2, BINUNICODE "abc" (length=3 LE), STOP
+        let pkl: &[u8] = &[
+            0x80, 0x02, b'X', 0x03, 0x00, 0x00, 0x00, b'a', b'b', b'c', b'.',
+        ];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::String(s) = result {
+            assert_eq!(s, "abc");
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
+    // G7: SHORT_BINSTRING
+    #[test]
+    fn vm_short_binstring() {
+        // PROTO 2, SHORT_BINSTRING "xy" (length=2), STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'U', 0x02, b'x', b'y', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::String(s) = result {
+            assert_eq!(s, "xy");
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
+    // G8: SHORT_BINBYTES
+    #[test]
+    fn vm_short_binbytes() {
+        // PROTO 2, SHORT_BINBYTES [0xDE, 0xAD] (length=2), STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'C', 0x02, 0xDE, 0xAD, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Bytes(b) = result {
+            assert_eq!(b, vec![0xDE, 0xAD]);
+        } else {
+            panic!("expected Bytes, got {result:?}");
+        }
+    }
+
+    // G9: EMPTY_LIST and EMPTY_TUPLE
+    #[test]
+    fn vm_empty_list() {
+        let pkl: &[u8] = &[0x80, 0x02, b']', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::List(items) = result {
+            assert!(items.is_empty());
+        } else {
+            panic!("expected List, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn vm_empty_tuple() {
+        let pkl: &[u8] = &[0x80, 0x02, b')', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Tuple(items) = result {
+            assert!(items.is_empty());
+        } else {
+            panic!("expected Tuple, got {result:?}");
+        }
+    }
+
+    // G10: TUPLE1 and TUPLE3
+    #[test]
+    fn vm_tuple1() {
+        // PROTO 2, BININT1 7, TUPLE1, STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'K', 7, 0x85, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Tuple(items) = result {
+            assert_eq!(items.len(), 1);
+            assert!(matches!(items[0], PickleValue::Int(7)));
+        } else {
+            panic!("expected Tuple, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn vm_tuple3() {
+        // PROTO 2, BININT1 1, BININT1 2, BININT1 3, TUPLE3, STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'K', 1, b'K', 2, b'K', 3, 0x87, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Tuple(items) = result {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[0], PickleValue::Int(1)));
+            assert!(matches!(items[1], PickleValue::Int(2)));
+            assert!(matches!(items[2], PickleValue::Int(3)));
+        } else {
+            panic!("expected Tuple, got {result:?}");
+        }
+    }
+
+    // G11: SETITEMS
+    #[test]
+    fn vm_setitems() {
+        // PROTO 2, EMPTY_DICT, MARK, SHORT_BINUNICODE "a", BININT1 1,
+        //          SHORT_BINUNICODE "b", BININT1 2, SETITEMS, STOP
+        let pkl: &[u8] = &[
+            0x80, 0x02, b'}', b'(', 0x8C, 0x01, b'a', b'K', 1, 0x8C, 0x01, b'b', b'K', 2, b'u',
+            b'.',
+        ];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Dict(pairs) = result {
+            assert_eq!(pairs.len(), 2);
+        } else {
+            panic!("expected Dict, got {result:?}");
+        }
+    }
+
+    // G12: APPEND and APPENDS
+    #[test]
+    fn vm_append() {
+        // PROTO 2, EMPTY_LIST, BININT1 42, APPEND, STOP
+        let pkl: &[u8] = &[0x80, 0x02, b']', b'K', 42, b'a', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::List(items) = result {
+            assert_eq!(items.len(), 1);
+            assert!(matches!(items[0], PickleValue::Int(42)));
+        } else {
+            panic!("expected List, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn vm_appends() {
+        // PROTO 2, EMPTY_LIST, MARK, BININT1 1, BININT1 2, APPENDS, STOP
+        let pkl: &[u8] = &[0x80, 0x02, b']', b'(', b'K', 1, b'K', 2, b'e', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::List(items) = result {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0], PickleValue::Int(1)));
+            assert!(matches!(items[1], PickleValue::Int(2)));
+        } else {
+            panic!("expected List, got {result:?}");
+        }
+    }
+
+    // G17: LONG_BINPUT / LONG_BINGET (4-byte memo keys)
+    #[test]
+    fn vm_long_memo_roundtrip() {
+        // PROTO 2, BININT1 77, LONG_BINPUT key=1, BININT1 0,
+        //          LONG_BINGET key=1, TUPLE2, STOP
+        let pkl: &[u8] = &[
+            0x80, 0x02, b'K', 77, b'r', 0x01, 0x00, 0x00, 0x00, // LONG_BINPUT(1)
+            b'K', 0, b'j', 0x01, 0x00, 0x00, 0x00, // LONG_BINGET(1)
+            0x86, b'.', // TUPLE2, STOP
+        ];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Tuple(items) = result {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0], PickleValue::Int(0)));
+            assert!(matches!(items[1], PickleValue::Int(77)));
+        } else {
+            panic!("expected Tuple, got {result:?}");
+        }
+    }
+
+    // G18: MEMOIZE (proto 4+)
+    #[test]
+    fn vm_memoize() {
+        // PROTO 4, BININT1 99, MEMOIZE, BININT1 0, BINGET key=0, TUPLE2, STOP
+        let pkl: &[u8] = &[
+            0x80, 0x04, b'K', 99, 0x94, // MEMOIZE (auto-assigns key 0)
+            b'K', 0, b'h', 0x00, // BINGET(0)
+            0x86, b'.', // TUPLE2, STOP
+        ];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Tuple(items) = result {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0], PickleValue::Int(0)));
+            assert!(matches!(items[1], PickleValue::Int(99)));
+        } else {
+            panic!("expected Tuple, got {result:?}");
+        }
+    }
+
+    // G20: LONG1 with exactly 8 bytes (negative value, two's complement)
+    #[test]
+    fn long1_8byte_negative() {
+        // -1 in 8-byte two's complement: all 0xFF
+        let result = long1_to_i64(&[0xFF; 8]).unwrap();
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn long1_8byte_max_positive() {
+        // i64::MAX = 0x7FFF_FFFF_FFFF_FFFF LE = [0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x7F]
+        let result = long1_to_i64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]).unwrap();
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn long1_8byte_min_negative() {
+        // i64::MIN = 0x8000_0000_0000_0000 LE = [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80]
+        let result = long1_to_i64(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]).unwrap();
+        assert_eq!(result, i64::MIN);
+    }
+
+    // G25: MAX_PICKLE_NESTING enforcement
+    #[test]
+    fn unwrap_to_rebuild_rejects_deep_nesting() {
+        // Construct a value nested 33 levels deep — exceeds MAX_PICKLE_NESTING (32)
+        let leaf = PickleValue::Int(0);
+        let result = unwrap_to_rebuild(&leaf, MAX_PICKLE_NESTING + 1);
+        assert!(result.is_none(), "should reject nesting beyond limit");
+    }
+
+    // G28: copy_to_contiguous with transposed 2D tensor
+    #[test]
+    fn copy_to_contiguous_transposed_2x3() {
+        // 2×3 F32 tensor stored with strides [1, 2] (transposed from [3, 1])
+        // Logical matrix: [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+        // Storage layout with strides [1, 2]: column-major
+        //   storage[0]=0.0, storage[1]=3.0, storage[2]=1.0,
+        //   storage[3]=4.0, storage[4]=2.0, storage[5]=5.0
+        let values: [f32; 6] = [0.0, 3.0, 1.0, 4.0, 2.0, 5.0];
+        let mut storage = Vec::new();
+        for v in &values {
+            storage.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let result = copy_to_contiguous(&storage, 0, &[2, 3], &[1, 2], 4).unwrap();
+
+        // Expected row-major output: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        let expected: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut expected_bytes = Vec::new();
+        for v in &expected {
+            expected_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(result, expected_bytes);
+    }
 }

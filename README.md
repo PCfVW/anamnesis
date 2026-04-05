@@ -22,6 +22,8 @@
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
 - [NPZ/NPY Parsing](#npznpy-parsing)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
+- [Used by](#used-by)
+- [License](#license)
 - [Development](#development)
 
 ## Install
@@ -143,6 +145,15 @@ Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with security allowl
 Lossless `.pth` → `.safetensors` conversion preserving original dtypes (F16, BF16, F32, F64, I8–I64, U8, Bool). The conversion pipeline writes directly from mmap slices to the output file — zero intermediate data copies.
 
 Handles both newer (`archive/` prefix) and older (`{model_name}/` prefix) PyTorch ZIP conventions. Legacy (pre-1.6) raw-pickle files are rejected with a clear error.
+
+## Used by
+
+- [candle-mi](https://github.com/PCfVW/candle-mi) — Mechanistic interpretability toolkit for language models
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
+or [MIT License](LICENSE-MIT) at your option.
 
 ## Development
 
