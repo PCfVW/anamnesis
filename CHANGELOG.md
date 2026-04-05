@@ -7,17 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-05
+
 ### Fixed
 
+- **`copy_to_contiguous` silent data corruption on mismatched shape/strides** (NI1) —
+  added ndim guard rejecting `shape.len() != strides.len()`. Previously, `.zip()`
+  silently truncated to the shorter iterator, producing corrupted output. Defence-in-depth
+  check also added in `parse_rebuild_args`
+- **`copy_to_contiguous` inner loop used `.get()` despite `// INDEX:` annotation** (NI2) —
+  switched to direct indexing `storage[range]`, matching CONVENTIONS.md and the
+  pre-validation that proves bounds safety. Eliminates dead `.ok_or_else()` branches
 - **NPZ `extract_descr` mixed-quote bug** — quote character detection now reads the
   first quote in the value portion, not the entire header tail. Fixes silent
   mis-extraction for mixed-quote headers like `{'descr': "<f4", ...}`
-- **NPZ `extract_fortran_order`** — added `// EXPLICIT:` annotation documenting the
-  intentional `false` default when the field is missing (C-order is the NumPy default)
-- **`parse/mod.rs` stale docstring** — updated from "wraps `npyz`" to reflect own parser
-- **`byteswap_inplace` missing `// VECTORIZED:` annotation** — added per CONVENTIONS.md
-- **NPZ `parse_descr` native-endian annotation** — added `// EXPLICIT:` for `=` prefix
-- **`bench_npz_adhoc.rs` hardcoded path** — replaced with `dirs::home_dir()` fallback
 - **`parse_pth` stale return-type doc** (D1) — claimed "Returns `Vec<PthTensor>`" but
   actually returns `Result<ParsedPth>`. Updated to reference `ParsedPth` and
   `ParsedPth::tensors()`
@@ -40,19 +43,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`lib.rs` architecture doc** (D6) — added `pth_to_safetensors()` to bullet list
 - **`NpzDtype` `Display` doc** (D7) — documented as canonical uppercase string used
   in inspection output and cross-validation tests
+- **`parse/mod.rs` stale docstring** — updated from "wraps `npyz`" to reflect own parser
+- **`byteswap_inplace` missing `// VECTORIZED:` annotation** — added per CONVENTIONS.md
+- **NPZ annotations** — `// EXPLICIT:` for `=` native-endian prefix, `// EXPLICIT:`
+  for `extract_fortran_order` default
+- **`bench_npz_adhoc.rs` hardcoded path** — replaced with `dirs::home_dir()` fallback
 
 ### Added
 
-- **43 new unit tests** covering all review findings G1–G36: pickle VM opcodes
-  (FRAME, NONE, NEWTRUE/NEWFALSE, BININT, BININT2, BINUNICODE, SHORT_BINSTRING,
-  BINSTRING, SHORT_BINBYTES, BINBYTES, EMPTY_LIST, EMPTY_TUPLE, TUPLE1, TUPLE3,
-  SETITEMS, APPEND, APPENDS, STACK_GLOBAL, REDUCE, NEWOBJ, BUILD, BINPERSID,
-  LONG_BINPUT/LONG_BINGET, MEMOIZE), `long1_to_i64` 8-byte boundary,
-  `MEMOIZE` overflow at `u32::MAX`, `MAX_PICKLE_NESTING` enforcement,
-  `copy_to_contiguous` (transposed, zero-element, overflow, zero-stride broadcast),
-  `is_contiguous` mismatched dims, missing/compressed `data.pkl` ZIP entries,
-  NPZ Fortran-order end-to-end rejection, empty NPZ archive, native-endian `=`
-  prefix, big-endian array through `parse_npz`, `inspect_npz` overflow saturation
+- **48 new unit tests** covering code review findings G1–G36, NI1–NI2, NN1–NN4:
+  pickle VM opcodes (FRAME, NONE, NEWTRUE/NEWFALSE, BININT, BININT2, BINUNICODE,
+  SHORT_BINSTRING, BINSTRING, SHORT_BINBYTES, BINBYTES, EMPTY_LIST, EMPTY_TUPLE,
+  TUPLE1, TUPLE3, SETITEMS, APPEND, APPENDS, STACK_GLOBAL, REDUCE, NEWOBJ, BUILD,
+  BINPERSID, LONG_BINPUT/LONG_BINGET, MEMOIZE), `long1_to_i64` 8-byte boundary,
+  `MEMOIZE` overflow at `u32::MAX`, `MAX_PICKLE_NESTING` enforcement (both
+  `unwrap_to_rebuild` and `extract_dict_pairs`), `copy_to_contiguous` (transposed,
+  zero-element, overflow, zero-stride broadcast, ndim mismatch, storage boundary),
+  missing/compressed `data.pkl` ZIP entries, zero-length ZIP entry,
+  NPZ Fortran-order end-to-end rejection, empty NPZ archive (parse + inspect),
+  native-endian `=` prefix, big-endian through `parse_npz`, `inspect_npz` overflow
 
 ## [0.3.1] - 2026-04-02
 
