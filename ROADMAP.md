@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated April 1, 2026)
-**Status:** Phases 1–3 complete (v0.3.0 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing. Next: Phase 3.5 (PyTorch `.pth` parsing, v0.3.1).
+**Date:** March 20, 2026 (updated April 5, 2026)
+**Status:** Phases 1–3.5 complete (v0.3.1 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing. Next: Phase 4 (GGUF).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -25,7 +25,10 @@
   - [Phase 3.5: PyTorch `.pth` Parsing](#phase-35-pytorch-pth-parsing)
   - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
-  - [Phase 6: Emerging Quantization Formats](#phase-6-emerging-quantization-formats)
+  - [Phase 6: Python Bindings (PyO3)](#phase-6-python-bindings-pyo3)
+  - [Phase 7: Format Conversion Matrix](#phase-7-format-conversion-matrix)
+  - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
+  - [Future Directions](#future-directions)
 - [4. Key Design Decisions](#4-key-design-decisions)
 - [5. Relationship to Other Projects](#5-relationship-to-other-projects)
 
@@ -115,6 +118,7 @@ anamnesis (library crate)
 │   ├── gptq               GPTQ dequantization
 │   ├── awq                AWQ dequantization
 │   ├── bnb                BitsAndBytes (NF4, INT8) dequantization
+│   ├── pth                PyTorch .pth → safetensors conversion (Phase 3.5)
 │   └── gguf               GGUF K-quant dequantization (Phase 4)
 │
 ├── lethe/              ← built on parse: precision reduction (quantize)
@@ -130,7 +134,7 @@ anamnesis (library crate)
 ### 2.3 Ecosystem Fit
 
 ```
-safetensors / npz / gguf  ← file formats
+safetensors / npz / pth / gguf  ← file formats
     ↓
 anamnesis (library)     ← parse, remember, lethe
 anamnesis / amn (CLI)   ← amn parse, amn inspect, amn remember, amn forget
@@ -296,7 +300,46 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Deliverable:** `anamnesis` v0.5.0 — full quantize + dequantize cycle. — **PUSH + tag `v0.5.0`**
 
-### Phase 6: Emerging Quantization Formats
+### Phase 6: Python Bindings (PyO3)
+
+**Goal:** Expose anamnesis to the Python ecosystem via `pip install anamnesis`. Phases 1–5 give anamnesis the fastest dequantization (2.7–54× vs PyTorch), the fastest NPZ parser (17.7× vs npyz), PyTorch `.pth` parsing, GGUF support, and quantization — all in pure Rust. Python bindings multiply the audience by ~100×, replacing ad-hoc dequantization scripts across the ML community.
+
+**Approach:** Use [PyO3](https://pyo3.rs/) + [maturin](https://github.com/PyO3/maturin) to build a native Python extension. The Python API should mirror the Rust library API closely: `parse()`, `inspect()`, `remember()`, `forget()`, `parse_npz()`. Returns NumPy arrays (via `numpy` interop) or raw bytes. Ships as a wheel on PyPI.
+
+- [ ] PyO3 module scaffold (`src/python.rs`) — feature-gated behind `python` — **commit**
+- [ ] `parse_npz()` binding — returns `dict[str, NpzTensor]` with NumPy-compatible arrays — **commit**
+- [ ] Safetensors `parse()` + `inspect()` bindings — **commit**
+- [ ] `remember()` / `forget()` bindings — dequantize and quantize from Python — **commit**
+- [ ] `maturin` build config, PyPI packaging, CI workflow — **commit**
+- [ ] Python test suite — validate against PyTorch reference on the same fixtures — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.6.0 — `pip install anamnesis` works. — **PUSH + tag `v0.6.0`**
+
+**New dependencies:** `pyo3`, `numpy` (PyO3 interop). Feature-gated behind `python`.
+
+### Phase 7: Format Conversion Matrix
+
+**Goal:** Wire the full pipeline — any supported input format to any supported output format in a single command. With Phases 1–6 complete, the core is `parse → remember → forget → write`. Phase 7 adds the CLI and Python API for end-to-end conversion, plus output writers for each target format.
+
+**Key conversions unlocked:**
+
+| From | To | Use case |
+|------|----|----------|
+| GPTQ safetensors | GGUF Q4_K_M | Deploy HuggingFace models in llama.cpp/Ollama |
+| AWQ safetensors | safetensors BF16 | Remove quantization for fine-tuning |
+| GGUF | safetensors BF16 | Load llama.cpp models in candle/burn |
+| safetensors BF16 | GGUF Q4_K_M | Quantize for local inference |
+| NPZ | safetensors | Migrate JAX weights to HuggingFace ecosystem |
+| PyTorch .pth | safetensors | Migrate legacy PyTorch weights (already supported since v0.3.1) |
+
+- [ ] GGUF output writer — write GGUF files with K-quant types from BF16 input — **commit**
+- [ ] `amn convert` CLI subcommand — `amn convert model.safetensors --to gguf-q4km -o model.gguf` — **commit**
+- [ ] Python `convert()` API — **commit**
+- [ ] Cross-format round-trip validation — convert, then convert back, measure distortion — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.7.0 — any-to-any format conversion. No Rust or Python tool does this today. — **PUSH + tag `v0.7.0`**
+
+### Phase 8: Emerging Quantization Formats
 
 **Goal:** Extend coverage to newer quantization formats that currently have zero Rust implementations. Prioritized by ecosystem adoption (HuggingFace model count as of March 2026).
 
@@ -315,7 +358,17 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [ ] AQLM dequantization — additive quantization, sub-2-bit with vector codebooks — **commit**
 - [ ] Cross-validation for each format — **commit** — **PUSH**
 
-**Deliverable:** `anamnesis` v0.6.0 — emerging format coverage. — **PUSH + tag `v0.6.0`**
+**Deliverable:** `anamnesis` v0.8.0 — emerging format coverage. — **PUSH + tag `v0.8.0`**
+
+### Future Directions
+
+The following are potential extensions beyond Phase 8, listed for context. They will be promoted to full phases when a concrete need arises.
+
+- **Streaming / memory-mapped processing** — mmap-based safetensors/GGUF parsing for 70B+ models (100+ GB) that exceed available RAM
+- **Model surgery** — extract specific layers, merge LoRA adapters with base weights at the file level, split/shard for distributed loading
+- **Quantization quality analysis** — per-layer distortion reports, optimal mixed-precision selection, diff two quantized versions of the same model
+- **WASM target** — compile anamnesis to WASM for browser-based model inspection (drop a safetensors file, see tensor layout and quantization scheme instantly)
+- **GPU-accelerated dequantization** — compute shader (wgpu/Vulkan) kernels for dequantization hot loops, for cases where CPU auto-vectorization is insufficient
 
 ---
 
@@ -382,7 +435,7 @@ Download crate. Depends on anamnesis for `--dequantize` and `download_and_parse_
 
 MI framework. anamnesis intersects with candle-mi in two ways:
 
-1. **NPZ migration.** candle-mi currently contains a tightly-coupled NPZ parser for Gemma Scope SAE weights. Phase 3 of anamnesis replaces it. candle-mi task: "Migrate `.npz` parsing logic from `candle-mi` to `anamnesis`."
+1. **NPZ migration.** candle-mi contained a tightly-coupled NPZ parser for Gemma Scope SAE weights. Phase 3 of anamnesis replaces it. Migration design: `candle-mi/design/migrate-npz-to-anamnesis.md`. `anamnesis` v0.3.0+ provides `parse_npz()` with a `From<AnamnesisError>` bridge to `MIError`. Target: candle-mi v0.1.5.
 
 2. **Auto-config extensions.** The FP8 test models chosen for anamnesis Phase 1 validation introduce two new architectures that candle-mi should support:
    - **`exaone4`** (`LGAI-EXAONE/EXAONE-4.0-1.2B-FP8`) — LLaMA-like with alternating sliding window / full attention ("LLLG" pattern). Close to Gemma 2's alternating scheme. Requires a new `parse_exaone4()` in `config.rs`.
