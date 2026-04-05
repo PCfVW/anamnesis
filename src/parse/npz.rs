@@ -1052,4 +1052,39 @@ mod tests {
         // After byteswap: [00, 00, 80, 3F] = 1.0 LE
         assert_eq!(t.data, vec![0x00, 0x00, 0x80, 0x3F]);
     }
+
+    // G36: inspect_npz overflow — large shape values saturate gracefully
+    #[test]
+    fn inspect_npz_overflow_saturates() {
+        // Build NPZ with an array whose shape would overflow usize when
+        // multiplied. inspect_npz should saturate rather than panic.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("huge.npy", options).unwrap();
+
+            // Shape with dimensions that overflow when multiplied:
+            // (usize::MAX, 2) → usize::MAX * 2 overflows
+            // We encode this as NPY v1 header with huge shape.
+            // But we can't actually store usize::MAX elements — the shape
+            // in the header can claim anything. inspect_npz only reads
+            // the header, not the data, so the file can be tiny.
+            let shape_str = format!(
+                "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, 2), }}",
+                usize::MAX / 2 + 1
+            );
+            let npy = make_npy_v1(&shape_str, &[]); // no actual data
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let info = inspect_npz(tmp.path()).unwrap();
+        assert_eq!(info.tensors.len(), 1);
+        // Element count overflows → unwrap_or(usize::MAX) → saturating_mul
+        // The byte_len should be usize::MAX (saturated)
+        assert_eq!(info.tensors[0].byte_len, usize::MAX);
+    }
 }

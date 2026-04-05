@@ -21,13 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **67 new unit tests** covering review findings G1–G36: pickle VM opcodes (FRAME,
-  NONE, NEWTRUE/NEWFALSE, BININT, BININT2, BINUNICODE, SHORT_BINSTRING,
-  SHORT_BINBYTES, EMPTY_LIST, EMPTY_TUPLE, TUPLE1, TUPLE3, SETITEMS, APPEND,
-  APPENDS, LONG_BINPUT/LONG_BINGET, MEMOIZE), `long1_to_i64` 8-byte boundary,
-  `MAX_PICKLE_NESTING` enforcement, `copy_to_contiguous` transposed tensor,
+- **43 new unit tests** covering all review findings G1–G36: pickle VM opcodes
+  (FRAME, NONE, NEWTRUE/NEWFALSE, BININT, BININT2, BINUNICODE, SHORT_BINSTRING,
+  BINSTRING, SHORT_BINBYTES, BINBYTES, EMPTY_LIST, EMPTY_TUPLE, TUPLE1, TUPLE3,
+  SETITEMS, APPEND, APPENDS, STACK_GLOBAL, REDUCE, NEWOBJ, BUILD, BINPERSID,
+  LONG_BINPUT/LONG_BINGET, MEMOIZE), `long1_to_i64` 8-byte boundary,
+  `MEMOIZE` overflow at `u32::MAX`, `MAX_PICKLE_NESTING` enforcement,
+  `copy_to_contiguous` (transposed, zero-element, overflow, zero-stride broadcast),
+  `is_contiguous` mismatched dims, missing/compressed `data.pkl` ZIP entries,
   NPZ Fortran-order end-to-end rejection, empty NPZ archive, native-endian `=`
-  prefix, big-endian array through `parse_npz`
+  prefix, big-endian array through `parse_npz`, `inspect_npz` overflow saturation
 
 ## [0.3.1] - 2026-04-02
 

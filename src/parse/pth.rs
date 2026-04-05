@@ -1783,6 +1783,8 @@ fn build_entry_index(
     clippy::wildcard_enum_match_arm
 )]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     // -- PthDtype ------------------------------------------------------------
@@ -2349,5 +2351,225 @@ mod tests {
             expected_bytes.extend_from_slice(&v.to_le_bytes());
         }
         assert_eq!(result, expected_bytes);
+    }
+
+    // G7 (partial): BINSTRING (b'T') — 4-byte signed length
+    #[test]
+    fn vm_binstring() {
+        // PROTO 2, BINSTRING "ab" (length=2 as i32 LE), STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'T', 0x02, 0x00, 0x00, 0x00, b'a', b'b', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::String(s) = result {
+            assert_eq!(s, "ab");
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
+    // G8 (partial): BINBYTES (b'B') — 4-byte length
+    #[test]
+    fn vm_binbytes() {
+        // PROTO 3, BINBYTES [0xCA, 0xFE] (length=2 as u32 LE), STOP
+        let pkl: &[u8] = &[0x80, 0x03, b'B', 0x02, 0x00, 0x00, 0x00, 0xCA, 0xFE, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Bytes(b) = result {
+            assert_eq!(b, vec![0xCA, 0xFE]);
+        } else {
+            panic!("expected Bytes, got {result:?}");
+        }
+    }
+
+    // G13: STACK_GLOBAL (protocol 4+)
+    #[test]
+    fn vm_stack_global() {
+        // PROTO 4, SHORT_BINUNICODE "torch._utils", SHORT_BINUNICODE
+        // "_rebuild_tensor_v2", STACK_GLOBAL, STOP
+        let pkl: &[u8] = &[
+            0x80, 0x04, 0x8C, 0x0C, // SHORT_BINUNICODE len=12
+            b't', b'o', b'r', b'c', b'h', b'.', b'_', b'u', b't', b'i', b'l', b's', 0x8C,
+            0x12, // SHORT_BINUNICODE len=18
+            b'_', b'r', b'e', b'b', b'u', b'i', b'l', b'd', b'_', b't', b'e', b'n', b's', b'o',
+            b'r', b'_', b'v', b'2', 0x93, // STACK_GLOBAL
+            b'.',
+        ];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(matches!(
+            result,
+            PickleValue::Global { ref module, ref name }
+            if module == "torch._utils" && name == "_rebuild_tensor_v2"
+        ));
+    }
+
+    // G14: REDUCE (b'R') — pop args + callable, create Reduced
+    #[test]
+    fn vm_reduce() {
+        // PROTO 2, GLOBAL "torch._utils\n_rebuild_tensor_v2\n",
+        //          EMPTY_TUPLE, REDUCE, STOP
+        let pkl = b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n)R.";
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(
+            matches!(result, PickleValue::Reduced { .. }),
+            "expected Reduced, got {result:?}"
+        );
+    }
+
+    // G14b: NEWOBJ (0x81) — same semantics as REDUCE
+    #[test]
+    fn vm_newobj() {
+        // PROTO 2, GLOBAL "torch._utils\n_rebuild_tensor_v2\n",
+        //          EMPTY_TUPLE, NEWOBJ, STOP
+        let pkl: &[u8] = b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n)\x81.";
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        assert!(
+            matches!(result, PickleValue::Reduced { .. }),
+            "expected Reduced, got {result:?}"
+        );
+    }
+
+    // G15: BUILD (b'b') — pop state, pop object, create Built
+    #[test]
+    fn vm_build() {
+        // PROTO 2, BININT1 1 (object), BININT1 2 (state), BUILD, STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'K', 1, b'K', 2, b'b', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::Built { obj, state } = result {
+            assert!(matches!(*obj, PickleValue::Int(1)));
+            assert!(matches!(*state, PickleValue::Int(2)));
+        } else {
+            panic!("expected Built, got {result:?}");
+        }
+    }
+
+    // G16: BINPERSID (b'Q') — pop id, create PersistentId
+    #[test]
+    fn vm_binpersid() {
+        // PROTO 2, BININT1 42, BINPERSID, STOP
+        let pkl: &[u8] = &[0x80, 0x02, b'K', 42, b'Q', b'.'];
+        let mut vm = PickleVm::new(pkl);
+        let result = vm.execute().unwrap();
+        if let PickleValue::PersistentId(inner) = result {
+            assert!(matches!(*inner, PickleValue::Int(42)));
+        } else {
+            panic!("expected PersistentId, got {result:?}");
+        }
+    }
+
+    // G19: MEMOIZE overflow at u32::MAX
+    #[test]
+    fn vm_memoize_overflow() {
+        // PROTO 4, BININT1 0, MEMOIZE (will get key 0), STOP
+        // — but we pre-set next_memo_id to u32::MAX so the +1 overflows
+        let pkl: &[u8] = &[0x80, 0x04, b'K', 0, 0x94, b'.'];
+        let mut vm = PickleVm::new(pkl);
+        vm.next_memo_id = u32::MAX;
+        let err = vm.execute().unwrap_err();
+        assert!(
+            err.to_string().contains("memo table overflow"),
+            "got: {err}"
+        );
+    }
+
+    // G21: Zero-element tensor (shape [0, 4])
+    // copy_to_contiguous uses dim.checked_sub(1) for max offset calculation,
+    // which returns None for dim=0. This correctly produces an error —
+    // zero-element tensors are handled at the caller level (n_elements=0
+    // → n_bytes=0 → empty slice), never reaching copy_to_contiguous.
+    #[test]
+    fn copy_to_contiguous_zero_elements_errors() {
+        let storage = vec![0u8; 16];
+        let result = copy_to_contiguous(&storage, 0, &[0, 4], &[4, 1], 4);
+        assert!(
+            result.is_err(),
+            "zero-dim in shape should error in max_elem_offset"
+        );
+    }
+
+    // G22: Element-count overflow in copy_to_contiguous
+    #[test]
+    fn copy_to_contiguous_element_count_overflow() {
+        let storage = vec![0u8; 8];
+        let result = copy_to_contiguous(&storage, 0, &[usize::MAX, 2], &[2, 1], 1);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("overflow"),
+            "expected overflow error"
+        );
+    }
+
+    // G24: storage_offset overflow in copy_to_contiguous
+    #[test]
+    fn copy_to_contiguous_offset_overflow() {
+        let storage = vec![0u8; 8];
+        // offset near usize::MAX, shape [1] → offset + 1 byte wraps
+        let result = copy_to_contiguous(&storage, usize::MAX, &[1], &[1], 1);
+        assert!(result.is_err());
+    }
+
+    // G26: shape.len() != strides.len() → is_contiguous returns false
+    #[test]
+    fn is_contiguous_mismatched_dims() {
+        // 3D shape with 2D strides — should not be contiguous
+        assert!(!is_contiguous(&[2, 3, 4], &[12, 4]));
+    }
+
+    // G27: Zero-stride dimension (broadcast)
+    #[test]
+    fn copy_to_contiguous_zero_stride_broadcast() {
+        // shape [2, 3], strides [0, 1], elem_size=1
+        // Row 0 and Row 1 both read from the same 3 bytes (broadcast)
+        let storage: Vec<u8> = vec![10, 20, 30];
+        let result = copy_to_contiguous(&storage, 0, &[2, 3], &[0, 1], 1).unwrap();
+        // Both rows should be [10, 20, 30]
+        assert_eq!(result, vec![10, 20, 30, 10, 20, 30]);
+    }
+
+    // G29: ZIP archive with no data.pkl entry
+    #[test]
+    fn reject_zip_missing_data_pkl() {
+        // Build a ZIP with a random entry but no data.pkl
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/not_a_pkl.txt", options).unwrap();
+            zip.write_all(b"hello").unwrap();
+            zip.finish().unwrap();
+        }
+        let err = parse_pth(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data.pkl") && msg.contains("not found"),
+            "expected 'data.pkl not found', got: {msg}"
+        );
+    }
+
+    // G30: data.pkl stored as DEFLATE (compressed) — silently skipped
+    #[test]
+    fn reject_compressed_data_pkl() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("archive/data.pkl", options).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap(); // valid pickle: empty dict
+            zip.finish().unwrap();
+        }
+        let err = parse_pth(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        // data.pkl is compressed → skipped by build_entry_index → "not found"
+        assert!(
+            msg.contains("data.pkl") && msg.contains("not found"),
+            "expected 'data.pkl not found' (compressed entries are skipped), got: {msg}"
+        );
     }
 }
