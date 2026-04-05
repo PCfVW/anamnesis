@@ -1591,9 +1591,9 @@ fn copy_to_contiguous(
 
 /// Parses a `PyTorch` `.pth` `state_dict` file.
 ///
-/// Returns a `Vec` of `PthTensor` with raw data in native-endian, row-major
-/// layout. The order matches the `OrderedDict` insertion order from the
-/// original Python `state_dict`.
+/// Returns a [`ParsedPth`] that owns the memory-mapped file and provides
+/// zero-copy access via [`ParsedPth::tensors()`]. Tensor order matches the
+/// `OrderedDict` insertion order from the original Python `state_dict`.
 ///
 /// # Supported Formats
 ///
@@ -1790,8 +1790,8 @@ fn build_entry_index(
 
         // Strip the archive prefix to get the suffix key.
         // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0"
-        // EXPLICIT: '/' is always byte 0x2F in UTF-8, so pos+1 is a valid
-        // char boundary. unwrap_or(&full_name) is a defensive fallback for
+        // '/' is always byte 0x2F in UTF-8, so pos+1 is a valid char
+        // boundary. unwrap_or(&full_name) is a defensive fallback for
         // non-ASCII names (impossible in PyTorch archives, but safe).
         // BORROW: .as_str() explicit String → &str; .to_owned() converts &str → owned String
         let suffix = full_name

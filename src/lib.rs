@@ -60,6 +60,8 @@
 //!   (requires `npz` feature)
 //! - `parse_pth()` — parse a `PyTorch` `.pth` file into a `ParsedPth`
 //!   with zero-copy `tensors()` (requires `pth` feature)
+//! - `pth_to_safetensors()` — lossless `.pth` → `.safetensors` conversion
+//!   (requires `pth` feature)
 //!
 //! The [`remember`] module contains one submodule per quantization family
 //! ([`remember::fp8`], [`remember::gptq`], [`remember::awq`],

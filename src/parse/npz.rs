@@ -90,6 +90,9 @@ impl NpzDtype {
     }
 }
 
+/// Displays the canonical uppercase name (e.g., `"F32"`, `"BF16"`, `"BOOL"`).
+///
+/// This is the string used in inspection output and cross-validation tests.
 impl fmt::Display for NpzDtype {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -544,6 +547,12 @@ impl fmt::Display for NpzInspectInfo {
 ///
 /// Allocates only per-tensor metadata (name, shape, dtype). No tensor
 /// data is read or allocated. Peak memory ≈ kilobytes for typical models.
+///
+/// **Note:** If a shape's element count overflows `usize`, `byte_len`
+/// saturates to `usize::MAX` and `total_bytes` saturates to `u64::MAX`.
+/// This differs from `parse_npz`, which returns `Err` on the same overflow.
+/// The distinction is intentional: `inspect_npz` is best-effort metadata
+/// extraction, while `parse_npz` must validate before allocating buffers.
 pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
     let file = std::fs::File::open(path.as_ref())?;
     let mut archive = zip::ZipArchive::new(file)?;
