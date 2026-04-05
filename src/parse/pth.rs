@@ -229,6 +229,15 @@ impl ParsedPth {
     ///
     /// Returns [`AnamnesisError::Parse`] if a storage entry is missing
     /// or a tensor's byte range exceeds the storage.
+    ///
+    /// # Memory
+    ///
+    /// For contiguous little-endian tensors, data is zero-copy (`Cow::Borrowed`
+    /// from the mmap) — no per-tensor allocation. Non-contiguous or big-endian
+    /// tensors allocate an owned `Vec<u8>` of `n_elements × dtype.byte_size()`
+    /// bytes. Peak memory: the mmap (file-sized) plus one owned copy per
+    /// non-contiguous tensor. The `Vec<PthTensor>` itself is lightweight
+    /// (metadata + `Cow` pointers).
     pub fn tensors(&self) -> crate::Result<Vec<PthTensor<'_>>> {
         let mut tensors = Vec::with_capacity(self.meta.len());
         for m in &self.meta {
@@ -331,13 +340,13 @@ impl ParsedPth {
 
     /// Returns the number of tensors.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.meta.len()
     }
 
     /// Returns `true` if the file contained no tensors.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.meta.is_empty()
     }
 
@@ -700,10 +709,6 @@ impl<'a> PickleVm<'a> {
     ///
     /// Returns [`AnamnesisError::Parse`] on malformed opcodes, stack
     /// underflow, non-allowlisted globals, or unrecognized opcodes.
-    // BORROW: throughout this function, `.to_owned()` and `.to_vec()` convert
-    // borrowed slices from the pickle byte stream (which borrows from the mmap)
-    // into owned `PickleValue` variants. The pickle VM's stack must own its
-    // values because the VM outlives individual opcode reads.
     fn execute(&mut self) -> crate::Result<PickleValue> {
         loop {
             let opcode = self.read_u8()?;
@@ -765,6 +770,7 @@ impl<'a> PickleVm<'a> {
                     let s = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
                         reason: format!("non-UTF-8 pickle string: {e}"),
                     })?;
+                    // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
                     self.stack.push(PickleValue::String(s.to_owned()));
                 }
                 // BINUNICODE (4-byte length prefix)
@@ -777,6 +783,7 @@ impl<'a> PickleVm<'a> {
                     let s = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
                         reason: format!("non-UTF-8 pickle string: {e}"),
                     })?;
+                    // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
                     self.stack.push(PickleValue::String(s.to_owned()));
                 }
                 // SHORT_BINSTRING (1-byte length, protocol 2 — bytes, not str)
@@ -787,7 +794,9 @@ impl<'a> PickleVm<'a> {
                     // Protocol 2 SHORT_BINSTRING is used for ASCII identifiers;
                     // treat as UTF-8 string if valid, otherwise keep as bytes.
                     match std::str::from_utf8(bytes) {
+                        // BORROW: .to_owned() converts &str to owned String
                         Ok(s) => self.stack.push(PickleValue::String(s.to_owned())),
+                        // BORROW: .to_vec() converts &[u8] to owned Vec<u8>
                         Err(_) => self.stack.push(PickleValue::Bytes(bytes.to_vec())),
                     }
                 }
@@ -804,7 +813,9 @@ impl<'a> PickleVm<'a> {
                     })?;
                     let bytes = self.read_bytes(len)?;
                     match std::str::from_utf8(bytes) {
+                        // BORROW: .to_owned() converts &str to owned String
                         Ok(s) => self.stack.push(PickleValue::String(s.to_owned())),
+                        // BORROW: .to_vec() converts &[u8] to owned Vec<u8>
                         Err(_) => self.stack.push(PickleValue::Bytes(bytes.to_vec())),
                     }
                 }
@@ -818,6 +829,7 @@ impl<'a> PickleVm<'a> {
                         reason: "BINBYTES length overflow".into(),
                     })?;
                     let bytes = self.read_bytes(len)?;
+                    // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
                     self.stack.push(PickleValue::Bytes(bytes.to_vec()));
                 }
                 // SHORT_BINBYTES (1-byte length, protocol 3+)
@@ -825,6 +837,7 @@ impl<'a> PickleVm<'a> {
                     let n = self.read_u8()?;
                     // CAST: u8 → usize, lossless
                     let bytes = self.read_bytes(usize::from(n))?;
+                    // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
                     self.stack.push(PickleValue::Bytes(bytes.to_vec()));
                 }
 
@@ -938,7 +951,9 @@ impl<'a> PickleVm<'a> {
 
                 // GLOBAL (text mode: "module\nname\n")
                 b'c' => {
+                    // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
                     let module = self.read_line()?.to_owned();
+                    // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
                     let name = self.read_line()?.to_owned();
                     if !is_allowed_global(&module, &name) {
                         return Err(AnamnesisError::Parse {
@@ -973,7 +988,9 @@ impl<'a> PickleVm<'a> {
                         });
                     }
                     self.stack.push(PickleValue::Global {
+                        // BORROW: .to_owned() converts &str to owned String
                         module: module.to_owned(),
+                        // BORROW: .to_owned() converts &str to owned String
                         name: name.to_owned(),
                     });
                 }
@@ -1205,6 +1222,12 @@ fn tuple_to_usize_vec(val: &PickleValue) -> crate::Result<Vec<usize>> {
 ///
 /// Expected args tuple:
 /// `(PersistentId(storage_info), offset, shape, strides, requires_grad, metadata)`
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `args` is not a 6-element `Tuple`,
+/// if the storage info is malformed, or if shape/strides/offset values
+/// cannot be extracted as valid dimensions.
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
 #[allow(clippy::wildcard_enum_match_arm)]
 fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef> {
@@ -1450,6 +1473,12 @@ fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
 /// maximum reachable source byte offset **once** before the loop, then
 /// use plain arithmetic inside. The output buffer is pre-allocated to
 /// the exact size, so destination writes are also bounds-safe.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if element count or byte count
+/// overflows `usize`, if the maximum stride offset overflows, or if the
+/// source data range exceeds the storage slice.
 fn copy_to_contiguous(
     storage: &[u8],
     offset: usize,
@@ -1511,6 +1540,9 @@ fn copy_to_contiguous(
     let ndim = shape.len();
     let mut coords = vec![0usize; ndim];
 
+    // VECTORIZED: scalar fallback — per-element coordinate tracking (coords[]
+    // update) introduces cross-iteration state that prevents auto-vectorization.
+    // Non-contiguous tensors are rare in practice (<0.1% of state_dict files).
     for flat_idx in 0..n_elements {
         // Compute source element offset from strides and coordinates.
         // All values are bounded by the pre-validation above.
@@ -1702,6 +1734,12 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 ///
 /// Only indexes STORED entries (uncompressed). The suffix is the part after
 /// the archive prefix (e.g., `"data.pkl"`, `"data/0"`, `"byteorder"`).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if a ZIP entry cannot be read,
+/// `data_start` or `size` overflows `usize`, or the entry's byte range
+/// exceeds the file size.
 fn build_entry_index(
     archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     raw: &[u8],
@@ -1755,6 +1793,7 @@ fn build_entry_index(
         // EXPLICIT: '/' is always byte 0x2F in UTF-8, so pos+1 is a valid
         // char boundary. unwrap_or(&full_name) is a defensive fallback for
         // non-ASCII names (impossible in PyTorch archives, but safe).
+        // BORROW: .as_str() explicit String → &str; .to_owned() converts &str → owned String
         let suffix = full_name
             .find('/')
             .map_or(full_name.as_str(), |pos| {
