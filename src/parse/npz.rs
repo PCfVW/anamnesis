@@ -1025,6 +1025,11 @@ mod tests {
         }
         let result = parse_npz(tmp.path()).unwrap();
         assert!(result.is_empty(), "empty NPZ should return empty map");
+
+        // NN4: also verify inspect_npz handles empty archives
+        let info = inspect_npz(tmp.path()).unwrap();
+        assert!(info.tensors.is_empty());
+        assert_eq!(info.total_bytes, 0);
     }
 
     // G35: Native-endian '=' prefix in parse_descr

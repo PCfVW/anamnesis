@@ -1316,6 +1316,16 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
     let shape = tuple_to_usize_vec(it2)?;
     let strides = tuple_to_usize_vec(it3)?;
 
+    if shape.len() != strides.len() {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "tensor `{name}`: shape ndim {} != strides ndim {}",
+                shape.len(),
+                strides.len()
+            ),
+        });
+    }
+
     Ok(TensorRef {
         // BORROW: owned copy — TensorRef outlives the PickleValue borrow
         name: name.to_owned(),
@@ -1476,9 +1486,10 @@ fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if element count or byte count
-/// overflows `usize`, if the maximum stride offset overflows, or if the
-/// source data range exceeds the storage slice.
+/// Returns [`AnamnesisError::Parse`] if shape and strides have different
+/// lengths, element count or byte count overflows `usize`, if the maximum
+/// stride offset overflows, or if the source data range exceeds the
+/// storage slice.
 fn copy_to_contiguous(
     storage: &[u8],
     offset: usize,
@@ -1486,6 +1497,16 @@ fn copy_to_contiguous(
     strides: &[usize],
     elem_size: usize,
 ) -> crate::Result<Vec<u8>> {
+    if shape.len() != strides.len() {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "shape ndim {} != strides ndim {}",
+                shape.len(),
+                strides.len()
+            ),
+        });
+    }
+
     let n_elements: usize = shape
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
@@ -1556,18 +1577,9 @@ fn copy_to_contiguous(
 
         // INDEX: src_byte + elem_size ≤ max_src_end ≤ storage.len(),
         // validated before the loop. dst_byte + elem_size ≤ out_bytes = out.len().
-        out.get_mut(dst_byte..dst_byte + elem_size)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "destination write out of bounds".into(),
-            })?
-            .copy_from_slice(storage.get(src_byte..src_byte + elem_size).ok_or_else(|| {
-                AnamnesisError::Parse {
-                    reason: format!(
-                        "storage read out of bounds at [{src_byte}..{}]",
-                        src_byte + elem_size
-                    ),
-                }
-            })?);
+        #[allow(clippy::indexing_slicing)]
+        out[dst_byte..dst_byte + elem_size]
+            .copy_from_slice(&storage[src_byte..src_byte + elem_size]);
 
         // Increment coordinates (rightmost dimension first).
         // EXPLICIT: manual coordinate increment; iterator-based
@@ -2361,7 +2373,9 @@ mod tests {
     // G25: MAX_PICKLE_NESTING enforcement
     #[test]
     fn unwrap_to_rebuild_rejects_deep_nesting() {
-        // Construct a value nested 33 levels deep — exceeds MAX_PICKLE_NESTING (32)
+        // Pass depth = 33 (> MAX_PICKLE_NESTING) to trigger the guard on entry.
+        // The guard fires immediately without actual recursion — it checks
+        // depth before inspecting the value.
         let leaf = PickleValue::Int(0);
         let result = unwrap_to_rebuild(&leaf, MAX_PICKLE_NESTING + 1);
         assert!(result.is_none(), "should reject nesting beyond limit");
@@ -2515,10 +2529,11 @@ mod tests {
     }
 
     // G21: Zero-element tensor (shape [0, 4])
-    // copy_to_contiguous uses dim.checked_sub(1) for max offset calculation,
-    // which returns None for dim=0. This correctly produces an error —
-    // zero-element tensors are handled at the caller level (n_elements=0
-    // → n_bytes=0 → empty slice), never reaching copy_to_contiguous.
+    // This test exercises copy_to_contiguous directly with a zero-sized
+    // dimension. In the non-contiguous path, dim=0 triggers the checked_sub(1)
+    // error in the max_elem_offset calculation. (In the contiguous path,
+    // n_elements=0 produces a zero-byte slice before copy_to_contiguous
+    // is ever called.)
     #[test]
     fn copy_to_contiguous_zero_elements_errors() {
         let storage = vec![0u8; 16];
@@ -2573,6 +2588,19 @@ mod tests {
     fn is_contiguous_mismatched_dims() {
         // 3D shape with 2D strides — should not be contiguous
         assert!(!is_contiguous(&[2, 3, 4], &[12, 4]));
+    }
+
+    // NI1: copy_to_contiguous rejects mismatched shape/strides lengths
+    #[test]
+    fn copy_to_contiguous_mismatched_ndim() {
+        let storage = vec![0u8; 96]; // 24 f32 values
+        let result = copy_to_contiguous(&storage, 0, &[2, 3, 4], &[12, 4], 4);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ndim"),
+            "expected ndim mismatch error, got: {msg}"
+        );
     }
 
     // G27: Zero-stride dimension (broadcast)
