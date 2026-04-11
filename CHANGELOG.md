@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-house parser for `GGUF` v2 and v3 files. Reads header, metadata
   key-value pairs (all 13 value types including nested `ARRAY`), and tensor
   info table. Resolves absolute tensor-data offsets from the tensor-info
-  table's relative offsets plus the effective `general.alignment` (defaultLet's 
+  table's relative offsets plus the effective `general.alignment` (default
   32 bytes). `ParsedGguf::tensors` returns zero-copy `Cow::Borrowed` slices
   into the memory-mapped file for every dtype with a known `type_size`
   (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`, `Q4_0`–`Q8_1`, `Q2_K`–`Q8_K`).
@@ -71,9 +71,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed arrays (`Vec<u8>`, `Vec<f32>`, `Vec<String>`, …). Replaces the old
   `GgufMetadataValue::Array(Vec<GgufMetadataValue>)` storage to eliminate
   the ~8× enum-discriminant bloat on homogeneous numeric metadata arrays.
-
-### Changed
-
 - **`ParsedGguf::tensors` returns `impl Iterator<Item = GgufTensor<'_>>`**
   instead of `Result<Vec<GgufTensor<'_>>>` — zero heap allocation per call.
   `GgufTensor::{name, shape}` now borrow from the parsed handle as
@@ -115,6 +112,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data_section_start` is known. Peak tensor-info heap on a 1 M-tensor
   file drops by ~60 MB; `RawTensorInfo` and `read_raw_tensor_info` are
   deleted.
+
+### Fixed
+
+- **`parse_gguf` accepted tensors whose relative offset was not a
+  multiple of `general.alignment`** (Phase 4 audit I1). The GGUF spec
+  mandates that every tensor's offset field is a multiple of the file's
+  declared alignment, but the patch sweep only checked the upper bound
+  of each tensor's byte range. A malformed file encoding
+  `relative_offset = 1` for every tensor would parse successfully and
+  hand out unaligned byte slices through `ParsedGguf::tensors`, which
+  downstream SIMD dequant kernels would then reinterpret as `f32`/`f16`
+  words — unaligned access is undefined behaviour in the `unsafe`
+  intrinsics planned for Phase 9. `parse_gguf` now rejects such files
+  with `AnamnesisError::Parse` naming the offending tensor.
 
 ## [0.3.2] - 2026-04-05
 

@@ -1615,6 +1615,20 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
     // offsets and run the bounds checks that couldn't happen at read time.
     for info in &mut tensor_infos {
         let relative_offset = info.data_offset;
+        // The GGUF spec mandates that every tensor's offset field is a
+        // multiple of `general.alignment`. `data_section_start` is itself
+        // aligned (via `align_up` above), so checking the relative offset
+        // is equivalent to checking the absolute offset and catches
+        // adversarial files that would hand out unaligned byte slices to
+        // SIMD dequant kernels downstream.
+        if relative_offset % alignment_u64 != 0 {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "GGUF tensor `{}`: relative offset {relative_offset} is not a multiple of alignment {alignment_u64}",
+                    info.name
+                ),
+            });
+        }
         let absolute = data_section_start
             .checked_add(relative_offset)
             .ok_or_else(|| AnamnesisError::Parse {
@@ -2175,6 +2189,50 @@ mod tests {
         let tmp = write_temp_gguf(&b.finish());
         let err = parse_gguf(tmp.path()).unwrap_err();
         assert!(matches!(err, AnamnesisError::Parse { .. }));
+    }
+
+    #[test]
+    fn reject_unaligned_relative_offset() {
+        // The GGUF spec mandates each tensor's offset field is a multiple
+        // of `general.alignment`. A well-formed file with `alignment = 32`
+        // and a tensor at `relative_offset = 1` must be rejected, because
+        // downstream consumers would get unaligned byte slices.
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3);
+        b.push_u64(1);
+        b.push_u64(0);
+        // F32 [1] — 4 bytes — at relative offset 1 (not a multiple of 32).
+        b.push_tensor_info("misaligned", &[1], 0, 1);
+        b.pad_to_alignment(32);
+        // Enough data so the trailing bounds check cannot mask the
+        // alignment check — we need to verify the alignment check is the
+        // one that fires, not the "exceeds file size" check.
+        b.push_bytes(&[0u8; 64]);
+        let tmp = write_temp_gguf(&b.finish());
+        let err = parse_gguf(tmp.path()).unwrap_err();
+        match err {
+            AnamnesisError::Parse { reason } => {
+                assert!(
+                    reason.contains("not a multiple of alignment"),
+                    "expected alignment error, got: {reason}"
+                );
+                assert!(reason.contains("misaligned"), "got: {reason}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_aligned_nonzero_relative_offset() {
+        // Regression guard for the alignment check: a legitimate tensor at
+        // a non-zero but aligned relative offset (e.g., second tensor in a
+        // file, sitting at relative offset 32) must still parse cleanly.
+        let bytes = build_minimal_gguf();
+        let parsed = parse_gguf(write_temp_gguf(&bytes).path()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        // tensor.b is at relative offset 32 in the fixture — aligned to 32.
+        assert_eq!(parsed.tensor_info()[1].name, "tensor.b");
     }
 
     #[test]
