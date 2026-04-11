@@ -28,7 +28,7 @@ pub use fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
 #[cfg(feature = "gguf")]
-pub use gguf::dequantize_gguf_to_bf16;
+pub use gguf::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
 #[cfg(feature = "gptq")]
 pub use gptq::dequantize_gptq_to_bf16;
 #[cfg(feature = "pth")]

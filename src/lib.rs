@@ -97,8 +97,6 @@ pub use parse::{
 };
 #[cfg(feature = "awq")]
 pub use remember::dequantize_awq_to_bf16;
-#[cfg(feature = "gguf")]
-pub use remember::dequantize_gguf_to_bf16;
 #[cfg(feature = "gptq")]
 pub use remember::dequantize_gptq_to_bf16;
 #[cfg(feature = "pth")]
@@ -108,3 +106,5 @@ pub use remember::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
 pub use remember::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
+#[cfg(feature = "gguf")]
+pub use remember::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};

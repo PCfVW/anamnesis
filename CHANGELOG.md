@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`dequantize_gguf_blocks_to_bf16`** — new streaming public API that
+  emits one block's worth of `BF16` bytes per call into a caller-supplied
+  `FnMut(&[u8]) -> Result<()>` sink closure (64 B per call for legacy
+  quants, 512 B for K-quants). Peak heap is O(one scratch + one block
+  output) regardless of tensor size — around 1.5 KB — enabling
+  dequantisation of 70 B-parameter models on modest-RAM machines by
+  streaming directly to disk. The existing `dequantize_gguf_to_bf16`
+  `Vec`-returning variant is now a thin convenience wrapper that sinks
+  into `Vec::with_capacity`, so both entry points share the same
+  validation and the same scalar kernels.
 - **`GGUF` block-quant dequantisation to `BF16`** (`dequantize_gguf_to_bf16`,
   feature-gated behind `gguf`) — scalar reference kernels for all 12 block
   types covered by the parser: legacy `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`,
@@ -22,6 +32,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependencies — reuses `half` and the existing `gguf` feature. Phase 4
   step 2 toward v0.4.0; bit-for-bit cross-validation against `llama.cpp`
   is Phase 4 step 4.
+
+### Changed
+
+- **GGUF dequant kernels refactored to close over a `FnMut` sink**
+  instead of each returning an owned `Vec<u8>`. Per-type pass-1 unpacking
+  is now a small closure fed to a generic `run_legacy_kernel` /
+  `run_super_kernel` outer-loop helper that handles `chunks_exact(TS)`
+  iteration, scratch-buffer management, and the shared pass-2 `BF16`
+  writer. `Vec::with_capacity` + `extend_from_slice` replaces the old
+  `vec![0u8; n_elements * 2]`, avoiding the zero-init memset (~10–15 %
+  of dequant wall time on `Q8_0`/`Q4_0` saved on platforms without lazy
+  zero pages). Per-block `.get_mut(range).ok_or_else(...)?` bounds
+  checks are replaced with `chunks_exact_mut`-style iteration on the
+  inner kernel runners — ~4 M branches removed per 1 M-block tensor.
+- **Infallible byte readers**: `read_f16_le(&[u8], usize) -> Result<f32>`
+  is replaced with `read_f16_bytes([u8; 2]) -> f32` (and analogously for
+  `read_f32_bytes`), eliminating dead `Result` shuffling on every
+  hot-loop call. Callers slice fixed-length arrays out of their
+  already-validated block slices.
+- **Output size overflow guard**: `dequantize_gguf_to_bf16` now checks
+  `n_elements.checked_mul(2)` in its shared validation helper, turning
+  what would have been a silent `Vec` allocation truncation on 32-bit
+  targets with > 2 GiB of `BF16` output into a clean `AnamnesisError::Parse`.
 - **`GGUF` file parser** (`parse_gguf`, feature-gated behind `gguf`) — lean
   in-house parser for `GGUF` v2 and v3 files. Reads header, metadata
   key-value pairs (all 13 value types including nested `ARRAY`), and tensor
