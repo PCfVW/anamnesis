@@ -9,11 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GGUF` block-quant dequantisation to `BF16`** (`dequantize_gguf_to_bf16`,
+  feature-gated behind `gguf`) — scalar reference kernels for all 12 block
+  types covered by the parser: legacy `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`,
+  `Q8_1` (32-element blocks) and K-quants `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
+  `Q6_K`, `Q8_K` (256-element super-blocks). Formulas ported verbatim from
+  `ggml-quants.c`'s `dequantize_row_*` reference functions, with
+  block-at-a-time loop fission (packed-bit unpacking into an `[f32; QK]`
+  stack scratch buffer, then a branch-free `f32 × scale → BF16` pass via
+  the shared `f32_bits_to_bf16_bits` helper). `IQ*`/`TQ*`/`MXFP4` return
+  `AnamnesisError::Unsupported` (deferred to a later phase). No new crate
+  dependencies — reuses `half` and the existing `gguf` feature. Phase 4
+  step 2 toward v0.4.0; bit-for-bit cross-validation against `llama.cpp`
+  is Phase 4 step 4.
 - **`GGUF` file parser** (`parse_gguf`, feature-gated behind `gguf`) — lean
   in-house parser for `GGUF` v2 and v3 files. Reads header, metadata
   key-value pairs (all 13 value types including nested `ARRAY`), and tensor
   info table. Resolves absolute tensor-data offsets from the tensor-info
-  table's relative offsets plus the effective `general.alignment` (default
+  table's relative offsets plus the effective `general.alignment` (defaultLet's 
   32 bytes). `ParsedGguf::tensors` returns zero-copy `Cow::Borrowed` slices
   into the memory-mapped file for every dtype with a known `type_size`
   (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`, `Q4_0`–`Q8_1`, `Q2_K`–`Q8_K`).

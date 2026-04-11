@@ -97,6 +97,8 @@ pub use parse::{
 };
 #[cfg(feature = "awq")]
 pub use remember::dequantize_awq_to_bf16;
+#[cfg(feature = "gguf")]
+pub use remember::dequantize_gguf_to_bf16;
 #[cfg(feature = "gptq")]
 pub use remember::dequantize_gptq_to_bf16;
 #[cfg(feature = "pth")]
