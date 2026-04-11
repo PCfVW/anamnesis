@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated April 5, 2026)
-**Status:** Phases 1–3.5 complete (v0.3.1 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing. Next: Phase 4 (GGUF).
+**Date:** March 20, 2026 (updated April 11, 2026)
+**Status:** Phases 1–3.5 complete (v0.3.2 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing. **Phase 4 in progress:** parser + 12 block-quant dequant kernels (both legacy `Q4_0`–`Q8_1` and K-quants `Q2_K`–`Q8_K`) committed, streaming + Vec APIs shipped. Next: cross-validation against `llama.cpp` reference output, then `v0.4.0` tag.
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -270,24 +270,37 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 ### Phase 4: GGUF Parsing & Dequantization
 
+**Status:** Parser + all 12 block-quant dequantisation kernels + streaming API committed (`2acaf1a`, `cc4ecf8`, `b6610fe`, `3156104`). Cross-validation against `llama.cpp` + `v0.4.0` tag still pending.
+
 **Goal:** Add support for GGUF, the dominant format for local inference (~166,000 models on HuggingFace as of March 2026). GGUF is to llama.cpp/Ollama/LM Studio what safetensors is to HuggingFace Transformers. No standalone, framework-agnostic Rust crate exists for GGUF dequantization — candle-core has GGUF support but it is tightly coupled to candle's tensor types and inference pipeline.
 
-**Approach:** Parse GGUF metadata and tensor layout. Dequantize K-quant types (Q2_K through Q8_K) and legacy types (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0) to BF16 using the same loop-fission + auto-vectorization strategy as GPTQ/AWQ/BnB. Feature-gated behind `gguf`.
+**Approach:** Parse GGUF metadata and tensor layout. Dequantize K-quant types (`Q2_K`–`Q8_K`) and legacy types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`) to BF16 using the same loop-fission + auto-vectorization strategy as GPTQ/AWQ/BnB. Feature-gated behind `gguf`.
 
-**Key projects to study:**
-- **candle-core `quantized`** (`k_quants.rs`) — clean K-quant dequantization algorithms, the math reference
-- **gguf-rs-lib** — pure safe Rust GGUF reader/writer, potential parsing dependency (4.8K downloads, active)
-- **llama-gguf (Lexmata)** — pure Rust reimplementation of llama.cpp with GPU dequant kernels
+**Key projects studied:**
+- **ggml-org/ggml** (`src/ggml-common.h`, `src/ggml-quants.c`) — canonical block struct layouts with `_Static_assert` byte counts and scalar `dequantize_row_*` reference implementations. **Used as the ground truth for every kernel in this phase** (ported verbatim with CONVENTIONS annotations applied).
+- **candle-core `quantized`** (`k_quants.rs`) — secondary math reference for K-quants; not depended on.
+- **gguf-rs-lib** — considered as a parsing dependency but rejected in favour of a lean in-house parser (matches the `.npy` and `.pth` pattern, keeps all error paths inside `AnamnesisError`).
+- **llama-gguf (Lexmata)** — pure Rust reimplementation of llama.cpp with GPU dequant kernels; not used.
 
-- [ ] GGUF file parser (`src/parse/gguf.rs`) — header, metadata key-value pairs, tensor info table (name, shape, dtype, offset). Evaluate whether to depend on `gguf-rs-lib` or write a lean parser — **commit**
-- [ ] K-quant dequantization (`src/remember/gguf.rs`) — Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. Each type has a block structure with scales, mins, and packed quantized values. Loop fission: pass 1 unpacks block structure → f32 scratch, pass 2 applies scales → BF16 — **commit**
-- [ ] Legacy quant types — Q4_0, Q4_1, Q5_0, Q5_1, Q8_0. Simpler block layouts (single scale + optional min per block) — **commit**
-- [ ] Feature-gated behind `gguf` feature — **commit**
-- [ ] Cross-validation against llama.cpp reference dequantization on real GGUF models — **commit** — **PUSH**
+- [x] **GGUF file parser** (`src/parse/gguf.rs`, commit `2acaf1a`) — lean in-house parser for `GGUF` v2 and v3. Memory-mapped via `memmap2` (reused from `pth`), returns `Cow::Borrowed` tensor views with zero per-tensor heap allocation. Reads header, metadata KV pairs (all 13 value types including nested `ARRAY`), and the tensor info table; resolves absolute tensor-data offsets from the `general.alignment` metadata key (default 32 B). Adversarial-input DoS guards on tensor count (1 M), KV count (1 M), string length (16 MiB), array length (16 M), array nesting depth (4), tensor dimensions (8), and element product (1 T). Public types: `GgufType`, `GgufMetadataValue`, `GgufMetadataArray`, `GgufTensor`, `GgufTensorInfo`, `GgufInspectInfo`, `ParsedGguf`. **21 unit tests.** **commit**
+- [x] **K-quant dequantization** (`src/remember/gguf.rs`, commit `cc4ecf8`) — scalar reference kernels for `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` (256-element super-blocks). Each block is processed with two-pass loop fission: pass 1 unpacks the packed-bit storage into an `[f32; 256]` stack scratch buffer (L1-resident), pass 2 walks the scratch and emits `BF16` bytes via the shared `f32_bits_to_bf16_bits` helper from `remember::fp8`. `get_scale_min_k4` (Q4_K/Q5_K's 6-bit packed-scale extractor) and `q3_k_unpack_scales` (Q3_K's `kmask1`/`kmask2` permute) are ported verbatim as private `#[inline]` helpers with their own unit tests — the two most error-prone bit-packing pieces are verifiable in isolation. **commit**
+- [x] **Legacy quant types** (`src/remember/gguf.rs`, commit `cc4ecf8`) — scalar kernels for `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` (32-element blocks). `Q8_1` is a trivial variant of `Q8_0` (same `d * qs[j]` formula; the auxiliary `d × Σ qs` field is ignored for reconstruction). Landed together with the K-quants in a single commit — the loop-fission template is identical; only the per-type pass-1 unpack differs. **commit**
+- [x] **Streaming dequant API** (`dequantize_gguf_blocks_to_bf16`, commit `b6610fe`) — `FnMut(&[u8]) -> Result<()>` sink closure receives one block's worth of `BF16` bytes at a time (64 B legacy, 512 B K-quant). Peak heap is O(one scratch + one block buffer) ≈ 1.5 KB, independent of tensor size — enabling dequantisation of 70 B-parameter models on modest-RAM machines by streaming directly to disk. The `Vec`-returning `dequantize_gguf_to_bf16` is now a thin wrapper around the streaming variant; both entry points share the same validation and the same scalar kernels via a generic `run_legacy_kernel` / `run_super_kernel` outer-loop helper.
+- [x] **Algorithmic audit fixes + consistency pass** (commits `b6610fe`, `3156104`) — `Vec::with_capacity` + `extend_from_slice` instead of `vec![0u8; n]` (no zero-init memset); `chunks_exact` outer loop eliminates per-block bounds checks; infallible `read_f16_bytes([u8; 2]) -> f32` / `read_f32_bytes([u8; 4]) -> f32` replace the old `Result`-returning readers; `n_elements.checked_mul(2)` overflow guard catches 32-bit targets with > 2 GiB of `BF16` output; `read_scales12` helper deduplicates the 12-byte packed-scale load across Q3_K/Q4_K/Q5_K. **30 unit tests** after the refactor.
+- [x] **Feature-gated behind `gguf` feature** — added in commit `2acaf1a` as part of the parser commit (`gguf = ["dep:memmap2"]` in `Cargo.toml`). Reuses `memmap2` (already a `pth` dep) and `half` (already mandatory). No new third-party crate in any Phase 4 commit.
+- [ ] **Cross-validation against `llama.cpp` reference dequantization** on real GGUF models — pick a small model (e.g., `TinyLlama-1.1B-Q4_K_M`), run `llama.cpp`'s `quantize --inspect` or a purpose-built C harness to dump golden dequant output per tensor, then assert bit-exactness against anamnesis output across all 12 block types. Required to graduate from "scalar reference ported from ggml" to "proven equivalent to the ground truth". — **commit** — **PUSH + tag `v0.4.0`**
 
-**Deliverable:** `anamnesis` v0.4.0 — GGUF parsing + dequantization works. anamnesis becomes the only Rust crate that can parse *both* safetensors-based (GPTQ/AWQ/BnB/FP8) and GGUF-based quantized models and dequantize everything to BF16. — **PUSH + tag `v0.4.0`**
+**Known follow-ups (deferred out of v0.4.0 scope):**
 
-**New dependencies:** Possibly `gguf-rs-lib` for parsing (TBD — may write own lean parser instead). Feature-gated behind `gguf`.
+- **`IQ*` / `TQ*` / `MXFP4` dequant kernels** — recognised by the parser with `byte_len = None`, rejected by the dispatcher with `Unsupported`. Each family has its own block struct layout in `ggml-common.h` that would need porting. Not blocking v0.4.0 because no mainstream model relies on them yet.
+- **Big-endian GGUF v3 support** — the parser detects byte-swapped magic and returns a clear `Unsupported` error; a reader rewrite can reuse `parse::utils::byteswap_inplace`.
+- **AVX2 `f32x8 → bf16x8` pass-2 SIMD** — would give a ~4-8× speedup on pass 2 (~40-60% of total dequant time) but requires a `simd` feature, a new `remember::simd` module, an entry in the CONVENTIONS accepted-unsafe table, and runtime `is_x86_feature_detected!` dispatch. Flagged as a `TODO(phase4-followup)` comment on `write_scratch_to_bf16`.
+- **GGUF CLI subcommands** — `amn parse model.gguf`, `amn inspect model.gguf`, `amn remember model.gguf --to bf16`. The library API is ready; CLI wiring in `src/bin/main.rs` is a small follow-up.
+- **`ParsedGguf::dequantize_tensor(&self, info: &GgufTensorInfo)` convenience method** — users can call `dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, tensor.shape.iter().product())` directly; a wrapper method can land if real callers would benefit.
+
+**Deliverable:** `anamnesis` v0.4.0 — GGUF parsing + dequantization works end-to-end with bit-exact `llama.cpp`-validated output. anamnesis becomes the only Rust crate that can parse *both* safetensors-based (GPTQ/AWQ/BnB/FP8) and GGUF-based quantized models and dequantize everything to BF16. — **PUSH + tag `v0.4.0`**
+
+**New dependencies:** None. The `gguf` feature pulls in `memmap2` (already used by `pth`) and relies on `half` (already mandatory). No third-party GGUF parser in the dependency tree.
 
 ### Phase 5: Quantization (Lethe)
 
