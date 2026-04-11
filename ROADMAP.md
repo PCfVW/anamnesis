@@ -24,10 +24,12 @@
   - [Phase 3: NPZ/NPY Parsing](#phase-3-npznpy-parsing)
   - [Phase 3.5: PyTorch `.pth` Parsing](#phase-35-pytorch-pth-parsing)
   - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
+  - [Phase 4.5: GGUF Completeness](#phase-45-gguf-completeness)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Python Bindings (PyO3)](#phase-6-python-bindings-pyo3)
   - [Phase 7: Format Conversion Matrix](#phase-7-format-conversion-matrix)
   - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
+  - [Phase 9: CPU SIMD Pass](#phase-9-cpu-simd-pass)
   - [Future Directions](#future-directions)
 - [4. Key Design Decisions](#4-key-design-decisions)
 - [5. Relationship to Other Projects](#5-relationship-to-other-projects)
@@ -290,17 +292,36 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [x] **Feature-gated behind `gguf` feature** — added in commit `2acaf1a` as part of the parser commit (`gguf = ["dep:memmap2"]` in `Cargo.toml`). Reuses `memmap2` (already a `pth` dep) and `half` (already mandatory). No new third-party crate in any Phase 4 commit.
 - [ ] **Cross-validation against `llama.cpp` reference dequantization** on real GGUF models — pick a small model (e.g., `TinyLlama-1.1B-Q4_K_M`), run `llama.cpp`'s `quantize --inspect` or a purpose-built C harness to dump golden dequant output per tensor, then assert bit-exactness against anamnesis output across all 12 block types. Required to graduate from "scalar reference ported from ggml" to "proven equivalent to the ground truth". — **commit** — **PUSH + tag `v0.4.0`**
 
-**Known follow-ups (deferred out of v0.4.0 scope):**
-
-- **`IQ*` / `TQ*` / `MXFP4` dequant kernels** — recognised by the parser with `byte_len = None`, rejected by the dispatcher with `Unsupported`. Each family has its own block struct layout in `ggml-common.h` that would need porting. Not blocking v0.4.0 because no mainstream model relies on them yet.
-- **Big-endian GGUF v3 support** — the parser detects byte-swapped magic and returns a clear `Unsupported` error; a reader rewrite can reuse `parse::utils::byteswap_inplace`.
-- **AVX2 `f32x8 → bf16x8` pass-2 SIMD** — would give a ~4-8× speedup on pass 2 (~40-60% of total dequant time) but requires a `simd` feature, a new `remember::simd` module, an entry in the CONVENTIONS accepted-unsafe table, and runtime `is_x86_feature_detected!` dispatch. Flagged as a `TODO(phase4-followup)` comment on `write_scratch_to_bf16`.
-- **GGUF CLI subcommands** — `amn parse model.gguf`, `amn inspect model.gguf`, `amn remember model.gguf --to bf16`. The library API is ready; CLI wiring in `src/bin/main.rs` is a small follow-up.
-- **`ParsedGguf::dequantize_tensor(&self, info: &GgufTensorInfo)` convenience method** — users can call `dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, tensor.shape.iter().product())` directly; a wrapper method can land if real callers would benefit.
+**Deferred follow-ups:** every out-of-scope item is rehomed to **Phase 4.5: GGUF Completeness** (`IQ*`/`TQ*`/`MXFP4` kernels, GGUF CLI subcommands, `ParsedGguf::dequantize_tensor` convenience method — all targeting `v0.4.1`) and **Phase 9: CPU SIMD Pass** (cross-format AVX2/NEON pass-2 SIMD). Big-endian GGUF v3 support has no committed target — the parser detects byte-swapped magic and returns a clear `Unsupported` error, which is enough until a real big-endian model ships.
 
 **Deliverable:** `anamnesis` v0.4.0 — GGUF parsing + dequantization works end-to-end with bit-exact `llama.cpp`-validated output. anamnesis becomes the only Rust crate that can parse *both* safetensors-based (GPTQ/AWQ/BnB/FP8) and GGUF-based quantized models and dequantize everything to BF16. — **PUSH + tag `v0.4.0`**
 
 **New dependencies:** None. The `gguf` feature pulls in `memmap2` (already used by `pth`) and relies on `half` (already mandatory). No third-party GGUF parser in the dependency tree.
+
+### Phase 4.5: GGUF Completeness
+
+**Goal:** Close the last remaining coverage gap in GGUF dequantisation so that anamnesis can handle every GGUF block type shipping on HuggingFace today. `v0.4.0` covers the 12 block types that back most mainstream models (`Q4_0`–`Q8_1`, `Q2_K`–`Q8_K`), but a growing fraction of 2025–2026 GGUF uploads use the newer `IQ*` family — `IQ4_XS` in particular has become a common "small but accurate" quant for many Llama 3, Qwen 2.5, and Mistral Nemo variants — plus a handful of models ship `TQ*` or `MXFP4`. Without those kernels, anamnesis rejects real files with `AnamnesisError::Unsupported`. Phase 4.5 also lands the user-facing polish (CLI subcommands + a `ParsedGguf::dequantize_tensor` convenience method) that was deliberately deferred from Phase 4.
+
+**Approach:** Port the scalar `dequantize_row_*` reference functions for the remaining block types from `ggml-quants.c` using the same loop-fission template as Phase 4. Most of the work is verbatim translation of the reference kernels plus verbatim copying of the lattice / codebook constant tables that the `IQ*` family uses (`iq2xxs_grid: [u64; 256]`, `iq3s_grid`, `iq1s_grid`, and siblings). Each variant has a distinct block struct layout documented in `ggml-common.h`; the test playbook is unchanged from Phase 4 — hand-constructed single-block fixtures per type, plus bit-exact cross-validation against `llama.cpp` reference output.
+
+- [ ] **`IQ4_NL` and `IQ4_XS` dequant kernels** — non-linear 4-bit quants (`IQ4_NL` 32-element, `IQ4_XS` 256-element super-block). `IQ4_XS` is the priority: the most widely used member of the `IQ*` family, covering a growing fraction of 2025–2026 HuggingFace uploads. Both use a 16-entry lookup table for the 4-bit non-linear codebook — **commit**
+- [ ] **`IQ2_XXS`, `IQ2_XS`, `IQ2_S` dequant kernels** — 2-bit super-quants with lattice codebook grids (`iq2xxs_grid: [u64; 256]`, `iq2s_grid`). The grids are large constant tables that need porting verbatim from `ggml-quants.c` (~2 KB per grid) — **commit**
+- [ ] **`IQ3_XXS` and `IQ3_S` dequant kernels** — 3-bit variants with their own codebook grids (`iq3xxs_grid`, `iq3s_grid`) — **commit**
+- [ ] **`IQ1_S` and `IQ1_M` dequant kernels** — 1-bit super-quants, smallest footprint in the family. Rarer in practice but completes coverage — **commit**
+- [ ] **`TQ1_0` and `TQ2_0` dequant kernels** — ternary 1-bit and 2-bit packing. Added to `ggml` in 2024; used by a handful of research models — **commit**
+- [ ] **`MXFP4` dequant kernel** — 32-element microscaling FP4 (OCP standard, added to `ggml` in 2024). Distinct from the other `IQ*` / `TQ*` types because it uses standardised IEEE-like sub-block exponents rather than a learned codebook — **commit**
+- [ ] **`ParsedGguf::dequantize_tensor(&self, info: &GgufTensorInfo) -> crate::Result<Vec<u8>>` convenience method** — thin wrapper that infers `n_elements` from `shape.iter().product()` and slices the mmap at `data_offset..data_offset + byte_len` before delegating to `dequantize_gguf_to_bf16`. Saves consumers the three-line boilerplate on every tensor iteration — **commit**
+- [ ] **GGUF CLI subcommands** — extend `src/bin/main.rs` format detection to recognise the `"GGUF"` magic and add `amn parse model.gguf`, `amn inspect model.gguf`, and `amn remember model.gguf --to bf16 -o out.safetensors`. The library API from Phase 4 is already CLI-ready; only dispatch wiring is needed — **commit**
+- [ ] **Cross-validation extension** — add `IQ*` / `TQ*` / `MXFP4` reference outputs to the Phase 4 step 4 `llama.cpp` cross-validation harness. Same bit-exactness requirement as the Phase 4 kernels — **commit** — **PUSH + tag `v0.4.1`**
+
+**Deliverable:** `anamnesis` v0.4.1 — anamnesis now dequantises every GGUF block type shipping on HuggingFace, and the GGUF CLI subcommands let users exercise the whole pipeline from the command line without writing Rust. `IQ*`/`TQ*`/`MXFP4` are the last meaningful coverage gap; after this release anamnesis is a drop-in replacement for `llama.cpp`'s CPU dequant path. — **PUSH + tag `v0.4.1`**
+
+**New dependencies:** None. Reuses the `gguf` feature gate, `memmap2`, and `half` from Phase 4.
+
+**Explicitly out of scope:**
+
+- **Big-endian GGUF v3 support** — the parser detects byte-swapped magic and returns `Unsupported`. A reader rewrite can reuse `parse::utils::byteswap_inplace` if demand ever materialises, but no mainstream model is distributed big-endian today. No committed target.
+- **CPU SIMD optimisation of pass 2** — cross-cutting optimisation that would benefit FP8, GPTQ, AWQ, and BnB equally, not just GGUF. See [Phase 9: CPU SIMD Pass](#phase-9-cpu-simd-pass).
 
 ### Phase 5: Quantization (Lethe)
 
@@ -373,6 +394,34 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Deliverable:** `anamnesis` v0.8.0 — emerging format coverage. — **PUSH + tag `v0.8.0`**
 
+### Phase 9: CPU SIMD Pass
+
+**Goal:** Replace the scalar pass-2 `f32 → BF16` loop in every dequantiser with an explicit AVX2 / NEON vectorised version, giving a 4–8× speedup on the hot path without touching the correctness-verified scalar kernels. This is the first time anamnesis commits to explicit SIMD intrinsics — up to v0.8.0 the project has relied entirely on auto-vectorisation through the loop-fission + `chunks_exact_mut(2)` pattern.
+
+**Why this is a single phase and not per-format work:** Phases 1–4.5 all share the same `f32_bits_to_bf16_bits` pattern (defined once at [src/remember/fp8.rs:101](src/remember/fp8.rs#L101) and reused verbatim by `gptq.rs`, `awq.rs`, `bnb.rs`, and `gguf.rs`). A single `f32x8_to_bf16x8` SIMD helper retrofits every existing dequantiser at once, with one `unsafe` module, one `// SAFETY:` contract, one benchmark harness, and one cross-format round of cross-validation. Splitting the work per format would duplicate the intrinsic surface area across five modules and violate `CONVENTIONS.md`'s "unsafe lives in a single, dedicated module" rule.
+
+**Why now (not earlier):** Auto-vectorisation handles the pass-2 loop reasonably well already — the branch-free `chunks_exact_mut(2)` pattern was chosen specifically to give LLVM a clean target. Phase 9 is triggered when benchmark pressure from real users (enabled by the Phase 6 Python bindings and the Phase 7 format conversion CLI) surfaces kernels where the scalar fallback is a bottleneck. A `TODO(phase4-followup)` comment already sits on [`write_scratch_to_bf16`](src/remember/gguf.rs) flagging the intent.
+
+**Approach:** Add a `simd` feature flag. Under that flag, introduce `src/remember/simd.rs` — a single dedicated module containing `#[target_feature(enable = "avx2")] unsafe fn f32x8_to_bf16x8(...)` and its NEON equivalent. The `write_scratch_to_bf16` helper (currently in `src/remember/gguf.rs` but logically shared across all dequantisers) moves to this module and becomes a runtime dispatcher: `is_x86_feature_detected!("avx2")` → AVX2 path, `std::arch::is_aarch64_feature_detected!("neon")` → NEON path, else fall through to the existing scalar loop. The scalar path stays the canonical correctness reference; the SIMD paths are tested bit-exactly against it via golden-vector cross-checks.
+
+Per [`CONVENTIONS.md`](CONVENTIONS.md)'s accepted-unsafe table, all of the following must hold:
+
+1. `unsafe` lives in a **single, dedicated module** (`src/remember/simd.rs`) — never scattered.
+2. Every `unsafe` block carries a `// SAFETY:` comment documenting the invariants (lane count, alignment, target-feature preconditions).
+3. The module is gated behind `#[cfg(feature = "simd")]` — users who don't enable the feature get `#![forbid(unsafe_code)]` unchanged.
+4. The safe scalar fallback exists and is tested identically to the SIMD path.
+
+- [ ] **`simd` feature flag + `remember::simd` module scaffold** — new `Cargo.toml` entry, `#[cfg(feature = "simd")] pub mod simd;` in `remember/mod.rs`, `cfg_attr(feature = "simd", allow(unsafe_code))` in `lib.rs`, and a new row in the `CONVENTIONS.md` accepted-unsafe table — **commit**
+- [ ] **`f32x8_to_bf16x8` AVX2 intrinsic** — 8-wide round-to-nearest-even `f32 → BF16` lane-for-lane equivalent to the scalar `f32_bits_to_bf16_bits`. Bit-exact against the scalar reference (golden-vector test) — **commit**
+- [ ] **`f32x4_to_bf16x4` NEON intrinsic** — ARM64 equivalent for Apple Silicon and AWS Graviton. Same bit-exactness requirement as the AVX2 path — **commit**
+- [ ] **Runtime dispatch in `write_scratch_to_bf16`** — move the shared helper out of `src/remember/gguf.rs` into `src/remember/simd.rs` (or a new `remember::bf16_writer` shim). Retrofit FP8, GPTQ, AWQ, BnB, and GGUF pass-2 loops to call the shared dispatcher. Delete the per-kernel scalar copies — single source of truth — **commit**
+- [ ] **Criterion bench harness** — benchmarks comparing scalar vs SIMD vs PyTorch CPU on the existing FP8/GPTQ/AWQ/BnB/GGUF cross-validation fixtures. Target: ≥ 4× speedup on `BF16`-writing pass 2 for tensors ≥ 1 MB. Publish the numbers in the crate README — **commit**
+- [ ] **Cross-format correctness sweep** — re-run every Phase 1–4.5 cross-validation test with `--features simd` and assert bit-identical output against the scalar path. No format may regress — **commit** — **PUSH + tag `v0.9.0`**
+
+**Deliverable:** `anamnesis` v0.9.0 — `BF16`-writing pass 2 runs 4–8× faster on AVX2 and NEON CPUs, scalar fallback preserved for `forbid(unsafe_code)` users, with cross-kernel consistency (FP8 / GPTQ / AWQ / BnB / GGUF all benefit from the same single-source-of-truth SIMD helper). — **PUSH + tag `v0.9.0`**
+
+**New dependencies:** None at runtime — uses `std::arch` intrinsics directly. Optional dev-dependency on `criterion` for the bench harness.
+
 ### Future Directions
 
 The following are potential extensions beyond Phase 8, listed for context. They will be promoted to full phases when a concrete need arises.
@@ -381,7 +430,7 @@ The following are potential extensions beyond Phase 8, listed for context. They 
 - **Model surgery** — extract specific layers, merge LoRA adapters with base weights at the file level, split/shard for distributed loading
 - **Quantization quality analysis** — per-layer distortion reports, optimal mixed-precision selection, diff two quantized versions of the same model
 - **WASM target** — compile anamnesis to WASM for browser-based model inspection (drop a safetensors file, see tensor layout and quantization scheme instantly)
-- **GPU-accelerated dequantization** — compute shader (wgpu/Vulkan) kernels for dequantization hot loops, for cases where CPU auto-vectorization is insufficient
+- **GPU-accelerated dequantization** — compute shader (wgpu/Vulkan) kernels for dequantization hot loops, for cases where the Phase 9 CPU SIMD pass is still insufficient (e.g., bulk 70 B-parameter conversions on a workstation with an idle GPU)
 
 ---
 
