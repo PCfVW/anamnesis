@@ -20,6 +20,7 @@ awq = []
 bnb = []
 npz = ["dep:zip"]
 pth = ["dep:zip", "dep:memmap2"]
+gguf = ["dep:memmap2"]
 indicatif = ["dep:indicatif"]
 
 [dependencies]

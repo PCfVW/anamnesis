@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`GGUF` file parser** (`parse_gguf`, feature-gated behind `gguf`) — lean
+  in-house parser for `GGUF` v2 and v3 files. Reads header, metadata
+  key-value pairs (all 13 value types including nested `ARRAY`), and tensor
+  info table. Resolves absolute tensor-data offsets from the tensor-info
+  table's relative offsets plus the effective `general.alignment` (default
+  32 bytes). `ParsedGguf::tensors` returns zero-copy `Cow::Borrowed` slices
+  into the memory-mapped file for every dtype with a known `type_size`
+  (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`, `Q4_0`–`Q8_1`, `Q2_K`–`Q8_K`).
+  `IQ*`/`TQ*`/`MXFP4` tensors are listed in `tensor_info()` with
+  `byte_len = None` and will be sized when dequantisation lands. No new
+  third-party crate — reuses the `memmap2` dependency already pulled in by
+  the `pth` feature. First commit of Phase 4 toward v0.4.0.
+- **`GgufMetadataArray`** — new `#[non_exhaustive]` enum holding natively
+  typed arrays (`Vec<u8>`, `Vec<f32>`, `Vec<String>`, …). Replaces the old
+  `GgufMetadataValue::Array(Vec<GgufMetadataValue>)` storage to eliminate
+  the ~8× enum-discriminant bloat on homogeneous numeric metadata arrays.
+
+### Changed
+
+- **`ParsedGguf::tensors` returns `impl Iterator<Item = GgufTensor<'_>>`**
+  instead of `Result<Vec<GgufTensor<'_>>>` — zero heap allocation per call.
+  `GgufTensor::{name, shape}` now borrow from the parsed handle as
+  `&'a str` / `&'a [usize]` rather than cloning owned `String`/`Vec`.
+  Worst-case allocation dropped from ~130 MB per call on a 1 M-tensor file
+  to 0 MB. Callers needing random access should use `.collect::<Vec<_>>()`.
+- **`GgufMetadataValue::Array` now holds `Box<GgufMetadataArray>`** (was
+  `Vec<GgufMetadataValue>`). `GgufMetadataValue::as_array` now returns
+  `Option<&GgufMetadataArray>`. As a side effect, `GgufMetadataValue`
+  shrinks from 32 bytes to 24 bytes (25% reduction) across every metadata
+  value, not just arrays, because the max-sized variant is now `String`.
+
+### Security / Performance
+
+- **Cap trust-the-header pre-allocation** at `PREALLOC_SOFT_CAP = 256`
+  entries for every `Vec::with_capacity` / `HashMap::with_capacity` call
+  keyed on a file-declared count (metadata kv count, tensor count,
+  per-array length). Previously a ~40-byte adversarial header claiming
+  1 M of each could force ~175 MB of eager heap allocation before a single
+  entry was read (empirically measured: 114 MB `HashMap` + 61 MB
+  `Vec<RawTensorInfo>`); the cap drops this to ~34 KB (5 000× reduction).
+  An adversarial `ARRAY` header claiming 16 M `f32` elements forced
+  ~488 MB of eager allocation; combined with the typed-array fix, this is
+  now capped at ~8 KB (60 000× reduction). Legitimate files grow the
+  containers geometrically and are unaffected.
+- **`Cursor::read_string` validates UTF-8 on the borrowed mmap slice
+  before copying** — an adversarial 16 MiB non-UTF-8 string now costs
+  zero heap allocation on the rejection path (was: a full 16 MiB
+  `to_vec()` followed by `String::from_utf8`).
+- **`ParsedGguf::inspect` dedups distinct dtypes via a `[bool; 32]`
+  bitmap** keyed on a dense `GgufType` discriminant, replacing
+  `Vec::contains` in the per-tensor loop. Drops the dtype-dedup hot path
+  from O(n × d) to O(n) — ~10 ms → ~1 ms on a 1 M-tensor inspect call.
+  First-occurrence order of `GgufInspectInfo::dtypes` is preserved.
+- **`parse_gguf` builds `tensor_infos` in a single pass** instead of
+  first materialising a throwaway `Vec<RawTensorInfo>` and then iterating
+  it. The relative tensor-data offset is stored in `data_offset` during
+  the read pass and patched to the absolute offset in a short sweep once
+  `data_section_start` is known. Peak tensor-info heap on a 1 M-tensor
+  file drops by ~60 MB; `RawTensorInfo` and `read_raw_tensor_info` are
+  deleted.
+
 ## [0.3.2] - 2026-04-05
 
 ### Fixed

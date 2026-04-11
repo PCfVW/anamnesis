@@ -11,10 +11,19 @@ pub mod safetensors;
 #[cfg(feature = "pth")]
 pub mod pth;
 
+/// `GGUF` file parsing — header, metadata key-value pairs, and tensor info table.
+#[cfg(feature = "gguf")]
+pub mod gguf;
+
 /// Shared parsing utilities (byte-swap, etc.) used by multiple format parsers.
 #[cfg(any(feature = "npz", feature = "pth"))]
 pub(crate) mod utils;
 
+#[cfg(feature = "gguf")]
+pub use gguf::{
+    parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo,
+    GgufType, ParsedGguf,
+};
 #[cfg(feature = "npz")]
 pub use npz::{inspect_npz, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo};
 #[cfg(feature = "pth")]

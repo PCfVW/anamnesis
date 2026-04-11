@@ -84,6 +84,11 @@ pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "npz")]
 pub use parse::{inspect_npz, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo};
+#[cfg(feature = "gguf")]
+pub use parse::{
+    parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo,
+    GgufType, ParsedGguf,
+};
 #[cfg(feature = "pth")]
 pub use parse::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
 pub use parse::{
