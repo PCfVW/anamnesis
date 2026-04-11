@@ -89,6 +89,36 @@ fn read_f32_bytes(bytes: [u8; 4]) -> f32 {
     f32::from_le_bytes(bytes)
 }
 
+/// Reads a 12-byte packed scales field out of a block at `offset`.
+///
+/// Used by `Q3_K`, `Q4_K`, and `Q5_K` to lift the packed 6-bit scales
+/// field into a fixed-size array for the extractor helpers. Written as
+/// an explicit element-by-element construction because `.try_into()` on
+/// a `&[u8]` slice is fallible in the type system and `.unwrap()` /
+/// `.expect()` are banned by the project's lint posture — and because
+/// the compiler optimises this form into a single 12-byte load.
+#[inline]
+#[allow(clippy::indexing_slicing)]
+fn read_scales12(block: &[u8], offset: usize) -> [u8; 12] {
+    // INDEX: callers pre-validate `block.len() >= offset + 12` via the
+    // `run_super_kernel` `chunks_exact(type_size)` outer loop, which
+    // guarantees a full K-quant super-block (≥ 110 bytes).
+    [
+        block[offset],
+        block[offset + 1],
+        block[offset + 2],
+        block[offset + 3],
+        block[offset + 4],
+        block[offset + 5],
+        block[offset + 6],
+        block[offset + 7],
+        block[offset + 8],
+        block[offset + 9],
+        block[offset + 10],
+        block[offset + 11],
+    ]
+}
+
 /// Converts a block's worth of `f32` scratch values to `BF16` bytes.
 ///
 /// This is the hot-path pass 2 for every kernel. Branch-free, contiguous
@@ -432,6 +462,8 @@ where
 #[allow(
     clippy::indexing_slicing,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
 fn dequant_q5_0<F>(data: &[u8], sink: F) -> crate::Result<()>
@@ -442,16 +474,13 @@ where
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let qh = u32::from_le_bytes([in_block[2], in_block[3], in_block[4], in_block[5]]);
         // BITWISE: merge low 4 bits from qs with bit 4 from qh, bias by -16
-        // CAST: u32/i32 → f32, lossless for [-16, 15]
+        // CAST: usize → u32 for the shift amount; u32 → i32 for the merged
+        // value; i32 → f32 lossless for the final [-16, 15] range
         for j in 0..16 {
-            // CAST: usize → u32 for the shift amount
-            #[allow(clippy::cast_possible_truncation)]
             let j_u32 = j as u32;
             let xh_0 = ((qh >> j_u32) << 4) & 0x10;
             let xh_1 = (qh >> (j_u32 + 12)) & 0x10;
-            #[allow(clippy::cast_possible_wrap)]
             let x0 = (i32::from(in_block[6 + j] & 0x0F) | xh_0 as i32) - 16;
-            #[allow(clippy::cast_possible_wrap)]
             let x1 = (i32::from(in_block[6 + j] >> 4) | xh_1 as i32) - 16;
             scratch[j] = x0 as f32 * d;
             scratch[j + 16] = x1 as f32 * d;
@@ -465,6 +494,8 @@ where
 #[allow(
     clippy::indexing_slicing,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
 fn dequant_q5_1<F>(data: &[u8], sink: F) -> crate::Result<()>
@@ -475,17 +506,15 @@ where
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let m = read_f16_bytes([in_block[2], in_block[3]]);
         let qh = u32::from_le_bytes([in_block[4], in_block[5], in_block[6], in_block[7]]);
+        // BITWISE: merge low 4 bits from qs with bit 4 from qh
+        // CAST: usize → u32 for the shift amount; u32 → i32 for the merged
+        // value; i32 → f32 lossless for the final [0, 31] range
         for j in 0..16 {
-            #[allow(clippy::cast_possible_truncation)]
             let j_u32 = j as u32;
-            // BITWISE: merge low 4 bits from qs with bit 4 from qh
             let xh_0 = ((qh >> j_u32) << 4) & 0x10;
             let xh_1 = (qh >> (j_u32 + 12)) & 0x10;
-            #[allow(clippy::cast_possible_wrap)]
             let x0 = i32::from(in_block[8 + j] & 0x0F) | xh_0 as i32;
-            #[allow(clippy::cast_possible_wrap)]
             let x1 = i32::from(in_block[8 + j] >> 4) | xh_1 as i32;
-            // CAST: i32 → f32, lossless for [0, 31]
             scratch[j] = x0 as f32 * d + m;
             scratch[j + 16] = x1 as f32 * d + m;
         }
@@ -575,7 +604,6 @@ where
 /// Formula: `y = d * (sc & 0xF) * q2 - dmin * (sc >> 4)` where
 /// `q2 = (qs[l] >> shift) & 3`.
 #[allow(
-    clippy::too_many_lines,
     clippy::indexing_slicing,
     clippy::as_conversions,
     clippy::cast_precision_loss
@@ -633,7 +661,6 @@ where
 /// 2 low bits from `qs` with 1 high bit from `hmask`, then subtracting 4
 /// when `hmask` is zero. Formula: `y = d * (scale - 32) * (q2 - hi)`.
 #[allow(
-    clippy::too_many_lines,
     clippy::indexing_slicing,
     clippy::as_conversions,
     clippy::cast_precision_loss
@@ -646,23 +673,7 @@ where
         // Field offsets: hmask [0..32], qs [32..96], scales [96..108], d [108..110]
         let hmask = &in_block[0..32];
         let qs = &in_block[32..96];
-        // `.try_into()` on a fixed-length slice cannot fail; the internal
-        // fallback error is structurally dead code but kept to satisfy the
-        // slice-to-array API.
-        let packed_scales: [u8; 12] = [
-            in_block[96],
-            in_block[97],
-            in_block[98],
-            in_block[99],
-            in_block[100],
-            in_block[101],
-            in_block[102],
-            in_block[103],
-            in_block[104],
-            in_block[105],
-            in_block[106],
-            in_block[107],
-        ];
+        let packed_scales = read_scales12(in_block, 96);
         let d_all = read_f16_bytes([in_block[108], in_block[109]]);
         let scales = q3_k_unpack_scales(&packed_scales);
 
@@ -716,22 +727,10 @@ where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
     run_super_kernel(data, 144, sink, |in_block, scratch| {
+        // Field offsets: d [0..2], dmin [2..4], scales [4..16], qs [16..144]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let dmin = read_f16_bytes([in_block[2], in_block[3]]);
-        let scales: [u8; 12] = [
-            in_block[4],
-            in_block[5],
-            in_block[6],
-            in_block[7],
-            in_block[8],
-            in_block[9],
-            in_block[10],
-            in_block[11],
-            in_block[12],
-            in_block[13],
-            in_block[14],
-            in_block[15],
-        ];
+        let scales = read_scales12(in_block, 4);
         let qs = &in_block[16..144];
 
         let mut is: usize = 0;
@@ -766,7 +765,6 @@ where
 /// from `qh[l]` selected by a rotating `u1`/`u2` mask. Formula:
 /// `y = d * sc * ((ql & 0xF) + (qh & mask ? 16 : 0)) - dmin * m`.
 #[allow(
-    clippy::too_many_lines,
     clippy::indexing_slicing,
     clippy::as_conversions,
     clippy::cast_precision_loss
@@ -776,22 +774,10 @@ where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
     run_super_kernel(data, 176, sink, |in_block, scratch| {
+        // Field offsets: d [0..2], dmin [2..4], scales [4..16], qh [16..48], ql [48..176]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let dmin = read_f16_bytes([in_block[2], in_block[3]]);
-        let scales: [u8; 12] = [
-            in_block[4],
-            in_block[5],
-            in_block[6],
-            in_block[7],
-            in_block[8],
-            in_block[9],
-            in_block[10],
-            in_block[11],
-            in_block[12],
-            in_block[13],
-            in_block[14],
-            in_block[15],
-        ];
+        let scales = read_scales12(in_block, 4);
         let qh = &in_block[16..48];
         let ql = &in_block[48..176];
 
@@ -830,7 +816,6 @@ where
 /// Each 6-bit element is reconstructed as `(ql & 0xF) | ((qh >> shift) &
 /// 3) << 4`, biased by `-32`. Processed in 2 halves of 128 elements.
 #[allow(
-    clippy::too_many_lines,
     clippy::indexing_slicing,
     clippy::similar_names,
     clippy::as_conversions,
