@@ -3,32 +3,225 @@
 This document describes the [Amphigraphic coding](https://github.com/PCfVW/Amphigraphic-Strict) conventions used in anamnesis. It is a superset of
 the [Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/Amphigraphic-Strict/tree/master/Grit).
 
-## Annotation Patterns
+## Trigger Checklist
 
-Every annotation below is mandatory when the corresponding situation applies.
+**Before writing any line of code, check which triggers apply.**
 
-### `// TRAIT_OBJECT: <reason>`
-Required on every `Box<dyn Trait>` or `&dyn Trait` usage.
-> Example: `// TRAIT_OBJECT: heterogeneous format parsers require dynamic dispatch`
+| You are about to... | Check these rules |
+|---|---|
+| Write a `///` or `//!` comment | [Backtick hygiene](#backtick-hygiene), [field-level docs](#field-level-docs), [intra-doc link safety](#intra-doc-link-safety) |
+| Write a `pub fn` or `pub const fn` | [`const fn`](#const-fn), [`#[must_use]`](#must_use-policy), [pass by value](#pass-by-value-vs-reference) |
+| Write a `pub fn` returning `Result<T>` | [`# Errors` section](#errors-doc-section) |
+| Write a `pub fn` that processes large files | [`# Memory` section](#memory-doc-section) |
+| Write a `pub enum` | [`#[non_exhaustive]`](#non_exhaustive-policy) or [`// EXHAUSTIVE:`](#exhaustive-annotation) |
+| Write an `as` cast | [`// CAST:`](#cast-annotation) |
+| Write `slice[i]` or `slice[a..b]` | [`// INDEX:`](#index-annotation) |
+| Write `.as_str()`, `.to_owned()` | [`// BORROW:`](#borrow-annotation) |
+| Write an `unsafe` block | [`// SAFETY:`](#safety-annotation), feature-gate check |
+| Write `Box<dyn T>` or `&dyn T` | [`// TRAIT_OBJECT:`](#trait_object-annotation) |
+| Write a `match` or `if let` | [Control-flow rules](#if-let-vs-match), [`// EXPLICIT:`](#explicit-annotation) if no-op arm |
+| Write bit manipulation for (de)quantization | [`// BITWISE:`](#bitwise-annotation) |
+| Write a bulk conversion loop | [`// VECTORIZED:`](#vectorized-annotation), [SIMD-friendly loop rules](#when-writing-simd-friendly-loops) |
+| Write error strings | [Error message wording](#error-message-wording) |
+| Batch operations by key | [HashMap grouping idiom](#hashmap-grouping-idiom) |
 
-### `// EXHAUSTIVE: <reason>`
-Required on `#[allow(clippy::exhaustive_enums)]` or
-`#[allow(clippy::wildcard_enum_match_arm)]` when a wildcard is used on a
-foreign `#[non_exhaustive]` enum that we cannot match exhaustively.
-> Example: `// EXHAUSTIVE: internal dispatch enum; crate owns and matches all variants`
-> Example: `// EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants`
+---
 
-### `// EXPLICIT: <reason>`
-Required when a match arm is intentionally a no-op, or when an imperative
-loop is used instead of an iterator chain for a stateful computation.
-> Example: `// EXPLICIT: FP8 block accumulation is stateful; .map() would hide the scale update`
+## When Writing Doc Comments (`///`, `//!`)
 
-### `// BORROW: <what is converted>`
-Required on explicit `.as_str()`, `.as_bytes()`, `.to_owned()` conversions (Grit Rule 2).
+### Backtick Hygiene
+
+All identifiers, types, trait names, field names, crate names, and
+file-format names in doc comments must be wrapped in backticks so that
+rustdoc renders them as inline code and Clippy's `doc_markdown` lint passes.
+
+Applies to: struct/enum/field names, method names (`fn foo`), types
+(`Vec<T>`, `Option<f32>`), crate names (`safetensors`, `half`),
+file extensions (`.npy`, `.npz`, `.safetensors`), and acronyms that double
+as types (`DType`, `NaN`, `FP8`, `E4M3`, `BF16`, `GPTQ`).
+
+> ✅ `` /// Parses the header of a `.safetensors` file. ``
+> ❌ `/// Parses the header of a .safetensors file.`
+
+### Intra-Doc Link Safety
+
+Rustdoc intra-doc links must resolve under all feature-flag combinations
+(enforced by `#![deny(warnings)]` → `rustdoc::broken_intra_doc_links`).
+
+Feature-gated items (e.g., NPZ types behind `npz` feature, GPTQ types
+behind `gptq` feature) must use plain backtick text, not link syntax:
+
+> ✅ `` /// See `NpzTensor` (requires `npz` feature). ``
+> ❌ `` /// See [`NpzTensor`](crate::parse::npz::NpzTensor). ``
+
+### Field-Level Docs
+
+Every field of every `pub` struct must carry a `///` doc comment describing:
+1. what the field represents,
+2. its unit or valid range where applicable.
+
+> Example:
+> ```rust
+> pub struct NpzTensor {
+>     /// Tensor dimensions (e.g., `[2304, 2048]`).
+>     pub shape: Vec<usize>,
+>     /// Element data type (e.g., `F32`, `F64`, `BF16`).
+>     pub dtype: NpzDtype,
+>     /// Raw bytes in row-major order. Length = product(shape) * dtype.byte_size().
+>     pub data: Vec<u8>,
+> }
+> ```
+
+### `# Errors` Doc Section
+
+All public fallible methods (`-> Result<T>`) must include an `# Errors` section.
+Each bullet uses the format:
+
+    /// # Errors
+    /// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
+    /// Returns [`AnamnesisError::Io`] if the file cannot be read.
+
+Rules:
+- Start each bullet with `Returns` followed by the variant in rustdoc link
+  syntax, e.g., `` [`AnamnesisError::Parse`] ``.
+- Follow with `if` (condition), `on` (event), or `when` (circumstance).
+- One bullet per distinct error path.
+
+### `# Memory` Doc Section
+
+Public methods that process large files (safetensors, NPZ archives) must include
+a `# Memory` section documenting:
+
+1. **Peak allocation** — how much memory the method allocates at its peak.
+2. **Lifetime** — whether allocations are dropped before the method returns
+   or persist in the returned value.
+
+Format:
+
+    /// # Memory
+    /// Reads the entire safetensors file into memory (~2× model size during
+    /// dequantization: source FP8 + destination BF16). The source buffer is
+    /// dropped before returning.
+
+---
+
+## When Writing Function Signatures
+
+### `const fn`
+
+Declare a function `const fn` when **all** of the following hold:
+1. The body contains no heap allocation, I/O, or `dyn` dispatch.
+2. All called functions are themselves `const fn`.
+3. There are no trait-method calls that are not yet `const`.
+
+This applies to constructors, accessors, and pure arithmetic helpers.
+When in doubt, annotate and let the compiler reject it — do not omit `const`
+preemptively.
+
+> ✅ `pub const fn byte_size(&self) -> usize { ... }`
+> ❌ `pub fn byte_size(&self) -> usize { ... }`
+
+### `#[must_use]` Policy
+
+All public functions and methods that return a value and have no side effects
+must be annotated `#[must_use]`. This includes constructors, accessors,
+and pure queries (`byte_size`, `is_quantized`, `tensor_count`).
+
+The `clippy::must_use_candidate` lint enforces this at `warn` level
+(promoted to error by `#![deny(warnings)]`).
+
+### Pass by Value vs Reference
+
+Follow these rules for function parameters:
+
+| Type | Rule |
+|---|---|
+| `Copy` type ≤ 2 words (`usize`, `f32`, `bool`, small `enum`) | Pass by value |
+| `Copy` type > 2 words | Pass by reference |
+| Non-`Copy`, not mutated | Pass by `&T` or `&[T]` |
+| Non-`Copy`, mutated | Pass by `&mut T` |
+| Owned, consumed by callee | Pass by value (move semantics) |
+| `&mut T` not actually mutated in body | Change to `&T` |
+
+Never accept `&mut T` when the function body never writes through the
+reference; Clippy's `needless_pass_by_ref_mut` will flag it. Similarly,
+`trivially_copy_pass_by_ref` flags `&T` where `T: Copy` and is small
+enough to pass by value.
+
+---
+
+## When Writing Public Enums
+
+### `#[non_exhaustive]` Policy
+
+- Public enums that may gain new variants: `#[non_exhaustive]`.
+  `Dtype`, `QuantScheme`, `TargetDtype`, and `TensorRole` are all
+  non-exhaustive — new formats and dtypes will be added over time.
+- Internal dispatch enums matched exhaustively by this crate:
+  `#[allow(clippy::exhaustive_enums)] // EXHAUSTIVE: <reason>`.
+
+---
+
+## When Writing Expressions
+
+These annotations are required **on or immediately before** the line where
+the pattern occurs. Apply them as you write the line, not in a review pass.
+
+### CAST Annotation
+
+`// CAST: <from> → <to>, <reason>` — required on every `as` cast between numeric types. Prefer `From`/`Into` for
+lossless conversions and `TryFrom`/`TryInto` with `?` for fallible ones.
+Use `as` only when truncation or wrapping is the deliberate intent, or when
+the bit-level reinterpretation is the whole point (as in dequantization).
+> Example: `// CAST: u8 → f32, FP8 E4M3 mantissa bits promoted for arithmetic`
+> Example: `// CAST: usize → u64, byte offset for safetensors; file size fits in u64`
+
+### INDEX Annotation
+
+`// INDEX: <reason>` — required on every direct slice index (`slice[i]`, `slice[a..b]`) that cannot
+be replaced by an iterator. Direct indexing panics on out-of-bounds; prefer
+`.get(i)` with `?` or explicit error handling. Use direct indexing only when
+the bound is provably valid and an iterator idiom would be significantly less
+readable. See also [reconciling bounds checking with vectorization](#reconciling-bounds-checking-with-vectorization)
+for how this rule interacts with the SIMD rules in hot loops.
+> Example: `// INDEX: offset is bounded by header.data_offsets checked above`
+> Example: `// INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk`
+
+### BITWISE Annotation
+
+`// BITWISE: <operation>` — required on every raw bit manipulation that implements part of a quantization
+or dequantization algorithm. Document what the bits represent and what the
+operation achieves — the mapping between storage format and numerical value
+must be traceable through the annotations.
+> Example: `// BITWISE: extract 3-bit mantissa from E4M3 byte (bits [2:0])`
+> Example: `// BITWISE: combine sign, exponent, mantissa into IEEE 754 half-precision`
+> Example: `// BITWISE: extract unsigned 4-bit value from packed I32 at bit position shift`
+
+### VECTORIZED Annotation
+
+`// VECTORIZED: <verification>` — required on every bulk conversion loop that is expected to auto-vectorize.
+Document how vectorization was verified and on which target.
+> Example: `// VECTORIZED: confirmed AVX2 vmulps + vpermb in cargo-show-asm, x86-64, opt-level=3`
+> Example: `// VECTORIZED: confirmed AVX2 vsubps+vmulps (target-cpu=native) via --emit=asm`
+> Example: `// VECTORIZED: scalar fallback — loop body contains branch that defeats auto-vectorization`
+
+### BORROW Annotation
+
+`// BORROW: <what is converted>` — required on explicit `.as_str()`, `.as_bytes()`, `.to_owned()` conversions (Grit Rule 2).
 > Example: `// BORROW: explicit .as_str() instead of Deref coercion`
 
-### `// SAFETY: <invariants>`
-Required on every `unsafe` block or function (inline comment, not a doc comment).
+### TRAIT_OBJECT Annotation
+
+`// TRAIT_OBJECT: <reason>` — required on every `Box<dyn Trait>` or `&dyn Trait` usage.
+> Example: `// TRAIT_OBJECT: heterogeneous format parsers require dynamic dispatch`
+
+---
+
+## When Writing `unsafe`
+
+### SAFETY Annotation
+
+`// SAFETY: <invariants>` — required on every `unsafe` block or function (inline comment, not a doc comment).
 
 anamnesis is `#![forbid(unsafe_code)]` **by default**. The one anticipated
 exception is explicit SIMD intrinsics (e.g., `#[target_feature(enable = "avx2")]`),
@@ -47,43 +240,85 @@ Each accepted use must satisfy all of:
    enable the feature get `forbid(unsafe_code)` with zero exceptions.
 4. A safe scalar fallback exists and is tested identically.
 
-### `// INDEX: <reason>`
-Required on every direct slice index (`slice[i]`, `slice[a..b]`) that cannot
-be replaced by an iterator. Direct indexing panics on out-of-bounds; prefer
-`.get(i)` with `?` or explicit error handling. Use direct indexing only when
-the bound is provably valid and an iterator idiom would be significantly less
-readable. See also "Reconciling bounds checking with vectorization" below for
-how this rule interacts with the SIMD rules in hot loops.
-> Example: `// INDEX: offset is bounded by header.data_offsets checked above`
-> Example: `// INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk`
-
-### `// CAST: <from> → <to>, <reason>`
-Required on every `as` cast between numeric types. Prefer `From`/`Into` for
-lossless conversions and `TryFrom`/`TryInto` with `?` for fallible ones.
-Use `as` only when truncation or wrapping is the deliberate intent, or when
-the bit-level reinterpretation is the whole point (as in dequantization).
-> Example: `// CAST: u8 → f32, FP8 E4M3 mantissa bits promoted for arithmetic`
-> Example: `// CAST: usize → u64, byte offset for safetensors; file size fits in u64`
-
-### `// BITWISE: <operation>`
-Required on every raw bit manipulation that implements part of a quantization
-or dequantization algorithm. Document what the bits represent and what the
-operation achieves — the mapping between storage format and numerical value
-must be traceable through the annotations.
-> Example: `// BITWISE: extract 3-bit mantissa from E4M3 byte (bits [2:0])`
-> Example: `// BITWISE: combine sign, exponent, mantissa into IEEE 754 half-precision`
-> Example: `// BITWISE: extract unsigned 4-bit value from packed I32 at bit position shift`
-
-### `// VECTORIZED: <verification>`
-Required on every bulk conversion loop that is expected to auto-vectorize.
-Document how vectorization was verified and on which target.
-> Example: `// VECTORIZED: confirmed AVX2 vmulps + vpermb in cargo-show-asm, x86-64, opt-level=3`
-> Example: `// VECTORIZED: confirmed AVX2 vsubps+vmulps (target-cpu=native) via --emit=asm`
-> Example: `// VECTORIZED: scalar fallback — loop body contains branch that defeats auto-vectorization`
+Adding a new accepted use requires updating this table and the `cfg_attr` lines
+in `lib.rs`.
 
 ---
 
-## SIMD-Friendly Loop Rules
+## When Writing Control Flow
+
+### `if let` vs `match`
+
+Use the most specific construct for the pattern at hand:
+
+| Situation | Preferred form |
+|---|---|
+| Testing a single variant, no binding needed | `matches!(expr, Pat)` |
+| Testing a single variant, binding needed | `if let Pat(x) = expr { … }` |
+| Two or more variants with different bodies | `match expr { … }` |
+| Exhaustive dispatch over an enum | `match expr { … }` (never `if let` chains) |
+
+Never use a `match` with a single non-`_` arm and a no-op `_ => {}` where
+`if let` or `matches!` would be clearer (Clippy: `single_match`,
+`match_like_matches_macro`). Conversely, never chain three or more
+`if let … else if let …` arms where a `match` would be exhaustive.
+
+### EXPLICIT Annotation
+
+`// EXPLICIT: <reason>` — required when a match arm is intentionally a no-op, or when an imperative
+loop is used instead of an iterator chain for a stateful computation.
+> Example: `// EXPLICIT: FP8 block accumulation is stateful; .map() would hide the scale update`
+
+### EXHAUSTIVE Annotation
+
+`// EXHAUSTIVE: <reason>` — required on `#[allow(clippy::exhaustive_enums)]` or
+`#[allow(clippy::wildcard_enum_match_arm)]` when a wildcard is used on a
+foreign `#[non_exhaustive]` enum that we cannot match exhaustively.
+> Example: `// EXHAUSTIVE: internal dispatch enum; crate owns and matches all variants`
+> Example: `// EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants`
+
+---
+
+## When Writing Error Strings
+
+### Error Message Wording
+
+Error strings passed to `AnamnesisError` variants follow two patterns:
+
+- **External failures** (I/O, serde): `"failed to <verb>: {e}"`
+  > Example: `AnamnesisError::Parse { reason: format!("failed to parse safetensors header: {e}") }`
+- **Validation failures** (format, range): `"<noun> <problem> (<context>)"`
+  > Example: `AnamnesisError::Parse { reason: format!("unexpected dtype {dtype} for tensor {name}") }`
+  > Example: `AnamnesisError::Unsupported { format: "GPTQ".into(), detail: "3-bit quantization not yet supported".into() }`
+
+Rules:
+- Use lowercase, no trailing period.
+- Include the offending value and the valid range or constraint when applicable.
+- Wrap external errors with `: {e}`, not `.to_string()`.
+
+---
+
+## When Batching Operations by Key
+
+### HashMap Grouping Idiom
+
+When operations must be batched by a key (e.g., grouping tensors by
+quantization scheme), use the `Entry` API:
+
+```rust
+let mut by_scheme: HashMap<QuantScheme, Vec<TensorInfo>> = HashMap::new();
+for tensor in tensors {
+    by_scheme.entry(tensor.scheme()).or_default().push(tensor);
+}
+```
+
+Rules:
+- Name the map `by_<grouping_key>` (e.g., `by_scheme`, `by_dtype`).
+- Use `.entry(key).or_default().push()` — never `if let Some` + `else insert`.
+
+---
+
+## When Writing SIMD-Friendly Loops
 
 anamnesis processes billions of elements (one per model parameter). Performance
 depends on the compiler auto-vectorizing the inner conversion loops. The
@@ -105,8 +340,8 @@ loops that satisfy these conditions:
 
 2. **No branches in the hot path.** Conditional logic (NaN handling, subnormal
    detection) must be expressed as bitwise select or arithmetic, not `if`/`match`.
-   This includes bounds checks — see "Reconciling bounds checking with
-   vectorization" below.
+   This includes bounds checks — see [reconciling bounds checking with
+   vectorization](#reconciling-bounds-checking-with-vectorization) below.
 
    > ✅ `let is_nan_mask = ((exp == 0xF) & (mant != 0)) as u16;` then blend with bitwise ops
    > ❌ `if exp == 0xF && mant != 0 { return BF16_NAN; }` ← branch per element kills SIMD
@@ -255,189 +490,3 @@ despite following the rules above, escalate in this order:
    Adds a dependency but avoids hand-written intrinsics.
 3. **Hand-written intrinsics with `#[cfg(target_arch)]`** — last resort.
    Must include a scalar fallback for non-x86/non-ARM targets.
-
----
-
-## Doc-Comment Rules
-
-### Backtick Hygiene (`doc_markdown`)
-
-All identifiers, types, trait names, field names, crate names, and
-file-format names in doc comments must be wrapped in backticks so that
-rustdoc renders them as inline code and Clippy's `doc_markdown` lint passes.
-
-Applies to: struct/enum/field names, method names (`fn foo`), types
-(`Vec<T>`, `Option<f32>`), crate names (`safetensors`, `half`),
-file extensions (`.npy`, `.npz`, `.safetensors`), and acronyms that double
-as types (`DType`, `NaN`, `FP8`, `E4M3`, `BF16`, `GPTQ`).
-
-> ✅ `` /// Parses the header of a `.safetensors` file. ``
-> ❌ `/// Parses the header of a .safetensors file.`
-
-### Intra-Doc Link Safety
-
-Rustdoc intra-doc links must resolve under all feature-flag combinations
-(enforced by `#![deny(warnings)]` → `rustdoc::broken_intra_doc_links`).
-
-Feature-gated items (e.g., NPZ types behind `npz` feature, GPTQ types
-behind `gptq` feature) must use plain backtick text, not link syntax:
-
-> ✅ `` /// See `NpzTensor` (requires `npz` feature). ``
-> ❌ `` /// See [`NpzTensor`](crate::parse::npz::NpzTensor). ``
-
-### Field-Level Docs
-
-Every field of every `pub` struct must carry a `///` doc comment describing:
-1. what the field represents,
-2. its unit or valid range where applicable.
-
-> Example:
-> ```rust
-> pub struct NpzTensor {
->     /// Tensor dimensions (e.g., `[2304, 2048]`).
->     pub shape: Vec<usize>,
->     /// Element data type (e.g., `F32`, `F64`, `BF16`).
->     pub dtype: NpzDtype,
->     /// Raw bytes in row-major order. Length = product(shape) * dtype.byte_size().
->     pub data: Vec<u8>,
-> }
-> ```
-
----
-
-## Control-Flow Rules
-
-### `if let` vs `match` (`match_like_matches_macro`, `single_match`)
-
-Use the most specific construct for the pattern at hand:
-
-| Situation | Preferred form |
-|---|---|
-| Testing a single variant, no binding needed | `matches!(expr, Pat)` |
-| Testing a single variant, binding needed | `if let Pat(x) = expr { … }` |
-| Two or more variants with different bodies | `match expr { … }` |
-| Exhaustive dispatch over an enum | `match expr { … }` (never `if let` chains) |
-
-Never use a `match` with a single non-`_` arm and a no-op `_ => {}` where
-`if let` or `matches!` would be clearer. Conversely, never chain three or
-more `if let … else if let …` arms where a `match` would be exhaustive.
-
----
-
-## Function Signature Rules
-
-### `const fn`
-
-Declare a function `const fn` when **all** of the following hold:
-1. The body contains no heap allocation, I/O, or `dyn` dispatch.
-2. All called functions are themselves `const fn`.
-3. There are no trait-method calls that are not yet `const`.
-
-This applies to constructors, accessors, and pure arithmetic helpers.
-When in doubt, annotate and let the compiler reject it — do not omit `const`
-preemptively.
-
-> ✅ `pub const fn byte_size(&self) -> usize { ... }`
-> ❌ `pub fn byte_size(&self) -> usize { ... }`
-
-### Pass by Value vs Reference (`needless_pass_by_ref_mut`, `trivially_copy_pass_by_ref`)
-
-| Type | Rule |
-|---|---|
-| `Copy` type ≤ 2 words (`usize`, `f32`, `bool`, small `enum`) | Pass by value |
-| `Copy` type > 2 words | Pass by reference |
-| Non-`Copy`, not mutated | Pass by `&T` or `&[T]` |
-| Non-`Copy`, mutated | Pass by `&mut T` |
-| Owned, consumed by callee | Pass by value (move semantics) |
-| `&mut T` not actually mutated in body | Change to `&T` |
-
----
-
-## `#[non_exhaustive]` Policy
-
-- Public enums that may gain new variants: `#[non_exhaustive]`.
-  `Dtype`, `QuantScheme`, `TargetDtype`, and `TensorRole` are all
-  non-exhaustive — new formats and dtypes will be added over time.
-- Internal dispatch enums matched exhaustively by this crate:
-  `#[allow(clippy::exhaustive_enums)] // EXHAUSTIVE: <reason>`.
-
----
-
-## `#[must_use]` Policy
-
-All public functions and methods that return a value and have no side effects
-must be annotated `#[must_use]`. This includes constructors, accessors,
-and pure queries (`byte_size`, `is_quantized`, `tensor_count`).
-
-The `clippy::must_use_candidate` lint enforces this at `warn` level
-(promoted to error by `#![deny(warnings)]`).
-
----
-
-## `# Errors` Doc Section
-
-All public fallible methods (`-> Result<T>`) must include an `# Errors` section.
-Each bullet uses the format:
-
-    /// # Errors
-    /// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
-    /// Returns [`AnamnesisError::Io`] if the file cannot be read.
-
-Rules:
-- Start each bullet with `Returns` followed by the variant in rustdoc link
-  syntax, e.g., `` [`AnamnesisError::Parse`] ``.
-- Follow with `if` (condition), `on` (event), or `when` (circumstance).
-- One bullet per distinct error path.
-
----
-
-## Error Message Wording
-
-Error strings passed to `AnamnesisError` variants follow two patterns:
-
-- **External failures** (I/O, serde): `"failed to <verb>: {e}"`
-  > Example: `AnamnesisError::Parse { reason: format!("failed to parse safetensors header: {e}") }`
-- **Validation failures** (format, range): `"<noun> <problem> (<context>)"`
-  > Example: `AnamnesisError::Parse { reason: format!("unexpected dtype {dtype} for tensor {name}") }`
-  > Example: `AnamnesisError::Unsupported { format: "GPTQ".into(), detail: "3-bit quantization not yet supported".into() }`
-
-Rules:
-- Use lowercase, no trailing period.
-- Include the offending value and the valid range or constraint when applicable.
-- Wrap external errors with `: {e}`, not `.to_string()`.
-
----
-
-## `# Memory` Doc Section
-
-Public methods that process large files (safetensors, NPZ archives) must include
-a `# Memory` section documenting:
-
-1. **Peak allocation** — how much memory the method allocates at its peak.
-2. **Lifetime** — whether allocations are dropped before the method returns
-   or persist in the returned value.
-
-Format:
-
-    /// # Memory
-    /// Reads the entire safetensors file into memory (~2× model size during
-    /// dequantization: source FP8 + destination BF16). The source buffer is
-    /// dropped before returning.
-
----
-
-## HashMap Grouping Idiom
-
-When operations must be batched by a key (e.g., grouping tensors by
-quantization scheme), use the `Entry` API:
-
-```rust
-let mut by_scheme: HashMap<QuantScheme, Vec<TensorInfo>> = HashMap::new();
-for tensor in tensors {
-    by_scheme.entry(tensor.scheme()).or_default().push(tensor);
-}
-```
-
-Rules:
-- Name the map `by_<grouping_key>` (e.g., `by_scheme`, `by_dtype`).
-- Use `.entry(key).or_default().push()` — never `if let Some` + `else insert`.
