@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated April 11, 2026)
-**Status:** Phases 1–3.5 complete (v0.3.2 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing. **Phase 4 in progress:** parser + 12 block-quant dequant kernels (both legacy `Q4_0`–`Q8_1` and K-quants `Q2_K`–`Q8_K`) committed, streaming + Vec APIs shipped. Next: cross-validation against `llama.cpp` reference output, then `v0.4.0` tag.
+**Date:** March 20, 2026 (updated April 12, 2026)
+**Status:** Phases 1–4 complete (v0.4.0 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization (12 block-quant kernels, bit-exact against `llama.cpp` reference). **Next:** Phase 4.5 (GGUF completeness: `IQ*`/`TQ*`/`MXFP4` kernels).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -26,8 +26,8 @@
   - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
   - [Phase 4.5: GGUF Completeness](#phase-45-gguf-completeness)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
-  - [Phase 6: Python Bindings (PyO3)](#phase-6-python-bindings-pyo3)
-  - [Phase 7: Format Conversion Matrix](#phase-7-format-conversion-matrix)
+  - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
+  - [Phase 7: Python Bindings (PyO3)](#phase-7-python-bindings-pyo3)
   - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
   - [Phase 9: CPU SIMD Pass](#phase-9-cpu-simd-pass)
   - [Future Directions](#future-directions)
@@ -272,7 +272,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 ### Phase 4: GGUF Parsing & Dequantization
 
-**Status:** Parser + all 12 block-quant dequantisation kernels + streaming API committed (`2acaf1a`, `cc4ecf8`, `b6610fe`, `3156104`). Cross-validation against `llama.cpp` + `v0.4.0` tag still pending.
+**Status:** Complete (`v0.4.0` published). Parser + all 12 block-quant dequantisation kernels + streaming API + cross-validation against `llama.cpp` reference (10/12 kernels bit-exact, 6.3–31.3× faster than Python reference).
 
 **Goal:** Add support for GGUF, the dominant format for local inference (~166,000 models on HuggingFace as of March 2026). GGUF is to llama.cpp/Ollama/LM Studio what safetensors is to HuggingFace Transformers. No standalone, framework-agnostic Rust crate exists for GGUF dequantization — candle-core has GGUF support but it is tightly coupled to candle's tensor types and inference pipeline.
 
@@ -334,26 +334,9 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Deliverable:** `anamnesis` v0.5.0 — full quantize + dequantize cycle. — **PUSH + tag `v0.5.0`**
 
-### Phase 6: Python Bindings (PyO3)
+### Phase 6: Format Conversion Matrix
 
-**Goal:** Expose anamnesis to the Python ecosystem via `pip install anamnesis`. Phases 1–5 give anamnesis the fastest dequantization (2.7–54× vs PyTorch), the fastest NPZ parser (17.7× vs npyz), PyTorch `.pth` parsing, GGUF support, and quantization — all in pure Rust. Python bindings multiply the audience by ~100×, replacing ad-hoc dequantization scripts across the ML community.
-
-**Approach:** Use [PyO3](https://pyo3.rs/) + [maturin](https://github.com/PyO3/maturin) to build a native Python extension. The Python API should mirror the Rust library API closely: `parse()`, `inspect()`, `remember()`, `forget()`, `parse_npz()`. Returns NumPy arrays (via `numpy` interop) or raw bytes. Ships as a wheel on PyPI.
-
-- [ ] PyO3 module scaffold (`src/python.rs`) — feature-gated behind `python` — **commit**
-- [ ] `parse_npz()` binding — returns `dict[str, NpzTensor]` with NumPy-compatible arrays — **commit**
-- [ ] Safetensors `parse()` + `inspect()` bindings — **commit**
-- [ ] `remember()` / `forget()` bindings — dequantize and quantize from Python — **commit**
-- [ ] `maturin` build config, PyPI packaging, CI workflow — **commit**
-- [ ] Python test suite — validate against PyTorch reference on the same fixtures — **commit** — **PUSH**
-
-**Deliverable:** `anamnesis` v0.6.0 — `pip install anamnesis` works. — **PUSH + tag `v0.6.0`**
-
-**New dependencies:** `pyo3`, `numpy` (PyO3 interop). Feature-gated behind `python`.
-
-### Phase 7: Format Conversion Matrix
-
-**Goal:** Wire the full pipeline — any supported input format to any supported output format in a single command. With Phases 1–6 complete, the core is `parse → remember → forget → write`. Phase 7 adds the CLI and Python API for end-to-end conversion, plus output writers for each target format.
+**Goal:** Wire the full pipeline — any supported input format to any supported output format in a single command. With Phases 1–5 complete, the core is `parse → remember → forget → write`. Phase 6 adds the CLI for end-to-end conversion, plus output writers for each target format.
 
 **Key conversions unlocked:**
 
@@ -368,10 +351,26 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 - [ ] GGUF output writer — write GGUF files with K-quant types from BF16 input — **commit**
 - [ ] `amn convert` CLI subcommand — `amn convert model.safetensors --to gguf-q4km -o model.gguf` — **commit**
-- [ ] Python `convert()` API — **commit**
 - [ ] Cross-format round-trip validation — convert, then convert back, measure distortion — **commit** — **PUSH**
 
-**Deliverable:** `anamnesis` v0.7.0 — any-to-any format conversion. No Rust or Python tool does this today. — **PUSH + tag `v0.7.0`**
+**Deliverable:** `anamnesis` v0.6.0 — any-to-any format conversion. No Rust or Python tool does this today. — **PUSH + tag `v0.6.0`**
+
+### Phase 7: Python Bindings (PyO3)
+
+**Goal:** Expose anamnesis to the Python ecosystem via `pip install anamnesis`. Phases 1–6 give anamnesis the fastest dequantization (2.7–54× vs PyTorch), the fastest NPZ parser (17.7× vs npyz), PyTorch `.pth` parsing, GGUF support, quantization, and any-to-any format conversion — all in pure Rust. Python bindings multiply the audience by ~100×, replacing ad-hoc dequantization scripts across the ML community. By shipping after the format conversion matrix, `pip install anamnesis` includes `convert()` from day one.
+
+**Approach:** Use [PyO3](https://pyo3.rs/) + [maturin](https://github.com/PyO3/maturin) to build a native Python extension. The Python API should mirror the Rust library API closely: `parse()`, `inspect()`, `remember()`, `forget()`, `convert()`, `parse_npz()`. Returns NumPy arrays (via `numpy` interop) or raw bytes. Ships as a wheel on PyPI.
+
+- [ ] PyO3 module scaffold (`src/python.rs`) — feature-gated behind `python` — **commit**
+- [ ] `parse_npz()` binding — returns `dict[str, NpzTensor]` with NumPy-compatible arrays — **commit**
+- [ ] Safetensors `parse()` + `inspect()` bindings — **commit**
+- [ ] `remember()` / `forget()` / `convert()` bindings — dequantize, quantize, and convert from Python — **commit**
+- [ ] `maturin` build config, PyPI packaging, CI workflow — **commit**
+- [ ] Python test suite — validate against PyTorch reference on the same fixtures — **commit** — **PUSH**
+
+**Deliverable:** `anamnesis` v0.7.0 — `pip install anamnesis` works, with the full conversion matrix exposed. — **PUSH + tag `v0.7.0`**
+
+**New dependencies:** `pyo3`, `numpy` (PyO3 interop). Feature-gated behind `python`.
 
 ### Phase 8: Emerging Quantization Formats
 
@@ -400,7 +399,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Why this is a single phase and not per-format work:** Phases 1–4.5 all share the same `f32_bits_to_bf16_bits` pattern (defined once at [src/remember/fp8.rs:101](src/remember/fp8.rs#L101) and reused verbatim by `gptq.rs`, `awq.rs`, `bnb.rs`, and `gguf.rs`). A single `f32x8_to_bf16x8` SIMD helper retrofits every existing dequantiser at once, with one `unsafe` module, one `// SAFETY:` contract, one benchmark harness, and one cross-format round of cross-validation. Splitting the work per format would duplicate the intrinsic surface area across five modules and violate `CONVENTIONS.md`'s "unsafe lives in a single, dedicated module" rule.
 
-**Why now (not earlier):** Auto-vectorisation handles the pass-2 loop reasonably well already — the branch-free `chunks_exact_mut(2)` pattern was chosen specifically to give LLVM a clean target. Phase 9 is triggered when benchmark pressure from real users (enabled by the Phase 6 Python bindings and the Phase 7 format conversion CLI) surfaces kernels where the scalar fallback is a bottleneck. A `TODO(phase4-followup)` comment already sits on [`write_scratch_to_bf16`](src/remember/gguf.rs) flagging the intent.
+**Why now (not earlier):** Auto-vectorisation handles the pass-2 loop reasonably well already — the branch-free `chunks_exact_mut(2)` pattern was chosen specifically to give LLVM a clean target. Phase 9 is triggered when benchmark pressure from real users (enabled by the Phase 6 format conversion CLI and the Phase 7 Python bindings) surfaces kernels where the scalar fallback is a bottleneck. A `TODO(phase4-followup)` comment already sits on [`write_scratch_to_bf16`](src/remember/gguf.rs) flagging the intent.
 
 **Approach:** Add a `simd` feature flag. Under that flag, introduce `src/remember/simd.rs` — a single dedicated module containing `#[target_feature(enable = "avx2")] unsafe fn f32x8_to_bf16x8(...)` and its NEON equivalent. The `write_scratch_to_bf16` helper (currently in `src/remember/gguf.rs` but logically shared across all dequantisers) moves to this module and becomes a runtime dispatcher: `is_x86_feature_detected!("avx2")` → AVX2 path, `std::arch::is_aarch64_feature_detected!("neon")` → NEON path, else fall through to the existing scalar loop. The scalar path stays the canonical correctness reference; the SIMD paths are tested bit-exactly against it via golden-vector cross-checks.
 
