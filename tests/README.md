@@ -9,6 +9,7 @@
 | `cross_validation_gptq.rs` | `gptq` | GPTQ dequantization: bit-exact comparison against PyTorch on 4 real models (2 quantizers × 2 bit widths) |
 | `cross_validation_awq.rs` | `awq` | AWQ dequantization: bit-exact comparison against PyTorch on 2 real models (AutoAWQ GEMM, 4-bit) |
 | `cross_validation_bnb.rs` | `bnb` | BitsAndBytes dequantization: bit-exact comparison against PyTorch on 4 real models (NF4, FP4, double-quant NF4, INT8) |
+| `cross_validation_gguf.rs` | `gguf` | GGUF block-quant dequantization: bit-exact comparison against `gguf` Python package (`ggml-org` reference) on 10 kernels from 3 real models (SmolLM2-135M, TinyLlama-1.1B) |
 | `cross_validation_pth.rs` | `pth` | PyTorch `.pth` parsing: byte-exact comparison against PyTorch on 3 AlgZoo models (RNN + Transformer, both newer and older ZIP prefix formats) |
 
 ## Fixtures
@@ -27,6 +28,7 @@ The fixture format is scheme-specific (documented in each generator script). All
 | `awq_reference/` | 2 models (Llama-3.2, Falcon3) | 256x256 | `generate_awq.py` |
 | `bnb_reference/` | 4 models (Llama-3.2 NF4/FP4/INT8) | 4096 elements (NF4/FP4), 256x256 (INT8) | `generate_bnb.py` |
 | `npz_reference/` | Gemma Scope 2B SAE (small slice) | 5 F32 arrays | `generate_npz.py` |
+| `gguf_reference/` | 3 models (SmolLM2-135M, TinyLlama-1.1B) | 65 536 elements (2 048 / 256 blocks) | `generate_gguf.py` |
 | `pth_reference/` | 3 AlgZoo models (see below) | Full model (10–432 params) | `generate_pth_reference.py` |
 
 ### AlgZoo `.pth` Fixtures
