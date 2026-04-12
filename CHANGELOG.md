@@ -115,6 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GGUF dequantization cross-validated against `llama.cpp` reference**
+  (Phase 4 step 4). 10 of 12 production kernels bit-exact (0 ULP) against
+  the `gguf` Python package's `dequantize` function (the official
+  `ggml-org` reference mirroring `ggml-quants.c`). Legacy quants: `Q4_0`,
+  `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`. K-quants: `Q2_K`, `Q3_K`, `Q4_K`,
+  `Q5_K`, `Q6_K`. Fixtures from 3 real models: bartowski SmolLM2-135M-
+  Instruct and TheBloke TinyLlama-1.1B-Chat. `Q8_1` and `Q8_K` are not
+  shipped by any real model (internal `llama.cpp` activation quant types)
+  and are already covered by unit tests.
+
 - **`parse_gguf` accepted tensors whose relative offset was not a
   multiple of `general.alignment`** (Phase 4 audit I1). The GGUF spec
   mandates that every tensor's offset field is a multiple of the file's

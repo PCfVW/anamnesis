@@ -20,6 +20,7 @@
   - [GPTQ Dequantization](#gptq-dequantization)
   - [AWQ Dequantization](#awq-dequantization)
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
+  - [GGUF Block-Quant Dequantization](#gguf-block-quant-dequantization)
 - [NPZ/NPY Parsing](#npznpy-parsing)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [Used by](#used-by)
@@ -118,6 +119,25 @@ Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-
 | Llama-3.2-1B-BNB-INT8 | INT8 | 65,536 | 1.2x faster |
 
 > **Note:** INT8 speedup is modest because the operation is trivially simple (`i8→f32→multiply`). Both PyTorch and anamnesis are near memory bandwidth limits at ~0.7–0.8 ns/element. The AVX2 hot loop is fully vectorized — the 1.2× reflects the inherent ceiling, not a missed optimization.
+
+### GGUF Block-Quant Dequantization
+
+Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on 10 block-quant kernels from 3 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat). Bit-exact output (0 ULP difference). Feature-gated behind `gguf`.
+
+| Kernel | Model | vs `gguf` Python (AVX2) |
+|---|---|---|
+| Q4_0 | SmolLM2-135M | 6.9x faster |
+| Q4_1 | SmolLM2-135M | 6.3x faster |
+| Q5_0 | TinyLlama-1.1B | 31.3x faster |
+| Q5_1 | SmolLM2-135M | 11.4x faster |
+| Q8_0 | SmolLM2-135M | 6.3x faster |
+| Q2_K | TinyLlama-1.1B | 6.7x faster |
+| Q3_K | SmolLM2-135M | 10.9x faster |
+| Q4_K | SmolLM2-135M | 8.1x faster |
+| Q5_K | SmolLM2-135M | 11.6x faster |
+| Q6_K | SmolLM2-135M | 26.6x faster |
+
+> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`).
 
 ### NPZ/NPY Parsing
 
