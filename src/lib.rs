@@ -72,6 +72,11 @@
 // See CONVENTIONS.md "// SAFETY:" rules for the policy.
 #![deny(unsafe_code)]
 #![deny(warnings)]
+// Allow unknown lint names so that `#[allow(clippy::newer_lint)]` in test
+// modules does not become an error when built with MSRV clippy (which may
+// not recognise lints added in later releases). Without this, every new
+// clippy lint suppression is a potential MSRV CI break.
+#![allow(unknown_lints)]
 
 pub mod error;
 pub mod inspect;

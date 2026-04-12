@@ -24,6 +24,7 @@ the [Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/
 | Write a bulk conversion loop | [`// VECTORIZED:`](#vectorized-annotation), [SIMD-friendly loop rules](#when-writing-simd-friendly-loops) |
 | Write error strings | [Error message wording](#error-message-wording) |
 | Batch operations by key | [HashMap grouping idiom](#hashmap-grouping-idiom) |
+| Add `#[allow(clippy::...)]` for a newer lint | [MSRV lint guard](#msrv-lint-guard) |
 
 ---
 
@@ -242,6 +243,18 @@ Each accepted use must satisfy all of:
 
 Adding a new accepted use requires updating this table and the `cfg_attr` lines
 in `lib.rs`.
+
+### MSRV Lint Guard
+
+`lib.rs` carries `#![allow(unknown_lints)]` so that `#[allow(clippy::newer_lint)]`
+in test modules does not break the MSRV CI build. Without it, every new clippy
+lint suppression is a potential MSRV failure because `#![deny(warnings)]` implies
+`#[deny(unknown_lints)]`, and the MSRV toolchain's clippy may not recognise lint
+names added in later releases.
+
+No special action is required when adding a new `#[allow(clippy::...)]` — the
+crate-level `allow(unknown_lints)` covers it automatically. If the MSRV is bumped,
+this guard remains necessary as long as the MSRV is behind the development toolchain.
 
 ---
 
