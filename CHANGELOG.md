@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`pth_to_safetensors_bytes`** — in-memory `.pth` → safetensors conversion
+  returning `Vec<u8>` instead of writing to disk. Enables downstream crates
+  (candle-mi) to load `.pth` files without a temp file round-trip via
+  `VarBuilder::from_buffered_safetensors`.
+- **`ParsedPth::to_safetensors_bytes`** — convenience method combining
+  `tensors()` + `pth_to_safetensors_bytes()`.
+- **`ParsedGguf::dequantize_tensor`** — convenience method that slices the
+  mmap, infers element count from shape, and delegates to
+  `dequantize_gguf_to_bf16`. Saves consumers the three-line boilerplate on
+  every tensor iteration.
+- **GGUF CLI subcommands** — `amn parse model.gguf`, `amn inspect model.gguf`,
+  and `amn remember model.gguf --to bf16 -o out.safetensors` now work when
+  built with `--features gguf`. Format detection by `.gguf` extension with
+  `GGUF` magic fallback for `.bin` and unknown extensions. Quantized tensors
+  are dequantized to `BF16`; non-quantized tensors (`F32`, `F16`, `BF16`,
+  integer types) are passed through with their original dtype.
+
 ## [0.4.0] - 2026-04-12
 
 ### Added

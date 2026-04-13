@@ -30,22 +30,22 @@
 ## Install
 
 ```sh
-cargo install anamnesis --features cli,pth
+cargo install anamnesis --features cli,pth,gguf
 ```
 
-Installs both `anamnesis` and `amn` (short alias). Feature flags: `gptq`, `awq`, `bnb`, `npz`, `pth`, `indicatif` (progress bars).
+Installs both `anamnesis` and `amn` (short alias). Feature flags: `gptq`, `awq`, `bnb`, `npz`, `pth`, `gguf`, `indicatif` (progress bars).
 
 ## CLI Commands
 
 | Command | |
 |---------|---|
-| `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`) |
+| `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`, `.gguf`) |
 | `amn inspect <file>` | Show format, tensor counts, size estimates, and byte order |
-| `amn remember <file>` | Dequantize to BF16 (safetensors) or convert `.pth` → `.safetensors` |
+| `amn remember <file>` | Dequantize to BF16 (safetensors) or convert `.pth`/`.gguf` → `.safetensors` |
 
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`.
 
-Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser, `.npz` files go through the header-only NPZ inspector. `.bin` files are probed for ZIP magic to distinguish PyTorch from safetensors.
+Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser, `.npz` files go through the header-only NPZ inspector, `.gguf` files go through the GGUF parser. `.bin` files are probed for ZIP/GGUF magic to distinguish PyTorch, GGUF, and safetensors.
 
 ```
 $ amn parse model.pth
