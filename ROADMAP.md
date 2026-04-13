@@ -24,6 +24,7 @@
   - [Phase 3: NPZ/NPY Parsing](#phase-3-npznpy-parsing)
   - [Phase 3.5: PyTorch `.pth` Parsing](#phase-35-pytorch-pth-parsing)
   - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
+  - [Phase 4 patch: API polish + dogfooding (v0.4.1)](#phase-4-patch-api-polish--dogfooding-v041)
   - [Phase 4.5: GGUF Completeness](#phase-45-gguf-completeness)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
@@ -292,15 +293,27 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [x] **Feature-gated behind `gguf` feature** — added in commit `2acaf1a` as part of the parser commit (`gguf = ["dep:memmap2"]` in `Cargo.toml`). Reuses `memmap2` (already a `pth` dep) and `half` (already mandatory). No new third-party crate in any Phase 4 commit.
 - [x] **Cross-validation against `llama.cpp` reference dequantization** (commit `73f8e74`) — 10 of 12 production kernels bit-exact (0 ULP) against the `gguf` Python package's `dequantize` function (the official `ggml-org` reference mirroring `ggml-quants.c`'s `dequantize_row_*`). Legacy quants: `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`. K-quants: `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`. Fixtures from bartowski SmolLM2-135M-Instruct and TheBloke TinyLlama-1.1B-Chat (65 536-element slices). `Q8_1` and `Q8_K` are not shipped by any real model (internal `llama.cpp` activation quant types) and are already covered by unit tests. **6.3–31.3× faster** than the Python reference (AVX2). **10 integration tests.** — **PUSH + tag `v0.4.0`**
 
-**Deferred follow-ups:** every out-of-scope item is rehomed to **Phase 4.5: GGUF Completeness** (`IQ*`/`TQ*`/`MXFP4` kernels, GGUF CLI subcommands, `ParsedGguf::dequantize_tensor` convenience method — all targeting `v0.4.1`) and **Phase 9: CPU SIMD Pass** (cross-format AVX2/NEON pass-2 SIMD). Big-endian GGUF v3 support has no committed target — the parser detects byte-swapped magic and returns a clear `Unsupported` error, which is enough until a real big-endian model ships.
+**Deferred follow-ups:** every out-of-scope item is rehomed to **Phase 4.5: GGUF Completeness** (`IQ*`/`TQ*`/`MXFP4` kernels — targeting `v0.4.2`) and **Phase 9: CPU SIMD Pass** (cross-format AVX2/NEON pass-2 SIMD). User-facing polish (GGUF CLI subcommands, `ParsedGguf::dequantize_tensor`) is pulled into v0.4.1 alongside the in-memory safetensors API from the candle-mi dogfooding report. Big-endian GGUF v3 support has no committed target — the parser detects byte-swapped magic and returns a clear `Unsupported` error, which is enough until a real big-endian model ships.
 
 **Deliverable:** `anamnesis` v0.4.0 — GGUF parsing + dequantization works end-to-end with bit-exact `llama.cpp`-validated output. anamnesis becomes the only Rust crate that can parse *both* safetensors-based (GPTQ/AWQ/BnB/FP8) and GGUF-based quantized models and dequantize everything to BF16. — **PUSH + tag `v0.4.0`**
 
 **New dependencies:** None. The `gguf` feature pulls in `memmap2` (already used by `pth`) and relies on `half` (already mandatory). No third-party GGUF parser in the dependency tree.
 
+### Phase 4 patch: API polish + dogfooding (v0.4.1)
+
+**Goal:** Quick backward-compatible release bundling two GGUF polish items pulled forward from Phase 4.5 and one in-memory safetensors API addition requested by candle-mi dogfooding. Unblocks candle-mi stoicheia module (agnostic `.pth` loading) and gives GGUF users CLI + convenience-method access without waiting for the full `IQ*`/`TQ*`/`MXFP4` kernel work.
+
+**Dogfooding report:** [`docs/dogfooding-feedbacks/in-memory-safetensors-for-candle-mi.md`](docs/dogfooding-feedbacks/in-memory-safetensors-for-candle-mi.md) — candle-mi's stoicheia module needs an in-memory path from `.pth` bytes to safetensors bytes (`VarBuilder::from_buffered_safetensors`). The existing `pth_to_safetensors` writes to disk; the new `pth_to_safetensors_bytes` returns `Vec<u8>`.
+
+- [ ] **`pth_to_safetensors_bytes` + `ParsedPth::to_safetensors_bytes`** — in-memory `.pth` → safetensors conversion returning `Vec<u8>` instead of writing to disk. Enables downstream crates (candle-mi) to load `.pth` files without a temp file round-trip. Re-export from `lib.rs`. ~50 lines — **commit**
+- [ ] **`ParsedGguf::dequantize_tensor` convenience method** — thin wrapper that infers `n_elements` from `shape.iter().product()` and slices the mmap at `data_offset..data_offset + byte_len` before delegating to `dequantize_gguf_to_bf16`. ~10 lines — **commit**
+- [ ] **GGUF CLI subcommands** — extend `src/bin/main.rs` format detection to recognise the `"GGUF"` magic and add `amn parse model.gguf`, `amn inspect model.gguf`, and `amn remember model.gguf --to bf16 -o out.safetensors`. The library API from Phase 4 is already CLI-ready; only dispatch wiring is needed. ~30–50 lines — **commit** — **PUSH + tag `v0.4.1`**
+
+**Deliverable:** `anamnesis` v0.4.1 — in-memory safetensors API for `.pth`, GGUF CLI subcommands, and `dequantize_tensor` convenience method. ~100 lines total, fully backward compatible. — **PUSH + tag `v0.4.1`**
+
 ### Phase 4.5: GGUF Completeness
 
-**Goal:** Close the last remaining coverage gap in GGUF dequantisation so that anamnesis can handle every GGUF block type shipping on HuggingFace today. `v0.4.0` covers the 12 block types that back most mainstream models (`Q4_0`–`Q8_1`, `Q2_K`–`Q8_K`), but a growing fraction of 2025–2026 GGUF uploads use the newer `IQ*` family — `IQ4_XS` in particular has become a common "small but accurate" quant for many Llama 3, Qwen 2.5, and Mistral Nemo variants — plus a handful of models ship `TQ*` or `MXFP4`. Without those kernels, anamnesis rejects real files with `AnamnesisError::Unsupported`. Phase 4.5 also lands the user-facing polish (CLI subcommands + a `ParsedGguf::dequantize_tensor` convenience method) that was deliberately deferred from Phase 4.
+**Goal:** Close the last remaining coverage gap in GGUF dequantisation so that anamnesis can handle every GGUF block type shipping on HuggingFace today. `v0.4.0` covers the 12 block types that back most mainstream models (`Q4_0`–`Q8_1`, `Q2_K`–`Q8_K`), but a growing fraction of 2025–2026 GGUF uploads use the newer `IQ*` family — `IQ4_XS` in particular has become a common "small but accurate" quant for many Llama 3, Qwen 2.5, and Mistral Nemo variants — plus a handful of models ship `TQ*` or `MXFP4`. Without those kernels, anamnesis rejects real files with `AnamnesisError::Unsupported`.
 
 **Approach:** Port the scalar `dequantize_row_*` reference functions for the remaining block types from `ggml-quants.c` using the same loop-fission template as Phase 4. Most of the work is verbatim translation of the reference kernels plus verbatim copying of the lattice / codebook constant tables that the `IQ*` family uses (`iq2xxs_grid: [u64; 256]`, `iq3s_grid`, `iq1s_grid`, and siblings). Each variant has a distinct block struct layout documented in `ggml-common.h`; the test playbook is unchanged from Phase 4 — hand-constructed single-block fixtures per type, plus bit-exact cross-validation against `llama.cpp` reference output.
 
@@ -310,11 +323,9 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [ ] **`IQ1_S` and `IQ1_M` dequant kernels** — 1-bit super-quants, smallest footprint in the family. Rarer in practice but completes coverage — **commit**
 - [ ] **`TQ1_0` and `TQ2_0` dequant kernels** — ternary 1-bit and 2-bit packing. Added to `ggml` in 2024; used by a handful of research models — **commit**
 - [ ] **`MXFP4` dequant kernel** — 32-element microscaling FP4 (OCP standard, added to `ggml` in 2024). Distinct from the other `IQ*` / `TQ*` types because it uses standardised IEEE-like sub-block exponents rather than a learned codebook — **commit**
-- [ ] **`ParsedGguf::dequantize_tensor(&self, info: &GgufTensorInfo) -> crate::Result<Vec<u8>>` convenience method** — thin wrapper that infers `n_elements` from `shape.iter().product()` and slices the mmap at `data_offset..data_offset + byte_len` before delegating to `dequantize_gguf_to_bf16`. Saves consumers the three-line boilerplate on every tensor iteration — **commit**
-- [ ] **GGUF CLI subcommands** — extend `src/bin/main.rs` format detection to recognise the `"GGUF"` magic and add `amn parse model.gguf`, `amn inspect model.gguf`, and `amn remember model.gguf --to bf16 -o out.safetensors`. The library API from Phase 4 is already CLI-ready; only dispatch wiring is needed — **commit**
-- [ ] **Cross-validation extension** — add `IQ*` / `TQ*` / `MXFP4` reference outputs to the Phase 4 step 4 `llama.cpp` cross-validation harness. Same bit-exactness requirement as the Phase 4 kernels — **commit** — **PUSH + tag `v0.4.1`**
+- [ ] **Cross-validation extension** — add `IQ*` / `TQ*` / `MXFP4` reference outputs to the Phase 4 step 4 `llama.cpp` cross-validation harness. Same bit-exactness requirement as the Phase 4 kernels — **commit** — **PUSH + tag `v0.4.2`**
 
-**Deliverable:** `anamnesis` v0.4.1 — anamnesis now dequantises every GGUF block type shipping on HuggingFace, and the GGUF CLI subcommands let users exercise the whole pipeline from the command line without writing Rust. `IQ*`/`TQ*`/`MXFP4` are the last meaningful coverage gap; after this release anamnesis is a drop-in replacement for `llama.cpp`'s CPU dequant path. — **PUSH + tag `v0.4.1`**
+**Deliverable:** `anamnesis` v0.4.2 — anamnesis now dequantises every GGUF block type shipping on HuggingFace. `IQ*`/`TQ*`/`MXFP4` are the last meaningful coverage gap; after this release anamnesis is a drop-in replacement for `llama.cpp`'s CPU dequant path. — **PUSH + tag `v0.4.2`**
 
 **New dependencies:** None. Reuses the `gguf` feature gate, `memmap2`, and `half` from Phase 4.
 
