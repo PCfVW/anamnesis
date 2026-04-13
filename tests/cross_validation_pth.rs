@@ -217,3 +217,62 @@ fn roundtrip_algzoo_transformer_small() {
 fn roundtrip_algzoo_rnn_blog() {
     roundtrip_to_safetensors("algzoo_rnn_blog.pth", "algzoo_rnn_blog_reference.json");
 }
+
+// -- Roundtrip via bytes: .pth → in-memory safetensors → deserialize → compare --
+
+/// Parse a `.pth`, convert to in-memory safetensors bytes via
+/// [`ParsedPth::to_safetensors_bytes`], deserialize, and verify all tensor
+/// data matches the `PyTorch` reference byte-for-byte.
+fn roundtrip_via_bytes(pth_name: &str, json_name: &str) {
+    let pth_path = fixture_dir().join(pth_name);
+    let parsed = parse_pth(&pth_path).unwrap();
+
+    // Convert to in-memory safetensors bytes.
+    let st_data = parsed.to_safetensors_bytes().unwrap();
+
+    // Deserialize the safetensors bytes.
+    let st = safetensors::SafeTensors::deserialize(&st_data).unwrap();
+
+    // Compare against Python reference.
+    let reference = load_reference(json_name);
+    assert_eq!(st.len(), reference.num_tensors);
+
+    for py_ref in &reference.tensors {
+        let st_tensor = st
+            .tensor(&py_ref.name)
+            .unwrap_or_else(|e| panic!("tensor `{}` not in safetensors: {e}", py_ref.name));
+
+        assert_eq!(
+            st_tensor.shape().to_vec(),
+            py_ref.shape,
+            "shape mismatch after bytes roundtrip for tensor `{}`",
+            py_ref.name
+        );
+
+        let expected_bytes = hex_to_bytes(&py_ref.data_hex);
+        assert_eq!(
+            st_tensor.data(),
+            expected_bytes.as_slice(),
+            "DATA MISMATCH after bytes roundtrip for tensor `{}`",
+            py_ref.name
+        );
+    }
+}
+
+#[test]
+fn roundtrip_bytes_algzoo_rnn_small() {
+    roundtrip_via_bytes("algzoo_rnn_small.pth", "algzoo_rnn_small_reference.json");
+}
+
+#[test]
+fn roundtrip_bytes_algzoo_transformer_small() {
+    roundtrip_via_bytes(
+        "algzoo_transformer_small.pth",
+        "algzoo_transformer_small_reference.json",
+    );
+}
+
+#[test]
+fn roundtrip_bytes_algzoo_rnn_blog() {
+    roundtrip_via_bytes("algzoo_rnn_blog.pth", "algzoo_rnn_blog_reference.json");
+}

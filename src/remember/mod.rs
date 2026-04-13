@@ -32,4 +32,4 @@ pub use gguf::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
 #[cfg(feature = "gptq")]
 pub use gptq::dequantize_gptq_to_bf16;
 #[cfg(feature = "pth")]
-pub use pth::pth_to_safetensors;
+pub use pth::{pth_to_safetensors, pth_to_safetensors_bytes};

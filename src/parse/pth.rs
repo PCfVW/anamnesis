@@ -395,6 +395,28 @@ impl ParsedPth {
         crate::remember::pth::pth_to_safetensors(&tensors, output)
     }
 
+    /// Converts the parsed `.pth` tensors to an in-memory safetensors byte
+    /// buffer.
+    ///
+    /// Equivalent to calling [`tensors()`](Self::tensors) followed by
+    /// [`pth_to_safetensors_bytes`](crate::remember::pth::pth_to_safetensors_bytes)
+    /// — but as a single convenience method. The returned bytes can be
+    /// passed directly to `VarBuilder::from_buffered_safetensors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor extraction or
+    /// serialization fails.
+    ///
+    /// # Memory
+    ///
+    /// Materialises all tensors (zero-copy for contiguous LE data), then
+    /// serialises into a single `Vec<u8>`. Peak heap ≈ mmap + output buffer.
+    pub fn to_safetensors_bytes(&self) -> crate::Result<Vec<u8>> {
+        let tensors = self.tensors()?;
+        crate::remember::pth::pth_to_safetensors_bytes(&tensors)
+    }
+
     /// Returns lightweight per-tensor metadata (name, shape, dtype, byte
     /// length) without materializing tensor data.
     ///
