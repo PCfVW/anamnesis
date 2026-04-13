@@ -19,7 +19,7 @@ struct Cli {
 enum Commands {
     /// Parse and summarize a model file.
     Parse {
-        /// Path to the model file (`.safetensors`, `.pth`, `.pt`, `.bin`).
+        /// Path to the model file (`.safetensors`, `.pth`, `.pt`, `.bin`, `.gguf`).
         path: PathBuf,
     },
     /// Inspect format, tensor counts, and size estimates.
@@ -33,7 +33,7 @@ enum Commands {
     Remember {
         /// Path to the input model file.
         path: PathBuf,
-        /// Target dtype (currently only `bf16`) or `safetensors` for `.pth` conversion.
+        /// Target dtype (currently only `bf16`) or `safetensors` for `.pth`/`.gguf` conversion.
         #[arg(long, default_value = "bf16")]
         to: String,
         /// Output file path (derived from input if omitted).
@@ -53,13 +53,16 @@ enum Format {
     Pth,
     #[cfg(feature = "npz")]
     Npz,
+    #[cfg(feature = "gguf")]
+    Gguf,
 }
 
 /// Detects the model format from file extension and magic bytes.
 ///
 /// `.safetensors` → `Safetensors`. `.pth`/`.pt` → `Pth`. `.npz` → `Npz`.
-/// `.bin` → check ZIP magic (`PK\x03\x04`) to distinguish `PyTorch` ZIP
-/// from safetensors. Unknown extensions default to `Safetensors`.
+/// `.gguf` → `Gguf`. `.bin` → check ZIP magic (`PK\x03\x04`) for
+/// `PyTorch`, then `GGUF` magic. Unknown extensions try `GGUF` magic
+/// before defaulting to `Safetensors`.
 fn detect_format(path: &std::path::Path) -> Format {
     let ext = path
         .extension()
@@ -73,15 +76,26 @@ fn detect_format(path: &std::path::Path) -> Format {
         "pth" | "pt" => Format::Pth,
         #[cfg(feature = "npz")]
         "npz" => Format::Npz,
-        #[cfg(feature = "pth")]
+        #[cfg(feature = "gguf")]
+        "gguf" => Format::Gguf,
         "bin" => {
+            #[cfg(feature = "pth")]
             if has_zip_magic(path) {
-                Format::Pth
-            } else {
-                Format::Safetensors
+                return Format::Pth;
             }
+            #[cfg(feature = "gguf")]
+            if has_gguf_magic(path) {
+                return Format::Gguf;
+            }
+            Format::Safetensors
         }
-        _ => Format::Safetensors,
+        _ => {
+            #[cfg(feature = "gguf")]
+            if has_gguf_magic(path) {
+                return Format::Gguf;
+            }
+            Format::Safetensors
+        }
     }
 }
 
@@ -97,6 +111,21 @@ fn has_zip_magic(path: &std::path::Path) -> bool {
             f.read_exact(&mut buf)
         })
         .map(|()| buf == *b"PK\x03\x04")
+        .unwrap_or(false)
+}
+
+/// Returns `true` if the file starts with the `GGUF` magic bytes (`"GGUF"`).
+///
+/// Reads only 4 bytes — does not load the file into memory.
+#[cfg(feature = "gguf")]
+fn has_gguf_magic(path: &std::path::Path) -> bool {
+    let mut buf = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .map(|()| buf == *b"GGUF")
         .unwrap_or(false)
 }
 
@@ -121,6 +150,8 @@ fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
         Format::Pth => run_parse_pth(path),
         #[cfg(feature = "npz")]
         Format::Npz => run_parse_npz(path),
+        #[cfg(feature = "gguf")]
+        Format::Gguf => run_parse_gguf(path),
     }
 }
 
@@ -279,6 +310,12 @@ fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
         }
         #[cfg(feature = "npz")]
         Format::Npz => run_inspect_npz(path)?,
+        #[cfg(feature = "gguf")]
+        Format::Gguf => {
+            let parsed = anamnesis::parse_gguf(path)?;
+            let info = parsed.inspect();
+            println!("{info}");
+        }
     }
     Ok(())
 }
@@ -312,6 +349,20 @@ fn run_remember(
                      no dequantization or conversion needed"
                 .into(),
         }),
+        #[cfg(feature = "gguf")]
+        Format::Gguf => {
+            let to_lower = to.to_ascii_lowercase();
+            if to_lower != "safetensors" && to_lower != "bf16" {
+                return Err(anamnesis::AnamnesisError::Unsupported {
+                    format: "GGUF".into(),
+                    detail: format!(
+                        "unsupported --to value `{to}` for .gguf files \
+                         (supported: `safetensors`, `bf16`)"
+                    ),
+                });
+            }
+            run_remember_gguf(path, output)
+        }
     }
 }
 
@@ -400,6 +451,170 @@ fn run_remember_pth(
     parsed.to_safetensors(&output_path)?;
     println!("  Done.");
     Ok(())
+}
+
+#[cfg(feature = "gguf")]
+fn run_parse_gguf(path: &std::path::Path) -> anamnesis::Result<()> {
+    let parsed = anamnesis::parse_gguf(path)?;
+    let info = parsed.inspect();
+    let tensor_info = parsed.tensor_info();
+
+    println!(
+        "Parsed {} (GGUF v{})",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(unknown)"),
+        info.version
+    );
+    if let Some(arch) = info.architecture.as_deref() {
+        println!("  Arch:       {arch}");
+    }
+    println!("  Tensors:    {}", info.tensor_count);
+    println!("  Total size: {}", format_bytes(info.total_bytes));
+    let dtype_list: String = info
+        .dtypes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  Dtypes:     {dtype_list}");
+    println!("  Alignment:  {} bytes", info.alignment);
+    println!();
+
+    for t in tensor_info {
+        let shape_str = format!("{:?}", t.shape);
+        let byte_len_str = t.byte_len.map_or_else(|| "?".into(), format_bytes);
+        println!(
+            "  {:<40} {:<8} {:<15} {}",
+            t.name, t.dtype, shape_str, byte_len_str
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gguf")]
+fn run_remember_gguf(
+    path: &std::path::Path,
+    output: Option<&std::path::Path>,
+) -> anamnesis::Result<()> {
+    let parsed = anamnesis::parse_gguf(path)?;
+    let info = parsed.inspect();
+
+    let output_path = if let Some(p) = output {
+        p.to_owned()
+    } else {
+        let mut out = path.to_owned();
+        out.set_extension("safetensors");
+        out
+    };
+
+    println!(
+        "Converting {} → {}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(input)"),
+        output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(output)")
+    );
+    println!("  {} tensors", info.tensor_count);
+
+    // Dequantize quantized tensors to BF16; pass through non-quantized
+    // tensors (F32, F16, BF16, integer types) with their original dtype.
+    // Collect owned data because TensorView borrows data and all views
+    // must be alive simultaneously for serialize_to_file.
+    let mut tensor_data: Vec<(String, Vec<u8>, Vec<usize>, safetensors::Dtype)> =
+        Vec::with_capacity(info.tensor_count);
+    let mut dequantized_count: usize = 0;
+
+    for tensor in parsed.tensors() {
+        // GGUF shape is most-significant-first; safetensors expects
+        // row-major (NumPy-style). Reverse the dimensions.
+        let mut shape: Vec<usize> = tensor.shape.to_vec();
+        shape.reverse();
+
+        if tensor.dtype.is_quantized() {
+            let n_elements: usize = tensor.shape.iter().product();
+            let bf16_data =
+                anamnesis::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
+            tensor_data.push((
+                tensor.name.to_owned(),
+                bf16_data,
+                shape,
+                safetensors::Dtype::BF16,
+            ));
+            dequantized_count += 1;
+        } else {
+            let st_dtype = gguf_type_to_safetensors_dtype(tensor.dtype)?;
+            // BORROW: `.into_owned()` copies borrowed mmap bytes into an
+            // owned Vec so the data outlives the parsed borrow.
+            tensor_data.push((
+                tensor.name.to_owned(),
+                tensor.data.into_owned(),
+                shape,
+                st_dtype,
+            ));
+        }
+    }
+
+    println!(
+        "  {} dequantized to BF16, {} passed through",
+        dequantized_count,
+        tensor_data.len() - dequantized_count
+    );
+
+    // Build TensorView list and serialize to file.
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
+        tensor_data
+            .iter()
+            .map(|(name, data, shape, dtype)| {
+                let view = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
+                    .map_err(|e| anamnesis::AnamnesisError::Parse {
+                        reason: format!("failed to create TensorView for `{name}`: {e}"),
+                    })?;
+                Ok((name.clone(), view))
+            })
+            .collect::<anamnesis::Result<Vec<_>>>()?;
+
+    safetensors::tensor::serialize_to_file(views, &None, output_path.as_ref()).map_err(
+        // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
+        #[allow(clippy::wildcard_enum_match_arm)]
+        |e| match e {
+            safetensors::SafeTensorError::IoError(io_err) => anamnesis::AnamnesisError::Io(io_err),
+            other => anamnesis::AnamnesisError::Parse {
+                reason: format!("failed to write safetensors file: {other}"),
+            },
+        },
+    )?;
+
+    println!("  Output: {}", output_path.display());
+    Ok(())
+}
+
+/// Maps a non-quantized [`GgufType`](anamnesis::GgufType) to the
+/// corresponding `safetensors::Dtype`.
+#[cfg(feature = "gguf")]
+fn gguf_type_to_safetensors_dtype(
+    dtype: anamnesis::GgufType,
+) -> anamnesis::Result<safetensors::Dtype> {
+    // EXHAUSTIVE: GgufType is a foreign #[non_exhaustive] enum — new
+    // variants may be added. The wildcard covers future types.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match dtype {
+        anamnesis::GgufType::F32 => Ok(safetensors::Dtype::F32),
+        anamnesis::GgufType::F16 => Ok(safetensors::Dtype::F16),
+        anamnesis::GgufType::BF16 => Ok(safetensors::Dtype::BF16),
+        anamnesis::GgufType::F64 => Ok(safetensors::Dtype::F64),
+        anamnesis::GgufType::I8 => Ok(safetensors::Dtype::I8),
+        anamnesis::GgufType::I16 => Ok(safetensors::Dtype::I16),
+        anamnesis::GgufType::I32 => Ok(safetensors::Dtype::I32),
+        anamnesis::GgufType::I64 => Ok(safetensors::Dtype::I64),
+        other => Err(anamnesis::AnamnesisError::Unsupported {
+            format: "GGUF".into(),
+            detail: format!("no safetensors equivalent for {other}"),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
