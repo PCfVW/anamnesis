@@ -10,3 +10,6 @@ tests/fixtures/gguf_reference/models/
 
 # Local convention snapshots
 docs/conventions/
+
+# Internal dogfooding reports (referenced by ROADMAP.md but not published)
+docs/dogfooding-feedbacks/
