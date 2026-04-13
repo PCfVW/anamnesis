@@ -1085,6 +1085,78 @@ impl ParsedGguf {
             alignment: self.alignment,
         }
     }
+
+    /// Dequantises a single tensor from the memory-mapped file to `BF16`
+    /// bytes.
+    ///
+    /// Convenience method that slices the internal mmap using `info`'s
+    /// offset and byte length, infers the element count from `info.shape`,
+    /// and delegates to
+    /// [`dequantize_gguf_to_bf16`](crate::remember::gguf::dequantize_gguf_to_bf16).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if `info.byte_len` is `None`
+    /// (the dtype's block layout is not yet tabulated —
+    /// `IQ*`/`TQ*`/`MXFP4`), or if the dtype is a recognised but
+    /// not-yet-implemented quantisation type.
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the element count overflows
+    /// `usize`, the mmap slice is out of bounds, or the underlying
+    /// dequantisation kernel encounters a data/shape mismatch.
+    ///
+    /// # Memory
+    ///
+    /// Allocates a single `Vec<u8>` of length `n_elements * 2` for the
+    /// `BF16` output. The input data is read directly from the mmap — no
+    /// input copy. Peak heap is the output buffer (O(`n_elements`)).
+    pub fn dequantize_tensor(&self, info: &GgufTensorInfo) -> crate::Result<Vec<u8>> {
+        let byte_len_u64 = info.byte_len.ok_or_else(|| AnamnesisError::Unsupported {
+            format: "GGUF".into(),
+            detail: format!(
+                "byte size not known for dtype {} — dequantisation not yet supported",
+                info.dtype
+            ),
+        })?;
+        let start = usize::try_from(info.data_offset).map_err(|_| AnamnesisError::Parse {
+            reason: format!(
+                "tensor `{}`: data_offset {} exceeds usize",
+                info.name, info.data_offset
+            ),
+        })?;
+        let byte_len = usize::try_from(byte_len_u64).map_err(|_| AnamnesisError::Parse {
+            reason: format!(
+                "tensor `{}`: byte_len {byte_len_u64} exceeds usize",
+                info.name
+            ),
+        })?;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!(
+                    "tensor `{}`: data_offset + byte_len overflows usize",
+                    info.name
+                ),
+            })?;
+        let data = self
+            .mmap
+            .get(start..end)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!(
+                    "tensor `{}`: byte range {start}..{end} exceeds mmap length {}",
+                    info.name,
+                    self.mmap.len()
+                ),
+            })?;
+        let n_elements: usize = info
+            .shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("tensor `{}`: element count overflows usize", info.name),
+            })?;
+        crate::remember::gguf::dequantize_gguf_to_bf16(data, info.dtype, n_elements)
+    }
 }
 
 // ---------------------------------------------------------------------------
