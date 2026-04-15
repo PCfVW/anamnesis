@@ -16,6 +16,10 @@
 use std::process::Command;
 
 /// Path to the built binary (cargo sets this via the test harness).
+///
+/// Panics with a diagnostic message if the binary is missing or stale
+/// (version mismatch with `Cargo.toml`). Fix: run `cargo build` before
+/// `cargo test`.
 fn binary_path() -> std::path::PathBuf {
     // `cargo test` builds binaries into target/debug/
     let mut path = std::env::current_exe()
@@ -30,6 +34,28 @@ fn binary_path() -> std::path::PathBuf {
     } else {
         "anamnesis"
     });
+
+    // Guard: binary must exist
+    assert!(
+        path.exists(),
+        "CLI binary not found at {}. Run `cargo build --features cli` before `cargo test`.",
+        path.display()
+    );
+
+    // Guard: binary version must match Cargo.toml
+    let output = Command::new(&path)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", path.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = env!("CARGO_PKG_VERSION");
+    assert!(
+        stdout.contains(expected),
+        "STALE BINARY: {} reports `{stdout}` \
+         but Cargo.toml has v{expected}. Run `cargo build --features cli` before `cargo test`.",
+        path.display()
+    );
+
     path
 }
 
