@@ -9,6 +9,9 @@ repository = "https://github.com/PCfVW/anamnesis"
 homepage = "https://github.com/PCfVW/anamnesis"
 documentation = "https://docs.rs/anamnesis"
 keywords = ["safetensors", "dequantization", "pytorch", "gptq", "machine-learning"]
+
+[package.metadata.docs.rs]
+features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]
 categories = ["science", "parser-implementations"]
 default-run = "anamnesis"
 

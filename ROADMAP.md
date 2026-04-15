@@ -28,6 +28,7 @@
   - [Phase 4.5: GGUF Completeness](#phase-45-gguf-completeness)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
+  - [Phase 6.5: Benchmarking & Performance Validation](#phase-65-benchmarking--performance-validation)
   - [Phase 7: Python Bindings (PyO3)](#phase-7-python-bindings-pyo3)
   - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
   - [Phase 9: CPU SIMD Pass](#phase-9-cpu-simd-pass)
@@ -365,6 +366,26 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [ ] Cross-format round-trip validation — convert, then convert back, measure distortion — **commit** — **PUSH**
 
 **Deliverable:** `anamnesis` v0.6.0 — any-to-any format conversion. No Rust or Python tool does this today. — **PUSH + tag `v0.6.0`**
+
+### Phase 6.5: Benchmarking & Performance Validation
+
+**Goal:** Establish reproducible performance baselines before the Python bindings expose anamnesis to a much larger audience. Benchmark every dequantization kernel (throughput) and validate memory efficiency claims (peak heap). All benchmarking infrastructure is dev-only — zero impact on the published crate.
+
+**Approach:** Use [criterion](https://github.com/bheisler/criterion.rs) for runtime throughput benchmarks (statistical rigor, regression detection, baselines). Use [dhat-rs](https://github.com/nnethercote/dhat-rs) for peak-heap assertions in integration tests. Both are `[dev-dependencies]` only — bench code in `benches/`, memory tests in `tests/`.
+
+**Runtime benchmarks (`benches/`):**
+
+- [ ] Dequantization throughput — one benchmark per kernel family (FP8, GPTQ 4-bit, AWQ 4-bit, BnB NF4, BnB INT8, GGUF Q4_K), reporting elements/sec on synthetic tensors sized like real model layers (e.g., 4096x11008) — **commit**
+- [ ] Parsing throughput — safetensors, NPZ, PTH, GGUF header parsing, reporting MB/s against raw `fs::read` baseline — **commit**
+
+**Peak-memory validation (`tests/`):**
+
+- [ ] Peak-heap assertions for GPTQ/AWQ dequantization — verify lazy precomputation keeps peak heap within `output_size + O(out_features)`, not `output_size + O(num_groups × out_features)` — **commit**
+- [ ] Peak-heap assertions for BnB double-quant — verify no intermediate byte-serialization allocation — **commit** — **PUSH**
+
+**New dev-dependencies:** `criterion` (runtime), `dhat` (peak heap). Not compiled into the published crate.
+
+**Deliverable:** Baselines recorded, CI can detect regressions, performance claims in README are backed by reproducible numbers. No version bump — this is infrastructure, not a user-facing release.
 
 ### Phase 7: Python Bindings (PyO3)
 

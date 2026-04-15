@@ -13,3 +13,6 @@ docs/conventions/
 
 # Internal dogfooding reports (referenced by ROADMAP.md but not published)
 docs/dogfooding-feedbacks/
+
+# External audit reports (private, not published)
+docs/EXTERNAL AUDIT/

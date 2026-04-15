@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`[package.metadata.docs.rs]`** — docs.rs now builds with `features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]`, exposing all feature-gated public API items on docs.rs.
+
+### Changed
+
+- **GPTQ/AWQ lazy precomputation** — scale and zero-point arrays are now computed per-group on demand instead of precomputing the full `num_groups × out_features` grid upfront. Reduces intermediate memory from `O(num_groups × out_features)` to `O(out_features)` with no throughput regression.
+- **BnB double-quant refactor** — extracted shared `dequantize_bnb4_core` accepting `&[f32]` absmax directly. The double-quant path no longer serializes `Vec<f32>` to `Vec<u8>` and back; eliminates one allocation and one copy loop.
+- **GPTQ g_idx pre-validation** — `g_idx` entries are now validated against `num_groups` in a single pass before the hot loop, failing fast on corrupted files instead of mid-dequantization.
+- **CLI stale-binary guard** — `binary_path()` in CLI integration tests now checks that the binary version matches `Cargo.toml` and panics with a diagnostic message if stale. Pre-commit checks updated to include `cargo build --features cli`.
+
 ## [0.4.1] - 2026-04-13
 
 ### Added
