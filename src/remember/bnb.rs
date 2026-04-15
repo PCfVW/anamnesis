@@ -34,6 +34,87 @@ fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
 // NF4/FP4 dequantization (4-bit, lookup-table based)
 // ---------------------------------------------------------------------------
 
+/// Core `NF4`/`FP4` dequant: accepts pre-decoded `f32` absmax values directly.
+///
+/// Shared by both the plain and double-quant public entry points.
+/// Callers are responsible for validation; this function assumes inputs
+/// are dimensionally consistent.
+fn dequantize_bnb4_core(
+    weight_data: &[u8],
+    absmax: &[f32],
+    quant_map: &[f32; 16],
+    total_elements: usize,
+    block_size: usize,
+) -> crate::Result<Vec<u8>> {
+    // --- Allocate output ---
+    let out_byte_len = total_elements
+        .checked_mul(2)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "BnB4 output byte count overflow".into(),
+        })?;
+    let mut output = vec![0u8; out_byte_len];
+
+    // --- Per-block dequantization with loop fission ---
+    let bytes_per_block = block_size / 2;
+    // Scratch buffer for unpacked f32 values (one block at a time, fits in L1)
+    let mut scratch = vec![0.0f32; block_size];
+
+    for (block_idx, &block_absmax) in absmax.iter().enumerate() {
+        // Pre-slice validated ranges (two-level bounds checking per CONVENTIONS.md)
+        let w_start = block_idx * bytes_per_block;
+        let w_end = w_start + bytes_per_block;
+        let weight_block =
+            weight_data
+                .get(w_start..w_end)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("BnB4 weight block {block_idx} out of bounds"),
+                })?;
+        let o_start = block_idx * block_size * 2;
+        let o_end = o_start + block_size * 2;
+        let out_block = output
+            .get_mut(o_start..o_end)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("BnB4 output block {block_idx} out of bounds"),
+            })?;
+
+        // --- Pass 1 (unpack): byte → 2 nibbles → table lookup → f32 scratch ---
+        // Each byte produces two f32 values via the quant_map lookup.
+        // VECTORIZED: pass 1 extracts nibbles and performs table lookup;
+        // pass 2 does pure f32 multiply + BF16 convert (verified: vmulps ymm
+        // with target-cpu=native).
+        // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
+        #[allow(clippy::indexing_slicing)]
+        let scratch_block = &mut scratch[..block_size];
+        for (&byte, pair) in weight_block.iter().zip(scratch_block.chunks_exact_mut(2)) {
+            // BITWISE: extract low nibble (bits [3:0]) and high nibble (bits [7:4])
+            // CAST: u8 → usize, nibble values 0-15 used as lookup indices
+            #[allow(clippy::as_conversions)]
+            let low = (byte & 0x0F) as usize;
+            #[allow(clippy::as_conversions)]
+            let high = (byte >> 4) as usize;
+            // INDEX: low and high are 0-15, quant_map has 16 entries
+            #[allow(clippy::indexing_slicing)]
+            {
+                pair[0] = quant_map[low];
+                pair[1] = quant_map[high];
+            }
+        }
+
+        // --- Pass 2 (scale): f32 scratch × absmax → BF16 output ---
+        // Pure float multiply + BF16 integer rounding — vectorizes to AVX2.
+        // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
+        #[allow(clippy::indexing_slicing)]
+        let scratch_view = &scratch[..block_size];
+        for (val, out_pair) in scratch_view.iter().zip(out_block.chunks_exact_mut(2)) {
+            let scaled = val * block_absmax;
+            let bf16 = f32_bits_to_bf16_bits(scaled.to_bits());
+            out_pair.copy_from_slice(&bf16.to_le_bytes());
+        }
+    }
+
+    Ok(output)
+}
+
 /// Dequantizes `BitsAndBytes` `NF4`/`FP4` quantized weights to `BF16`.
 ///
 /// Each byte in `weight_data` packs two 4-bit values: low nibble first
@@ -44,7 +125,7 @@ fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
 /// # Arguments
 ///
 /// - `weight_data` — `U8` bytes, two `NF4`/`FP4` values per byte.
-/// - `absmax_data` — `F32` per-block absmax values.
+/// - `absmax_data` — `F32` per-block absmax values (little-endian bytes).
 /// - `quant_map_data` — `F32[16]` lookup table.
 /// - `total_elements` — total number of dequantized elements (= weight bytes × 2).
 /// - `block_size` — elements per absmax block (typically 64).
@@ -124,78 +205,21 @@ pub fn dequantize_bnb4_to_bf16(
         })?;
     }
 
-    // --- Allocate output ---
-    let out_byte_len = total_elements
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB4 output byte count overflow".into(),
+    // --- Decode absmax bytes → f32 slice ---
+    let mut absmax_f32 = vec![0.0f32; num_blocks];
+    for (i, val) in absmax_f32.iter_mut().enumerate() {
+        *val = read_f32_le(absmax_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("BnB4 absmax read out of bounds at block {i}"),
         })?;
-    let mut output = vec![0u8; out_byte_len];
-
-    // --- Per-block dequantization with loop fission ---
-    let bytes_per_block = block_size / 2;
-    // Scratch buffer for unpacked f32 values (one block at a time, fits in L1)
-    let mut scratch = vec![0.0f32; block_size];
-
-    for block_idx in 0..num_blocks {
-        let absmax =
-            read_f32_le(absmax_data, block_idx * 4).ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("BnB4 absmax read out of bounds at block {block_idx}"),
-            })?;
-
-        // Pre-slice validated ranges (two-level bounds checking per CONVENTIONS.md)
-        let w_start = block_idx * bytes_per_block;
-        let w_end = w_start + bytes_per_block;
-        let weight_block =
-            weight_data
-                .get(w_start..w_end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("BnB4 weight block {block_idx} out of bounds"),
-                })?;
-        let o_start = block_idx * block_size * 2;
-        let o_end = o_start + block_size * 2;
-        let out_block = output
-            .get_mut(o_start..o_end)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("BnB4 output block {block_idx} out of bounds"),
-            })?;
-
-        // --- Pass 1 (unpack): byte → 2 nibbles → table lookup → f32 scratch ---
-        // Each byte produces two f32 values via the quant_map lookup.
-        // VECTORIZED: pass 1 extracts nibbles and performs table lookup;
-        // pass 2 does pure f32 multiply + BF16 convert (verified: vmulps ymm
-        // with target-cpu=native).
-        // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
-        #[allow(clippy::indexing_slicing)]
-        let scratch_block = &mut scratch[..block_size];
-        for (&byte, pair) in weight_block.iter().zip(scratch_block.chunks_exact_mut(2)) {
-            // BITWISE: extract low nibble (bits [3:0]) and high nibble (bits [7:4])
-            // CAST: u8 → usize, nibble values 0-15 used as lookup indices
-            #[allow(clippy::as_conversions)]
-            let low = (byte & 0x0F) as usize;
-            #[allow(clippy::as_conversions)]
-            let high = (byte >> 4) as usize;
-            // INDEX: low and high are 0-15, quant_map has 16 entries
-            #[allow(clippy::indexing_slicing)]
-            {
-                pair[0] = quant_map[low];
-                pair[1] = quant_map[high];
-            }
-        }
-
-        // --- Pass 2 (scale): f32 scratch × absmax → BF16 output ---
-        // Pure float multiply + BF16 integer rounding — vectorizes to AVX2.
-        // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
-        #[allow(clippy::indexing_slicing)]
-        let scratch_view = &scratch[..block_size];
-        for (val, out_pair) in scratch_view.iter().zip(out_block.chunks_exact_mut(2)) {
-            let scaled = val * absmax;
-            let bf16 = f32_bits_to_bf16_bits(scaled.to_bits());
-            out_pair.copy_from_slice(&bf16.to_le_bytes());
-        }
     }
 
-    Ok(output)
+    dequantize_bnb4_core(
+        weight_data,
+        &absmax_f32,
+        &quant_map,
+        total_elements,
+        block_size,
+    )
 }
 
 /// Dequantizes `BitsAndBytes` `NF4`/`FP4` with double quantization to `BF16`.
@@ -220,8 +244,9 @@ pub fn dequantize_bnb4_to_bf16(
 ///
 /// # Memory
 ///
-/// Allocates `total_elements × 2` bytes for `BF16` output, plus intermediate
-/// `F32` absmax array (`num_blocks × 4` bytes).
+/// Allocates `total_elements × 2` bytes for `BF16` output, plus an `f32`
+/// absmax array (`num_blocks × 4` bytes) and a scratch buffer
+/// (`block_size × 4` bytes). No intermediate byte serialization.
 #[allow(clippy::too_many_arguments)]
 pub fn dequantize_bnb4_double_quant_to_bf16(
     weight_data: &[u8],
@@ -317,20 +342,28 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
         }
     }
 
-    // --- Build F32 absmax byte slice from dequantized values ---
-    let mut absmax_f32_bytes = vec![0u8; num_blocks * 4];
-    for (&val, chunk) in dequantized_absmax
-        .iter()
-        .zip(absmax_f32_bytes.chunks_exact_mut(4))
-    {
-        chunk.copy_from_slice(&val.to_le_bytes());
+    // --- Pre-load quant_map (16 entries) ---
+    if quant_map_data.len() != 64 {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 quant_map must be 64 bytes (16×F32), got {}",
+                quant_map_data.len()
+            ),
+        });
+    }
+    let mut quant_map = [0.0f32; 16];
+    for (i, val) in quant_map.iter_mut().enumerate() {
+        *val = read_f32_le(quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: "BnB4 quant_map read out of bounds".into(),
+        })?;
     }
 
-    // --- Delegate to plain NF4/FP4 dequant with recovered absmax ---
-    dequantize_bnb4_to_bf16(
+    // --- Delegate to core dequant with recovered f32 absmax directly ---
+    // No intermediate serialization: dequantized_absmax is passed as &[f32].
+    dequantize_bnb4_core(
         weight_data,
-        &absmax_f32_bytes,
-        quant_map_data,
+        &dequantized_absmax,
+        &quant_map,
         total_elements,
         block_size,
     )

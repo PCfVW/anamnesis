@@ -16,27 +16,25 @@ use crate::remember::fp8::f32_bits_to_bf16_bits;
 use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 
 // ---------------------------------------------------------------------------
-// Precomputation
+// Per-group unpacking (lazy, cache-friendly)
 // ---------------------------------------------------------------------------
 
-/// Precompute all zero-point values (unpacked, NO +1 offset) as `f32`.
+/// Unpacks zero-point values (NO +1 offset) for a single group into `buf`.
 ///
-/// Returns a flat `Vec<f32>` of length `num_groups × out_features`.
-///
+/// Fills `buf[0..out_features]` with the f32 zero-points for group `g`.
 /// Unlike `GPTQ`, `AWQ` does NOT add +1 to zero-points. The stored values
 /// are used directly: `dequant = (qw - qz) × scale`.
-///
-/// `AWQ` packs `qzeros` along `out_features`: shape `[num_groups, out_features / pack_factor]`.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `qzeros_data` is too short.
-fn precompute_zeros(
+fn unpack_zeros_for_group(
+    buf: &mut [f32],
     qzeros_data: &[u8],
-    num_groups: usize,
+    g: usize,
     out_features: usize,
     bits: u8,
-) -> crate::Result<Vec<f32>> {
+) -> crate::Result<()> {
     // CAST: u8 → u32, bits is 4 or 8
     #[allow(clippy::as_conversions)]
     let bits_u32 = u32::from(bits);
@@ -52,68 +50,64 @@ fn precompute_zeros(
                 reason: "pack_factor is zero".into(),
             })?;
 
-    let total = num_groups
-        .checked_mul(out_features)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "num_groups × out_features overflow".into(),
-        })?;
-    let mut zeros = Vec::with_capacity(total);
+    for (j, buf_val) in buf.iter_mut().enumerate() {
+        let packed_col = j / pack_factor;
+        let pos = j % pack_factor;
+        // CAST: usize → u32, pos is at most 7 (4-bit) or 3 (8-bit)
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let shift = bits_u32 * (pos as u32);
 
-    for g in 0..num_groups {
-        for j in 0..out_features {
-            let packed_col = j / pack_factor;
-            let pos = j % pack_factor;
-            // CAST: usize → u32, pos is at most 7 (4-bit) or 3 (8-bit)
-            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-            let shift = bits_u32 * (pos as u32);
-
-            let byte_offset = (g * packed_cols + packed_col)
-                .checked_mul(4)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "qzeros byte offset overflow".into(),
-                })?;
-            let packed = read_u32_le(qzeros_data, byte_offset)?;
-            // BITWISE: extract unsigned zero-point — NO +1 offset (AWQ convention)
-            let qz = (packed >> shift) & mask;
-            // CAST: u32 → f32, qz is at most 15 (4-bit) or 255 (8-bit), exact in f32
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
-            let zero_f32 = qz as f32;
-            zeros.push(zero_f32);
+        let byte_offset = (g * packed_cols + packed_col)
+            .checked_mul(4)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "qzeros byte offset overflow".into(),
+            })?;
+        let packed = read_u32_le(qzeros_data, byte_offset)?;
+        // BITWISE: extract unsigned zero-point — NO +1 offset (AWQ convention)
+        let qz = (packed >> shift) & mask;
+        // CAST: u32 → f32, qz is at most 15 (4-bit) or 255 (8-bit), exact in f32
+        #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+        {
+            *buf_val = qz as f32;
         }
     }
 
-    Ok(zeros)
+    Ok(())
 }
 
-/// Precompute all scale factors as `f32` for all groups.
+/// Unpacks scale factors for a single group into `buf`.
 ///
-/// Returns a flat `Vec<f32>` of length `num_groups × out_features`.
+/// Fills `buf[0..out_features]` with the f32 scales for group `g`.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `scales_data` is too short.
-fn precompute_scales(
+/// Returns [`AnamnesisError::Parse`] if `scales_data` is too short or the
+/// dtype is unsupported.
+fn unpack_scales_for_group(
+    buf: &mut [f32],
     scales_data: &[u8],
-    num_groups: usize,
+    g: usize,
     out_features: usize,
     scale_dtype: Dtype,
-) -> crate::Result<Vec<f32>> {
+) -> crate::Result<()> {
     let bps = scale_dtype.byte_size();
-    let total = num_groups
+    let row_start = g
         .checked_mul(out_features)
         .ok_or_else(|| AnamnesisError::Parse {
-            reason: "num_groups × out_features overflow".into(),
+            reason: "scales group row offset overflow".into(),
         })?;
-    let mut scales = Vec::with_capacity(total);
 
-    for idx in 0..total {
-        let byte_offset = idx.checked_mul(bps).ok_or_else(|| AnamnesisError::Parse {
-            reason: "scale byte offset overflow".into(),
-        })?;
-        scales.push(read_scale_f32(scales_data, byte_offset, scale_dtype)?);
+    for (j, buf_val) in buf.iter_mut().enumerate() {
+        let byte_offset = row_start
+            .checked_add(j)
+            .and_then(|idx| idx.checked_mul(bps))
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "scale byte offset overflow".into(),
+            })?;
+        *buf_val = read_scale_f32(scales_data, byte_offset, scale_dtype)?;
     }
 
-    Ok(scales)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -153,9 +147,11 @@ fn precompute_scales(
 ///
 /// # Memory
 ///
-/// Allocates precomputed zero-point and scale arrays (`num_groups × out_features × 4`
-/// bytes each), a scratch buffer (`out_features × 4` bytes), plus the output
-/// buffer (`in_features × out_features × 2` bytes).
+/// Allocates per-group scratch buffers for zero-points and scales
+/// (`out_features × 4` bytes each), an unpacking scratch buffer
+/// (`out_features × 4` bytes), plus the output buffer
+/// (`in_features × out_features × 2` bytes). Group data is computed
+/// lazily — only the current group's row is live at any time.
 #[allow(clippy::too_many_arguments)]
 pub fn dequantize_awq_to_bf16(
     qweight_data: &[u8],
@@ -252,11 +248,7 @@ pub fn dequantize_awq_to_bf16(
         });
     }
 
-    // --- Precompute group data ---
-    let all_zeros = precompute_zeros(qzeros_data, num_groups, out_features, bits)?;
-    let all_scales = precompute_scales(scales_data, num_groups, out_features, scale_dtype)?;
-
-    // --- Allocate output + scratch buffer ---
+    // --- Allocate output + scratch buffers ---
     let out_byte_len = in_features
         .checked_mul(out_features)
         .and_then(|n| n.checked_mul(2))
@@ -265,8 +257,13 @@ pub fn dequantize_awq_to_bf16(
         })?;
     let mut output = vec![0u8; out_byte_len];
 
-    // Scratch buffer for unpacked f32 values (one row, reused across iterations).
+    // Pre-allocate scratch buffers for one row each (reused across iterations).
+    // Lazy per-group: only `out_features` f32 values are live at a time,
+    // instead of the full `num_groups × out_features` grid.
     let mut unpacked_buf = vec![0.0_f32; out_features];
+    let mut zeros_buf = vec![0.0_f32; out_features];
+    let mut scales_buf = vec![0.0_f32; out_features];
+    let mut cached_group: Option<usize> = None;
 
     // --- Precompute constants ---
     // CAST: u8 → u32, bits is 4 or 8
@@ -300,21 +297,16 @@ pub fn dequantize_awq_to_bf16(
                     reason: format!("qweight row {i} out of bounds"),
                 })?;
 
-        // Group zeros and scales: contiguous f32 slices, pre-validated.
-        let group_start = g * out_features;
-        let group_end = group_start + out_features;
-        let zeros_row =
-            all_zeros
-                .get(group_start..group_end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("zeros row for group {g} out of bounds"),
-                })?;
-        let scales_row =
-            all_scales
-                .get(group_start..group_end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("scales row for group {g} out of bounds"),
-                })?;
+        // Lazy per-group unpacking: refill zeros/scales only when the group
+        // changes. For sequential access, this fires once per group_size rows.
+        // The scratch buffers are out_features-sized and L1-resident.
+        if cached_group != Some(g) {
+            unpack_zeros_for_group(&mut zeros_buf, qzeros_data, g, out_features, bits)?;
+            unpack_scales_for_group(&mut scales_buf, scales_data, g, out_features, scale_dtype)?;
+            cached_group = Some(g);
+        }
+        let zeros_row = &zeros_buf[..];
+        let scales_row = &scales_buf[..];
 
         // Output row.
         let out_row_start = i

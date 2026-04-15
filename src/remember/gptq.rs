@@ -36,27 +36,25 @@ fn unpack_gptq(packed: u32, shift: u32, mask: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Precomputation
+// Per-group unpacking (lazy, cache-friendly)
 // ---------------------------------------------------------------------------
 
-/// Precompute all zero-point values (unpacked + 1) as `f32` for all groups.
+/// Unpacks zero-point values (with +1 offset) for a single group into `buf`.
 ///
-/// Returns a flat `Vec<f32>` of length `num_groups × out_features`.
-/// Element `[g * out_features + j]` is the zero-point for group `g`,
-/// output feature `j`.
-///
+/// Fills `buf[0..out_features]` with the f32 zero-points for group `g`.
 /// The +1 offset follows the standard `GPTQ` convention: `qzeros` are stored
 /// as `actual_zero - 1` during packing, and `+ 1` is applied during unpacking.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `qzeros_data` is too short.
-fn precompute_zeros(
+fn unpack_zeros_for_group(
+    buf: &mut [f32],
     qzeros_data: &[u8],
-    num_groups: usize,
+    g: usize,
     out_features: usize,
     bits: u8,
-) -> crate::Result<Vec<f32>> {
+) -> crate::Result<()> {
     // CAST: u8 → u32, bits is 4 or 8
     #[allow(clippy::as_conversions)]
     let bits_u32 = u32::from(bits);
@@ -72,72 +70,65 @@ fn precompute_zeros(
                 reason: "pack_factor is zero".into(),
             })?;
 
-    let total = num_groups
-        .checked_mul(out_features)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "num_groups × out_features overflow".into(),
-        })?;
-    let mut zeros = Vec::with_capacity(total);
+    for (j, buf_val) in buf.iter_mut().enumerate() {
+        let packed_col = j / pack_factor;
+        let pos = j % pack_factor;
+        // CAST: usize → u32, pos is at most 7 (4-bit) or 3 (8-bit)
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let shift = bits_u32 * (pos as u32);
 
-    for g in 0..num_groups {
-        for j in 0..out_features {
-            let packed_col = j / pack_factor;
-            let pos = j % pack_factor;
-            // CAST: usize → u32, pos is at most 7 (4-bit) or 3 (8-bit)
-            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-            let shift = bits_u32 * (pos as u32);
+        let byte_offset = (g * packed_cols + packed_col)
+            .checked_mul(4)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "qzeros byte offset overflow".into(),
+            })?;
+        let packed = read_u32_le(qzeros_data, byte_offset)?;
+        let qz = unpack_gptq(packed, shift, mask);
 
-            let byte_offset = (g * packed_cols + packed_col)
-                .checked_mul(4)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "qzeros byte offset overflow".into(),
-                })?;
-            let packed = read_u32_le(qzeros_data, byte_offset)?;
-            let qz = unpack_gptq(packed, shift, mask);
-
-            // BITWISE: +1 offset per standard GPTQ convention (stored as actual-1)
-            // CAST: u32 → f32, qz+1 is at most 16 (4-bit) or 256 (8-bit), exact in f32
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
-            let zero_f32 = (qz + 1) as f32;
-            zeros.push(zero_f32);
+        // BITWISE: +1 offset per standard GPTQ convention (stored as actual-1)
+        // CAST: u32 → f32, qz+1 is at most 16 (4-bit) or 256 (8-bit), exact in f32
+        #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+        {
+            *buf_val = (qz + 1) as f32;
         }
     }
 
-    Ok(zeros)
+    Ok(())
 }
 
-/// Precompute all scale factors as `f32` for all groups.
+/// Unpacks scale factors for a single group into `buf`.
 ///
-/// Returns a flat `Vec<f32>` of length `num_groups × out_features`.
-/// Element `[g * out_features + j]` is the scale for group `g`,
-/// output feature `j`.
+/// Fills `buf[0..out_features]` with the f32 scales for group `g`.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `scales_data` is too short or the
 /// dtype is unsupported.
-fn precompute_scales(
+fn unpack_scales_for_group(
+    buf: &mut [f32],
     scales_data: &[u8],
-    num_groups: usize,
+    g: usize,
     out_features: usize,
     scale_dtype: Dtype,
-) -> crate::Result<Vec<f32>> {
+) -> crate::Result<()> {
     let bps = scale_dtype.byte_size();
-    let total = num_groups
+    let row_start = g
         .checked_mul(out_features)
         .ok_or_else(|| AnamnesisError::Parse {
-            reason: "num_groups × out_features overflow".into(),
+            reason: "scales group row offset overflow".into(),
         })?;
-    let mut scales = Vec::with_capacity(total);
 
-    for idx in 0..total {
-        let byte_offset = idx.checked_mul(bps).ok_or_else(|| AnamnesisError::Parse {
-            reason: "scale byte offset overflow".into(),
-        })?;
-        scales.push(read_scale_f32(scales_data, byte_offset, scale_dtype)?);
+    for (j, buf_val) in buf.iter_mut().enumerate() {
+        let byte_offset = row_start
+            .checked_add(j)
+            .and_then(|idx| idx.checked_mul(bps))
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "scale byte offset overflow".into(),
+            })?;
+        *buf_val = read_scale_f32(scales_data, byte_offset, scale_dtype)?;
     }
 
-    Ok(scales)
+    Ok(())
 }
 
 /// Parse the `g_idx` tensor into a `Vec<usize>` of group indices.
@@ -216,9 +207,11 @@ fn parse_g_idx(g_idx_data: &[u8], in_features: usize) -> crate::Result<Vec<usize
 ///
 /// # Memory
 ///
-/// Allocates precomputed zero-point and scale arrays (`num_groups × out_features × 4`
-/// bytes each, up to ~8 MB per weight tensor for fine-grained groups), plus the output buffer
-/// (`in_features × out_features × 2` bytes).
+/// Allocates per-group scratch buffers for zero-points and scales
+/// (`out_features × 4` bytes each), an unpacking scratch buffer
+/// (`out_features × 4` bytes), plus the output buffer
+/// (`in_features × out_features × 2` bytes). Group data is computed
+/// lazily — only the current group's row is live at any time.
 #[allow(clippy::too_many_arguments)]
 pub fn dequantize_gptq_to_bf16(
     qweight_data: &[u8],
@@ -324,14 +317,21 @@ pub fn dequantize_gptq_to_bf16(
         });
     }
 
-    // --- Precompute group data ---
-    let all_zeros = precompute_zeros(qzeros_data, num_groups, out_features, bits)?;
-    let all_scales = precompute_scales(scales_data, num_groups, out_features, scale_dtype)?;
-
     // --- Parse g_idx if present ---
     let g_idx = g_idx_data
         .map(|data| parse_g_idx(data, in_features))
         .transpose()?;
+
+    // --- Pre-validate g_idx entries (fail-fast before the hot loop) ---
+    if let Some(ref idx) = g_idx {
+        for (i, &g) in idx.iter().enumerate() {
+            if g >= num_groups {
+                return Err(AnamnesisError::Parse {
+                    reason: format!("g_idx[{i}] = {g} >= num_groups {num_groups}"),
+                });
+            }
+        }
+    }
 
     // --- Allocate output ---
     let out_byte_len = in_features
@@ -349,15 +349,21 @@ pub fn dequantize_gptq_to_bf16(
     // BITWISE: mask for one quantized value, e.g. 0xF for 4-bit, 0xFF for 8-bit
     let mask = (1u32 << bits_u32) - 1;
 
-    // Pre-allocate a scratch buffer for unpacked f32 values (one row).
-    // Reused across iterations to avoid per-row allocation.
+    // Pre-allocate scratch buffers for one row each (reused across iterations).
+    // Lazy per-group: only `out_features` f32 values are live at a time,
+    // instead of the full `num_groups × out_features` grid.
     let mut unpacked_buf = vec![0.0_f32; out_features];
+    let mut zeros_buf = vec![0.0_f32; out_features];
+    let mut scales_buf = vec![0.0_f32; out_features];
+    let mut cached_group: Option<usize> = None;
 
     // --- Hot loop: row-by-row dequantization ---
     // Two-level bounds checking per CONVENTIONS.md: validate slices ONCE
     // before the inner loop, then iterate branch-free inside.
     for i in 0..in_features {
         // Determine group for this input feature.
+        // INDEX: g < num_groups guaranteed by pre-validation above (g_idx path)
+        // or by i < in_features ∧ in_features = num_groups × group_size (sequential path).
         let g = if let Some(ref idx) = g_idx {
             // INDEX: i < in_features, g_idx.len() == in_features (validated in parse_g_idx)
             idx.get(i).copied().ok_or_else(|| AnamnesisError::Parse {
@@ -366,12 +372,6 @@ pub fn dequantize_gptq_to_bf16(
         } else {
             i / group_size
         };
-
-        if g >= num_groups {
-            return Err(AnamnesisError::Parse {
-                reason: format!("group index {g} >= num_groups {num_groups} at input feature {i}"),
-            });
-        }
 
         let packed_row = i / pack_factor;
         let pos = i % pack_factor;
@@ -396,21 +396,17 @@ pub fn dequantize_gptq_to_bf16(
                     reason: format!("qweight row {packed_row} out of bounds"),
                 })?;
 
-        // Group zeros and scales: contiguous f32 slices, pre-validated.
-        let group_start = g * out_features;
-        let group_end = group_start + out_features;
-        let zeros_row =
-            all_zeros
-                .get(group_start..group_end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("zeros row for group {g} out of bounds"),
-                })?;
-        let scales_row =
-            all_scales
-                .get(group_start..group_end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("scales row for group {g} out of bounds"),
-                })?;
+        // Lazy per-group unpacking: refill zeros/scales only when the group
+        // changes. For sequential access (no g_idx), this fires once per
+        // group_size rows. The scratch buffers are out_features-sized and
+        // L1-resident.
+        if cached_group != Some(g) {
+            unpack_zeros_for_group(&mut zeros_buf, qzeros_data, g, out_features, bits)?;
+            unpack_scales_for_group(&mut scales_buf, scales_data, g, out_features, scale_dtype)?;
+            cached_group = Some(g);
+        }
+        let zeros_row = &zeros_buf[..];
+        let scales_row = &scales_buf[..];
 
         // Output row: contiguous BF16 bytes.
         let out_row_start = i
@@ -742,6 +738,53 @@ mod tests {
         // in_features=5 is not a multiple of pack_factor=8 for 4-bit
         let result = dequantize_gptq_to_bf16(&[], &[], &[], None, 5, 8, 5, 4, Dtype::F16);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validation_g_idx_out_of_range() {
+        let in_features = 8;
+        let out_features = 8;
+        let group_size = 4;
+        let bits: u8 = 4;
+
+        // Build valid qweight, scales, qzeros for 2 groups
+        let qweight_i32 = 0x5555_5555u32;
+        let mut qweight_data = Vec::new();
+        for _ in 0..out_features {
+            qweight_data.extend_from_slice(&qweight_i32.to_le_bytes());
+        }
+        let scale_f16 = half::f16::from_f32(1.0).to_le_bytes();
+        let mut scales_data = Vec::new();
+        for _ in 0..2 * out_features {
+            scales_data.extend_from_slice(&scale_f16);
+        }
+        let qz = 0x3333_3333u32;
+        let mut qzeros_data = Vec::new();
+        qzeros_data.extend_from_slice(&qz.to_le_bytes());
+        qzeros_data.extend_from_slice(&qz.to_le_bytes());
+
+        // g_idx with entry = 99 (>= num_groups=2) at position 5
+        let g_idx_values: Vec<u32> = vec![0, 0, 0, 0, 1, 99, 1, 1];
+        let g_idx_data: Vec<u8> = g_idx_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let result = dequantize_gptq_to_bf16(
+            &qweight_data,
+            &scales_data,
+            &qzeros_data,
+            Some(&g_idx_data),
+            in_features,
+            out_features,
+            group_size,
+            bits,
+            Dtype::F16,
+        );
+
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("g_idx[5]") && msg.contains("99"),
+            "expected fail-fast g_idx error, got: {msg}"
+        );
     }
 
     #[test]
