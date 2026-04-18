@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`[package.metadata.docs.rs]`** — docs.rs now builds with `features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]`, exposing all feature-gated public API items on docs.rs.
+- **`docs/formats/gemmascope.md`** — one-page reference for loading GemmaScope (Gemma 2 JumpReLU SAEs). Documents the two-repo split (metadata in `mntss/gemma-scope-transcoders`, weights in `google/gemma-scope-2b-pt-transcoders`), NPZ tensor layout (`W_enc` transpose, `threshold` for JumpReLU, no `W_skip`), and links to the canonical `circuit-tracer` Python loader. No new parser needed — loads via existing NPZ support.
 
 ### Changed
 
