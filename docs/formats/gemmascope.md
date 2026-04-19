@@ -9,6 +9,7 @@ Concise reference for loading **GemmaScope** transcoders (JumpReLU SAEs for Gemm
 - [Picking a variant per layer](#picking-a-variant-per-layer)
 - [Loading via anamnesis](#loading-via-anamnesis)
 - [Reference implementations](#reference-implementations)
+- [Where to find files on HuggingFace](#where-to-find-files-on-huggingface)
 - [Canonical sources](#canonical-sources)
 - [The `.bin` format (for completeness)](#the-bin-format-for-completeness)
 
@@ -98,6 +99,24 @@ let threshold = &tensors["threshold"];  // shape [16384]       F32 — JumpReLU 
 | Rust | candle-mi `TranscoderSchema::GemmaScopeNpz` (v0.1.10+, see `candle-mi/docs/roadmaps/candle_mi_v019_roadmap_V3.md`) | Mirrors the circuit-tracer path using anamnesis NPZ + a YAML config parser. Handles the `W_enc` transpose and JumpReLU `threshold` application. |
 
 Circuit-tracer uses the key name `"activation_function.threshold"` in its own state-dict convention; the NPZ on disk simply names it `threshold`. Rename at load time if you're mixing conventions.
+
+---
+
+## Where to find files on HuggingFace
+
+Beyond [`google/gemma-scope-2b-pt-transcoders`](https://huggingface.co/google/gemma-scope-2b-pt-transcoders) (the focus of this doc), the wider GemmaScope family is spread across many HuggingFace repos. Run `hf-fm search gemmascope` (or `huggingface-cli search gemmascope`) to enumerate them.
+
+Official Google releases follow the slug convention `google/gemma-scope-{size}-{tune}-{site}`:
+
+| Slug part | Values | Meaning |
+|---|---|---|
+| `size` | `2b`, `9b`, `27b`, `2-270m`, `2-1b` | Backing Gemma 2 model size |
+| `tune` | `pt`, `it` | Pretrained vs instruction-tuned base |
+| `site` | `res`, `att`, `mlp`, `transcoders` | Hook site: residual stream, attention output, MLP output, or MLP transcoder |
+
+So `google/gemma-scope-9b-pt-mlp` is "JumpReLU SAE on the MLP output of pretrained Gemma 2 9B". All Google releases carry the `saelens` tag.
+
+A handful of community / third-party ports show up alongside the official set: `mwhanna/gemma-scope-transcoders`, `mwhanna/gemma-scope-attn-saes-16k`, `EleutherAI/gemmascope-transcoders-sparsify`, `weijie210/gemma-scope-2b-it-pt-res`. Verify their tensor names and dtypes before assuming they match the layout in [NPZ tensor layout](#npz-tensor-layout) — that section was checked only against the Google `2b-pt-transcoders` repo.
 
 ---
 

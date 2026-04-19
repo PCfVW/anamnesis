@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BnB double-quant refactor** — extracted shared `dequantize_bnb4_core` accepting `&[f32]` absmax directly. The double-quant path no longer serializes `Vec<f32>` to `Vec<u8>` and back; eliminates one allocation and one copy loop.
 - **GPTQ g_idx pre-validation** — `g_idx` entries are now validated against `num_groups` in a single pass before the hot loop, failing fast on corrupted files instead of mid-dequantization.
 - **CLI stale-binary guard** — `binary_path()` in CLI integration tests now checks that the binary version matches `Cargo.toml` and panics with a diagnostic message if stale. Pre-commit checks updated to include `cargo build --features cli`.
+- **`docs/formats/gemmascope.md`** — added "Where to find files on HuggingFace" section documenting the `google/gemma-scope-{size}-{tune}-{site}` slug convention (sizes 2b/9b/27b/2-270m/2-1b, pt vs it, hook sites res/att/mlp/transcoders) and notable community ports (mwhanna, EleutherAI, weijie210).
 
 ## [0.4.1] - 2026-04-13
 
