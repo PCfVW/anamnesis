@@ -146,7 +146,7 @@ impl fmt::Display for InspectInfo {
         )?;
 
         if self.zeropoints > 0 {
-            write!(f, "\nZero-points: {} tensors", self.zeropoints,)?;
+            write!(f, "\nZero-points: {} tensors", self.zeropoints)?;
         }
 
         if self.group_indices > 0 {

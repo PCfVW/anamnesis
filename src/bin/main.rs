@@ -110,8 +110,7 @@ fn has_zip_magic(path: &std::path::Path) -> bool {
             use std::io::Read;
             f.read_exact(&mut buf)
         })
-        .map(|()| buf == *b"PK\x03\x04")
-        .unwrap_or(false)
+        .is_ok_and(|()| buf == *b"PK\x03\x04")
 }
 
 /// Returns `true` if the file starts with the `GGUF` magic bytes (`"GGUF"`).
@@ -125,8 +124,7 @@ fn has_gguf_magic(path: &std::path::Path) -> bool {
             use std::io::Read;
             f.read_exact(&mut buf)
         })
-        .map(|()| buf == *b"GGUF")
-        .unwrap_or(false)
+        .is_ok_and(|()| buf == *b"GGUF")
 }
 
 // ---------------------------------------------------------------------------
