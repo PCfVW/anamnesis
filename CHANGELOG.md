@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI stale-binary guard** — `binary_path()` in CLI integration tests now checks that the binary version matches `Cargo.toml` and panics with a diagnostic message if stale. Pre-commit checks updated to include `cargo build --features cli`.
 - **`docs/formats/gemmascope.md`** — added "Where to find files on HuggingFace" section documenting the `google/gemma-scope-{size}-{tune}-{site}` slug convention (sizes 2b/9b/27b/2-270m/2-1b, pt vs it, hook sites res/att/mlp/transcoders) and notable community ports (mwhanna, EleutherAI, weijie210).
 
+### Fixed
+
+- **Rust 1.95 clippy lints** — fixed `clippy::unnecessary_trailing_comma` in `src/inspect.rs` and `clippy::map_unwrap_or` (with the `is_ok_and` suggestion) in `src/bin/main.rs`. Both lints landed/strengthened in Rust 1.95.0 (2026-04-14) and would have broken CI's `stable` matrix job under `#![deny(warnings)]`. No user-visible behavior change.
+
 ## [0.4.1] - 2026-04-13
 
 ### Added
