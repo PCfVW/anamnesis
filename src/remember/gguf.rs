@@ -172,7 +172,8 @@ fn write_scratch_to_bf16(scratch: &[f32], out_block: &mut [u8]) {
 /// - `data.len()` does not equal `n_blocks × dtype.type_size()`.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if `dtype.type_size()` is
-/// `None` (`IQ*`/`TQ*`/`MXFP4` — deferred to a later phase).
+/// `None` (the remaining `IQ3_*` / `IQ1_*` / `TQ*` / `MXFP4` types —
+/// deferred to later Phase 4.5 commits).
 fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> crate::Result<usize> {
     let block_size = dtype.block_size();
     if !n_elements.is_multiple_of(block_size) {
@@ -281,9 +282,10 @@ fn dispatch_streaming<F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result
 where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    // EXHAUSTIVE: internal dispatch over GgufType. IQ*/TQ*/MXFP4 have no
-    // implemented kernel yet; scalar (non-block) types are structurally
-    // dequantised (reinterpret bytes), not in scope here.
+    // EXHAUSTIVE: internal dispatch over GgufType. The remaining IQ3_* /
+    // IQ1_* / TQ* / MXFP4 types have no implemented kernel yet; scalar
+    // (non-block) types are structurally dequantised (reinterpret bytes),
+    // not in scope here.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
         GgufType::Q4_0 => dequant_q4_0(data, sink),
@@ -330,8 +332,9 @@ where
 /// byte count (`n_blocks × type_size`).
 ///
 /// Returns [`AnamnesisError::Unsupported`] if `dtype` is one of the
-/// recognised-but-not-yet-implemented types (`IQ*`, `TQ*`, `MXFP4`) or a
-/// scalar type that is not a quantised block format.
+/// recognised-but-not-yet-implemented types (`IQ3_XXS`, `IQ3_S`, `IQ1_S`,
+/// `IQ1_M`, `TQ1_0`, `TQ2_0`, `MXFP4`) or a scalar type that is not a
+/// quantised block format.
 ///
 /// # Memory
 ///
@@ -361,9 +364,11 @@ pub fn dequantize_gguf_to_bf16(
 /// that block's `BF16` bytes. Peak heap is O(one block) regardless of
 /// tensor size.
 ///
-/// The `sink` closure receives `64` bytes per call for legacy quants
-/// (`Q4_0`–`Q8_1`) and `512` bytes per call for K-quants. Sink errors
-/// abort the stream and are propagated unchanged as the return value.
+/// The `sink` closure receives `64` bytes per call for 32-element block
+/// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`) and `512` bytes per call for
+/// 256-element super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`, `IQ2_XXS`,
+/// `IQ2_XS`, `IQ2_S`). Sink errors abort the stream and are propagated
+/// unchanged as the return value.
 ///
 /// This is the canonical form. [`dequantize_gguf_to_bf16`] is a thin
 /// wrapper that sinks into a `Vec::with_capacity`.
@@ -375,9 +380,10 @@ pub fn dequantize_gguf_to_bf16(
 ///
 /// # Memory
 ///
-/// Stack only: one `[f32; QK]` scratch buffer (128 B for legacy, 1 KB
-/// for K-quants) and one `[u8; QK × 2]` block output buffer (64 B /
-/// 512 B). No heap allocation in this function's frame.
+/// Stack only: one `[f32; QK]` scratch buffer (128 B for 32-element
+/// block kernels, 1 KB for 256-element super-block kernels) and one
+/// `[u8; QK × 2]` block output buffer (64 B / 512 B). No heap allocation
+/// in this function's frame.
 ///
 /// # Example
 ///

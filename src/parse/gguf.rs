@@ -1117,9 +1117,9 @@ impl ParsedGguf {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Unsupported`] if `info.byte_len` is `None`
-    /// (the dtype's block layout is not yet tabulated —
-    /// `IQ*`/`TQ*`/`MXFP4`), or if the dtype is a recognised but
-    /// not-yet-implemented quantisation type.
+    /// (the dtype's block layout is not yet tabulated — the remaining
+    /// `IQ3_*` / `IQ1_*` / `TQ*` / `MXFP4` types), or if the dtype is a
+    /// recognised but not-yet-implemented quantisation type.
     ///
     /// Returns [`AnamnesisError::Parse`] if the element count overflows
     /// `usize`, the mmap slice is out of bounds, or the underlying
