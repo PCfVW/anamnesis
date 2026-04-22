@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GGUF` `IQ4_NL` + `IQ4_XS` dequant kernels** — two more GGUF block types dequantised to `BF16`: `IQ4_NL` (32-element non-linear 4-bit, 18-byte blocks) and `IQ4_XS` (256-element non-linear 4-bit super-block, 136-byte blocks — the most widely used member of the `IQ*` family on HuggingFace). Both share the 16-entry `kvalues_iq4nl` codebook. Bit-exact (0 ULP) against the `gguf` Python reference on 65 536-element slices from `bartowski/SmolLM2-135M-Instruct-GGUF`. First step of Phase 4.5 (GGUF completeness).
 - **`[package.metadata.docs.rs]`** — docs.rs now builds with `features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]`, exposing all feature-gated public API items on docs.rs.
 - **`docs/formats/gemmascope.md`** — one-page reference for loading GemmaScope (Gemma 2 JumpReLU SAEs). Documents the two-repo split (metadata in `mntss/gemma-scope-transcoders`, weights in `google/gemma-scope-2b-pt-transcoders`), NPZ tensor layout (`W_enc` transpose, `threshold` for JumpReLU, no `W_skip`), and links to the canonical `circuit-tracer` Python loader. No new parser needed — loads via existing NPZ support.
 

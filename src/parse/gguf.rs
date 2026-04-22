@@ -300,10 +300,17 @@ impl GgufType {
     ///
     /// Returns `Some` for the scalar types (`F32`, `F16`, `BF16`, `F64`,
     /// `I8`–`I64`), the legacy block-wise quantised types (`Q4_0`, `Q4_1`,
-    /// `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`), and the K-quant super-blocks
-    /// (`Q2_K`–`Q8_K`). Returns `None` for `IQ*`, `TQ*`, and `MXFP4` — those
-    /// blocks reference `ggml` struct sizes that will be tabulated when
-    /// dequantisation support lands in a later phase.
+    /// `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`), the K-quant super-blocks
+    /// (`Q2_K`–`Q8_K`), and the two non-linear 4-bit `IQ*` variants
+    /// (`IQ4_NL` at 18 bytes, `IQ4_XS` at 136 bytes). Returns `None` for
+    /// the remaining `IQ*`, `TQ*`, and `MXFP4` types — those block layouts
+    /// will be tabulated when dequantisation support lands in later Phase 4.5
+    /// commits.
+    // `Q4_0` and `IQ4_NL` happen to both be 18 bytes (same `ggml_half` +
+    // 16 nibble-packed bytes), and other pairs share byte counts too; keeping
+    // the arms separate documents the distinct block-format semantics instead
+    // of collapsing them into pattern lists.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub const fn type_size(self) -> Option<usize> {
         match self {
@@ -325,16 +332,21 @@ impl GgufType {
             Self::Q5_K => Some(176),
             Self::Q6_K => Some(210),
             Self::Q8_K => Some(292),
-            // IQ*, TQ*, MXFP4 — byte sizes are defined by ggml struct layouts
-            // that this crate has not yet audited. Deferred to Phase 4 step 2.
+            // Non-linear 4-bit IQ variants (share the `kvalues_iq4nl` codebook).
+            // IQ4_NL: d (f16, 2 B) + qs (4-bit packed, 16 B) = 18 B per 32-element block.
+            // IQ4_XS: d (f16, 2 B) + scales_h (u16, 2 B) + scales_l (4 B) + qs (128 B)
+            //         = 136 B per 256-element super-block.
+            Self::IQ4_NL => Some(18),
+            Self::IQ4_XS => Some(136),
+            // Remaining IQ*, TQ*, MXFP4 — byte sizes are defined by ggml struct
+            // layouts that this crate has not yet audited. Deferred to later
+            // Phase 4.5 commits.
             Self::IQ2_XXS
             | Self::IQ2_XS
             | Self::IQ3_XXS
             | Self::IQ1_S
-            | Self::IQ4_NL
             | Self::IQ3_S
             | Self::IQ2_S
-            | Self::IQ4_XS
             | Self::IQ1_M
             | Self::TQ1_0
             | Self::TQ2_0
@@ -2393,14 +2405,24 @@ mod tests {
 
         assert_eq!(GgufType::Q8_K.type_size(), Some(292));
         assert_eq!(GgufType::Q6_K.type_size(), Some(210));
+
+        // Non-linear 4-bit IQ variants landed in Phase 4.5 step 1.
+        assert_eq!(GgufType::IQ4_NL.block_size(), 32);
+        assert_eq!(GgufType::IQ4_NL.type_size(), Some(18));
+        assert_eq!(GgufType::IQ4_NL.byte_size_for_n_elements(64).unwrap(), 36);
+        assert_eq!(GgufType::IQ4_XS.block_size(), 256);
+        assert_eq!(GgufType::IQ4_XS.type_size(), Some(136));
+        assert_eq!(GgufType::IQ4_XS.byte_size_for_n_elements(256).unwrap(), 136);
     }
 
     #[test]
     fn iq_types_have_unknown_type_size() {
-        assert_eq!(GgufType::IQ4_XS.type_size(), None);
+        // IQ4_NL and IQ4_XS became supported in Phase 4.5 step 1 — the
+        // remaining IQ* / TQ* / MXFP4 kernels are still deferred.
         assert_eq!(GgufType::IQ2_XXS.type_size(), None);
+        assert_eq!(GgufType::IQ3_S.type_size(), None);
         assert_eq!(GgufType::MXFP4.type_size(), None);
-        let err = GgufType::IQ4_XS.byte_size_for_n_elements(256).unwrap_err();
+        let err = GgufType::IQ2_XXS.byte_size_for_n_elements(256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 

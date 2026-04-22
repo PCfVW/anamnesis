@@ -10,12 +10,12 @@
 //! # Supported types
 //!
 //! - **Legacy block quants** (32-element blocks): `Q4_0`, `Q4_1`, `Q5_0`,
-//!   `Q5_1`, `Q8_0`, `Q8_1`.
+//!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
-//!   `Q5_K`, `Q6_K`, `Q8_K`.
+//!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`.
 //!
-//! `IQ*`, `TQ*`, and `MXFP4` are recognised by the parser but **not yet
-//! dequantised**; the dispatcher returns
+//! The remaining `IQ*`, `TQ*`, and `MXFP4` types are recognised by the
+//! parser but **not yet dequantised**; the dispatcher returns
 //! [`AnamnesisError::Unsupported`] for those types.
 //!
 //! # Two public entry points
@@ -64,11 +64,20 @@ use crate::remember::fp8::f32_bits_to_bf16_bits;
 // Block-size constants
 // ---------------------------------------------------------------------------
 
-/// Element count per legacy block quant (`Q4_0`..`Q8_1`).
+/// Element count per legacy block quant (`Q4_0`..`Q8_1`, `IQ4_NL`).
 const QK_SMALL: usize = 32;
 
-/// Element count per K-quant super-block (`Q2_K`..`Q8_K`).
+/// Element count per K-quant super-block (`Q2_K`..`Q8_K`, `IQ4_XS`).
 const QK_K: usize = 256;
+
+/// Non-linear 4-bit codebook shared by `IQ4_NL` and `IQ4_XS`.
+///
+/// Ported verbatim from `ggml-common.h::kvalues_iq4nl`. Each `IQ4_*` 4-bit
+/// storage nibble indexes this table to recover a signed `i8` quant value
+/// before the per-block `f32` scale is applied.
+const K_VALUES_IQ4_NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
 
 // ---------------------------------------------------------------------------
 // Infallible byte readers
@@ -288,6 +297,8 @@ where
         GgufType::Q5_K => dequant_q5_k(data, sink),
         GgufType::Q6_K => dequant_q6_k(data, sink),
         GgufType::Q8_K => dequant_q8_k(data, sink),
+        GgufType::IQ4_NL => dequant_iq4_nl(data, sink),
+        GgufType::IQ4_XS => dequant_iq4_xs(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!("dequantisation not yet supported for {dtype}"),
@@ -562,6 +573,35 @@ where
         for j in 0..QK_SMALL {
             let signed = in_block[4 + j] as i8;
             scratch[j] = f32::from(signed) * d;
+        }
+    })
+}
+
+/// `IQ4_NL` kernel — 18-byte blocks: `d: f16` + `qs[16]` (4-bit packed).
+///
+/// Non-linear 4-bit quant: each 4-bit nibble indexes the shared
+/// [`K_VALUES_IQ4_NL`] codebook to recover an `i8` quant, which is then
+/// multiplied by the per-block `f32` scale. Formula (from
+/// `ggml-quants.c::dequantize_row_iq4_nl`):
+///
+/// ```text
+/// y[j]       = d * K_VALUES_IQ4_NL[qs[j] & 0xF]   for j ∈ 0..16
+/// y[j + 16]  = d * K_VALUES_IQ4_NL[qs[j] >> 4]    for j ∈ 0..16
+/// ```
+#[allow(clippy::indexing_slicing)]
+fn dequant_iq4_nl<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_legacy_kernel(data, 18, sink, |in_block, scratch| {
+        let d = read_f16_bytes([in_block[0], in_block[1]]);
+        // BITWISE: split each qs byte into two 4-bit codebook indices
+        // INDEX: nibble masked to 0..16 — K_VALUES_IQ4_NL lookup is in-bounds
+        for j in 0..16 {
+            let lo = K_VALUES_IQ4_NL[usize::from(in_block[2 + j] & 0x0F)];
+            let hi = K_VALUES_IQ4_NL[usize::from(in_block[2 + j] >> 4)];
+            scratch[j] = f32::from(lo) * d;
+            scratch[j + 16] = f32::from(hi) * d;
         }
     })
 }
@@ -873,6 +913,67 @@ where
     })
 }
 
+/// `IQ4_XS` kernel — 136-byte super-blocks: `d: f16` + `scales_h: u16` +
+/// `scales_l[4]` + `qs[128]` (4-bit packed).
+///
+/// Non-linear 4-bit super-quant: 8 sub-blocks of 32 elements. Each
+/// sub-block carries a 6-bit signed-biased scale split across `scales_l`
+/// (low 4 bits) and `scales_h` (high 2 bits), biased by `-32`. The 4-bit
+/// storage nibbles index the shared [`K_VALUES_IQ4_NL`] codebook exactly
+/// as in [`dequant_iq4_nl`]. Formula (from
+/// `ggml-quants.c::dequantize_row_iq4_xs`):
+///
+/// ```text
+/// ls = ((scales_l[ib/2] >> (4*(ib%2))) & 0xF)
+///    | (((scales_h   >> (2*ib))       & 0x3) << 4)
+/// dl = d * (ls - 32)
+/// y[32*ib + j     ] = dl * K_VALUES_IQ4_NL[qs[16*ib + j] & 0xF]
+/// y[32*ib + j + 16] = dl * K_VALUES_IQ4_NL[qs[16*ib + j] >> 4]
+/// ```
+#[allow(
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
+fn dequant_iq4_xs<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_super_kernel(data, 136, sink, |in_block, scratch| {
+        // Field offsets: d [0..2], scales_h [2..4], scales_l [4..8], qs [8..136]
+        let d = read_f16_bytes([in_block[0], in_block[1]]);
+        let scales_h = u16::from_le_bytes([in_block[2], in_block[3]]);
+        let scales_l = [in_block[4], in_block[5], in_block[6], in_block[7]];
+        let qs = &in_block[8..136];
+
+        let mut y_off: usize = 0;
+        let mut q_off: usize = 0;
+        for ib in 0..8 {
+            // BITWISE: combine 4-bit low (scales_l) + 2-bit high (scales_h)
+            // into a 6-bit signed-biased sub-block scale, then subtract 32.
+            // CAST: usize → u32 for shift amounts; ib ∈ 0..8 so truncation is
+            // impossible on any target wider than 3 bits
+            let ib_u32 = ib as u32;
+            let sc_lo = (scales_l[ib / 2] >> (4 * (ib_u32 % 2))) & 0x0F;
+            let sc_hi = (scales_h >> (2 * ib_u32)) & 0x03;
+            let ls = i32::from(sc_lo) | (i32::from(sc_hi) << 4);
+            // CAST: i32 → f32 lossless for (ls - 32) ∈ [-32, 31]
+            let dl = d * ((ls - 32) as f32);
+
+            // INDEX: nibble masked to 0..16 — K_VALUES_IQ4_NL lookup is in-bounds
+            for j in 0..16 {
+                let lo = K_VALUES_IQ4_NL[usize::from(qs[q_off + j] & 0x0F)];
+                let hi = K_VALUES_IQ4_NL[usize::from(qs[q_off + j] >> 4)];
+                scratch[y_off + j] = dl * f32::from(lo);
+                scratch[y_off + j + 16] = dl * f32::from(hi);
+            }
+            q_off += 16;
+            y_off += 32;
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // K-quant scale extractors
 // ---------------------------------------------------------------------------
@@ -1001,8 +1102,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_dtype() {
-        // IQ4_XS is recognised by GgufType but has type_size() == None.
-        let err = dequantize_gguf_to_bf16(&[], GgufType::IQ4_XS, 256).unwrap_err();
+        // IQ2_XXS is recognised by GgufType but still has type_size() == None
+        // (IQ4_NL and IQ4_XS became supported in Phase 4.5 step 1; the rest of
+        // the IQ* / TQ* / MXFP4 family is still deferred).
+        let err = dequantize_gguf_to_bf16(&[], GgufType::IQ2_XXS, 256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 
@@ -1417,6 +1520,135 @@ mod tests {
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q6_K, 256).unwrap();
         for chunk in out.chunks_exact(2) {
             assert_eq!(bf16_pair_to_f32(chunk), -32.0);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // IQ4_NL
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn iq4_nl_zero_scale_emits_zero() {
+        // d = 0.0, arbitrary qs → every output 0.0
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&f16_bytes(0.0));
+        for j in 0..16 {
+            block[2 + j] = 0xA5;
+        }
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_NL, 32).unwrap();
+        assert_eq!(out.len(), 64);
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn iq4_nl_zero_nibbles_emit_codebook_0() {
+        // d = 1.0, qs = 0x00 → every nibble = 0, y = K_VALUES_IQ4_NL[0] = -127
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_NL, 32).unwrap();
+        for j in 0..32 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                -127.0,
+                "IQ4_NL[{j}]"
+            );
+        }
+    }
+
+    #[test]
+    fn iq4_nl_nibble_sweep() {
+        // d = 1.0, qs[j] = (j << 4) | j for j ∈ 0..16
+        // Low nibble j → y[j] = K_VALUES_IQ4_NL[j]
+        // High nibble j → y[j + 16] = K_VALUES_IQ4_NL[j]
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        for j in 0..16usize {
+            block[2 + j] = ((j as u8) << 4) | (j as u8);
+        }
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_NL, 32).unwrap();
+        for j in 0..16 {
+            let expected = f32::from(K_VALUES_IQ4_NL[j]);
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                expected,
+                "IQ4_NL low nibble[{j}]"
+            );
+            assert_eq!(
+                bf16_pair_to_f32(&out[(j + 16) * 2..(j + 16) * 2 + 2]),
+                expected,
+                "IQ4_NL high nibble[{j}]"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // IQ4_XS
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn iq4_xs_all_zero_block() {
+        // All-zero block: d = 0.0 kills every output regardless of ls/nibble.
+        let block = vec![0u8; 136];
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_XS, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn iq4_xs_scale_bias_centers_at_minus_32() {
+        // d = 1.0, scales_h = 0, scales_l = [0; 4], qs = 0x00
+        // → ls = 0, dl = (0 - 32) = -32, nibble = 0, K_VALUES_IQ4_NL[0] = -127
+        // → y = -32 * -127 = 4064.0 everywhere.
+        //
+        // 4064 = (1 + 126/128) × 2^11 is exactly representable in BF16
+        // (7-bit mantissa at exponent 11 has ULP 16, and 4064 = 254 × 16).
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_XS, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 4064.0);
+        }
+    }
+
+    #[test]
+    fn iq4_xs_ls_combination() {
+        // Test the 6-bit scale assembly. Sub-block 0 gets:
+        //   scales_l[0] low nibble (bits [3:0]) = 0xF
+        //   scales_h bits [1:0]                 = 0x3
+        //   → ls = 0xF | (0x3 << 4) = 0x3F = 63, (ls - 32) = 31
+        // All other sub-blocks see ls = 0, (ls - 32) = -32.
+        //
+        // qs = 0x00 → every nibble = 0 → K_VALUES_IQ4_NL[0] = -127
+        // d = 1.0
+        //
+        // Expected (as f32, then rounded to BF16 by the dequantiser):
+        //   sub-block 0 (y[0..32])     : 31 × -127 = -3937 → BF16 rounds to -3936
+        //   sub-blocks 1..=7 (y[32..]) : -32 × -127 = 4064 (exactly BF16-representable)
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        // scales_h = 0x0003: high 2 bits of sub-block 0 = 0b11
+        block[2] = 0x03;
+        block[3] = 0x00;
+        // scales_l[0] low nibble = 0xF; high nibble (sub-block 1 low) left 0.
+        block[4] = 0x0F;
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_XS, 256).unwrap();
+        let expected_sb0 = f32::from(half::bf16::from_f32(31.0 * -127.0));
+        for j in 0..32 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                expected_sb0,
+                "IQ4_XS sub-block 0[{j}]"
+            );
+        }
+        for j in 32..256 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                4064.0,
+                "IQ4_XS sub-block >=1[{j}]"
+            );
         }
     }
 }
