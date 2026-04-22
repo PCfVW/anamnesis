@@ -122,7 +122,7 @@ Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-
 
 ### GGUF Block-Quant Dequantization
 
-Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on 10 block-quant kernels from 3 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat). Bit-exact output (0 ULP difference). Feature-gated behind `gguf`.
+Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on 15 block-quant kernels from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct). Bit-exact output (0 ULP difference). Feature-gated behind `gguf`.
 
 | Kernel | Model | vs `gguf` Python (AVX2) |
 |---|---|---|
@@ -131,13 +131,18 @@ Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors
 | Q5_0 | TinyLlama-1.1B | 31.3x faster |
 | Q5_1 | SmolLM2-135M | 11.4x faster |
 | Q8_0 | SmolLM2-135M | 6.3x faster |
+| IQ4_NL | SmolLM2-135M | 12.2x faster |
 | Q2_K | TinyLlama-1.1B | 6.7x faster |
 | Q3_K | SmolLM2-135M | 10.9x faster |
 | Q4_K | SmolLM2-135M | 8.1x faster |
 | Q5_K | SmolLM2-135M | 11.6x faster |
 | Q6_K | SmolLM2-135M | 26.6x faster |
+| IQ4_XS | SmolLM2-135M | 12.6x faster |
+| IQ2_XXS | Mistral-7B-v0.3 | 3.45x faster |
+| IQ2_XS | Mistral-7B-v0.3 | 2.84x faster |
+| IQ2_S | Qwen2.5-0.5B | 4.10x faster |
 
-> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`).
+> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` kernels land in the 2.8×–4.1× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. Phase 9 (CPU SIMD pass) will address this with hand-written AVX2 intrinsics.
 
 ### NPZ/NPY Parsing
 
