@@ -301,11 +301,12 @@ impl GgufType {
     /// Returns `Some` for the scalar types (`F32`, `F16`, `BF16`, `F64`,
     /// `I8`–`I64`), the legacy block-wise quantised types (`Q4_0`, `Q4_1`,
     /// `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`), the K-quant super-blocks
-    /// (`Q2_K`–`Q8_K`), and the two non-linear 4-bit `IQ*` variants
-    /// (`IQ4_NL` at 18 bytes, `IQ4_XS` at 136 bytes). Returns `None` for
-    /// the remaining `IQ*`, `TQ*`, and `MXFP4` types — those block layouts
-    /// will be tabulated when dequantisation support lands in later Phase 4.5
-    /// commits.
+    /// (`Q2_K`–`Q8_K`), the two non-linear 4-bit `IQ*` variants (`IQ4_NL`
+    /// at 18 bytes, `IQ4_XS` at 136 bytes), and the three 2-bit `IQ*`
+    /// variants (`IQ2_XXS` at 66 bytes, `IQ2_XS` at 74 bytes, `IQ2_S` at
+    /// 82 bytes). Returns `None` for the remaining `IQ*`, `TQ*`, and
+    /// `MXFP4` types — those block layouts will be tabulated when
+    /// dequantisation support lands in later Phase 4.5 commits.
     // `Q4_0` and `IQ4_NL` happen to both be 18 bytes (same `ggml_half` +
     // 16 nibble-packed bytes), and other pairs share byte counts too; keeping
     // the arms separate documents the distinct block-format semantics instead
@@ -338,15 +339,22 @@ impl GgufType {
             //         = 136 B per 256-element super-block.
             Self::IQ4_NL => Some(18),
             Self::IQ4_XS => Some(136),
+            // 2-bit IQ super-quants (256-element super-blocks). All three share
+            // the `ksigns_iq2xs` / `kmask_iq2xs` sign tables; the grid tables
+            // differ in size (256 / 512 / 1024 entries, each an 8-byte lattice
+            // codebook vector).
+            // IQ2_XXS: d (f16, 2 B) + qs (u16[32], 64 B)                    = 66 B.
+            // IQ2_XS:  d (f16, 2 B) + qs (u16[32], 64 B) + scales (8 B)     = 74 B.
+            // IQ2_S:   d (f16, 2 B) + qs (u8[64], 64 B) + qh (8 B) + scales (8 B) = 82 B.
+            Self::IQ2_XXS => Some(66),
+            Self::IQ2_XS => Some(74),
+            Self::IQ2_S => Some(82),
             // Remaining IQ*, TQ*, MXFP4 — byte sizes are defined by ggml struct
             // layouts that this crate has not yet audited. Deferred to later
             // Phase 4.5 commits.
-            Self::IQ2_XXS
-            | Self::IQ2_XS
-            | Self::IQ3_XXS
+            Self::IQ3_XXS
             | Self::IQ1_S
             | Self::IQ3_S
-            | Self::IQ2_S
             | Self::IQ1_M
             | Self::TQ1_0
             | Self::TQ2_0
@@ -2413,16 +2421,27 @@ mod tests {
         assert_eq!(GgufType::IQ4_XS.block_size(), 256);
         assert_eq!(GgufType::IQ4_XS.type_size(), Some(136));
         assert_eq!(GgufType::IQ4_XS.byte_size_for_n_elements(256).unwrap(), 136);
+
+        // 2-bit IQ super-quants landed in Phase 4.5 step 2.
+        assert_eq!(GgufType::IQ2_XXS.block_size(), 256);
+        assert_eq!(GgufType::IQ2_XXS.type_size(), Some(66));
+        assert_eq!(GgufType::IQ2_XXS.byte_size_for_n_elements(256).unwrap(), 66);
+        assert_eq!(GgufType::IQ2_XS.block_size(), 256);
+        assert_eq!(GgufType::IQ2_XS.type_size(), Some(74));
+        assert_eq!(GgufType::IQ2_XS.byte_size_for_n_elements(256).unwrap(), 74);
+        assert_eq!(GgufType::IQ2_S.block_size(), 256);
+        assert_eq!(GgufType::IQ2_S.type_size(), Some(82));
+        assert_eq!(GgufType::IQ2_S.byte_size_for_n_elements(256).unwrap(), 82);
     }
 
     #[test]
     fn iq_types_have_unknown_type_size() {
-        // IQ4_NL and IQ4_XS became supported in Phase 4.5 step 1 — the
-        // remaining IQ* / TQ* / MXFP4 kernels are still deferred.
-        assert_eq!(GgufType::IQ2_XXS.type_size(), None);
+        // IQ4_NL / IQ4_XS (step 1) and IQ2_XXS / IQ2_XS / IQ2_S (step 2) are
+        // supported; the remaining IQ* / TQ* / MXFP4 kernels are still deferred.
+        assert_eq!(GgufType::IQ3_XXS.type_size(), None);
         assert_eq!(GgufType::IQ3_S.type_size(), None);
         assert_eq!(GgufType::MXFP4.type_size(), None);
-        let err = GgufType::IQ2_XXS.byte_size_for_n_elements(256).unwrap_err();
+        let err = GgufType::IQ3_XXS.byte_size_for_n_elements(256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 
