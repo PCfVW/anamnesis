@@ -12,9 +12,10 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor.
 //!
-//! Coverage: 10 of 12 production kernels from 3 real models. `Q8_1` and
-//! `Q8_K` are not shipped by any real model — they are internal
-//! `llama.cpp` activation quant types, already covered by unit tests.
+//! Coverage: 12 of 14 production kernels from 3 real models
+//! (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`). `Q8_1` and `Q8_K` are
+//! not shipped by any real model — they are internal `llama.cpp` activation
+//! quant types, already covered by unit tests.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -55,8 +56,9 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 
 /// Maps a `ggml_type` discriminant to a [`GgufType`].
 ///
-/// Only covers the 12 dequantizable block types — scalars and
-/// `IQ*`/`TQ*`/`MXFP4` are not cross-validated here.
+/// Covers the 14 currently dequantizable block types — the remaining
+/// `IQ*` / `TQ*` / `MXFP4` entries are not cross-validated here because
+/// they are still unsupported at the dequantiser level.
 fn gguf_type_from_disc(disc: u32) -> GgufType {
     match disc {
         2 => GgufType::Q4_0,
@@ -71,6 +73,8 @@ fn gguf_type_from_disc(disc: u32) -> GgufType {
         13 => GgufType::Q5_K,
         14 => GgufType::Q6_K,
         15 => GgufType::Q8_K,
+        20 => GgufType::IQ4_NL,
+        23 => GgufType::IQ4_XS,
         other => panic!("unknown ggml_type discriminant: {other}"),
     }
 }
@@ -179,7 +183,7 @@ fn run_cross_validation(name: &str, data: &[u8], dtype: GgufType, max_ulp: u16) 
 }
 
 // ---------------------------------------------------------------------------
-// Legacy quants (block_size=32) — 5 kernels
+// Legacy quants (block_size=32) — 6 kernels (incl. IQ4_NL)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -232,8 +236,18 @@ fn cross_validate_smollm2_q8_0() {
     );
 }
 
+#[test]
+fn cross_validate_smollm2_iq4_nl() {
+    run_cross_validation(
+        "SmolLM2-135M IQ4_NL (bartowski)",
+        include_bytes!("fixtures/gguf_reference/smollm2_iq4_nl.bin"),
+        GgufType::IQ4_NL,
+        0,
+    );
+}
+
 // ---------------------------------------------------------------------------
-// K-quants (block_size=256) — 5 kernels
+// K-quants (block_size=256) — 6 kernels (incl. IQ4_XS)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -282,6 +296,16 @@ fn cross_validate_smollm2_q6_k() {
         "SmolLM2-135M Q6_K (bartowski)",
         include_bytes!("fixtures/gguf_reference/smollm2_q6_k.bin"),
         GgufType::Q6_K,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_smollm2_iq4_xs() {
+    run_cross_validation(
+        "SmolLM2-135M IQ4_XS (bartowski)",
+        include_bytes!("fixtures/gguf_reference/smollm2_iq4_xs.bin"),
+        GgufType::IQ4_XS,
         0,
     );
 }

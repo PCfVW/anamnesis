@@ -28,7 +28,7 @@ BF16 conversion uses round-to-nearest-even, identical to anamnesis's
     bf16 = (bits + 0x7FFF + lsb) >> 16
 
 Models (download via ``hf-fm download-file --flat --output-dir models/``):
-  bartowski/SmolLM2-135M-Instruct-GGUF — Q4_0, Q4_1, Q8_0, Q2_K–Q6_K
+  bartowski/SmolLM2-135M-Instruct-GGUF — Q4_0, Q4_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS
   TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF — Q5_0
 
 Usage:
@@ -61,6 +61,10 @@ FIXTURES = [
     # TheBloke TinyLlama — Q5_0 and Q5_1 not shipped by bartowski
     ("tinyllama_q5_0", "tinyllama-1.1b-chat-v1.0.Q5_0.gguf", GGMLQuantizationType.Q5_0),
     ("smollm2_q5_1",  "SmolLM2-135M-Instruct-Q3_K_M.gguf", GGMLQuantizationType.Q5_1),
+    # IQ4_NL (non-linear 4-bit, 32-element block, shares kvalues_iq4nl codebook
+    # with IQ4_XS). SmolLM2's Q2_K file mixes Q3_K with IQ4_NL for high-impact
+    # layers, so no extra model download is needed.
+    ("smollm2_iq4_nl", "SmolLM2-135M-Instruct-Q2_K.gguf",   GGMLQuantizationType.IQ4_NL),
     # ---- K-quants (block_size=256) ----
     # TinyLlama Q2_K file — SmolLM2's "Q2_K" file uses Q3_K+IQ4_NL, not Q2_K
     ("tinyllama_q2_k", "tinyllama-1.1b-chat-v1.0.Q2_K.gguf", GGMLQuantizationType.Q2_K),
@@ -69,6 +73,9 @@ FIXTURES = [
     ("smollm2_q4_k",  "SmolLM2-135M-Instruct-Q4_K_M.gguf", GGMLQuantizationType.Q4_K),
     ("smollm2_q5_k",  "SmolLM2-135M-Instruct-Q5_K_M.gguf", GGMLQuantizationType.Q5_K),
     ("smollm2_q6_k",  "SmolLM2-135M-Instruct-Q6_K.gguf",   GGMLQuantizationType.Q6_K),
+    # IQ4_XS (non-linear 4-bit super-block, 256 elements, 136 bytes). Most
+    # widely used member of the IQ* family on HuggingFace as of 2025-2026.
+    ("smollm2_iq4_xs", "SmolLM2-135M-Instruct-IQ4_XS.gguf", GGMLQuantizationType.IQ4_XS),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
 
