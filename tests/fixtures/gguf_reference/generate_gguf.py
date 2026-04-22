@@ -30,6 +30,12 @@ BF16 conversion uses round-to-nearest-even, identical to anamnesis's
 Models (download via ``hf-fm download-file --flat --output-dir models/``):
   bartowski/SmolLM2-135M-Instruct-GGUF — Q4_0, Q4_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS
   TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF — Q5_0
+  bartowski/Qwen2.5-0.5B-Instruct-GGUF — IQ2_S (via the IQ2_M mix file)
+  bartowski/Mistral-7B-Instruct-v0.3-GGUF — IQ2_XXS, IQ2_XS (pure variants)
+
+  NOTE: Mistral-7B-Instruct-v0.3-IQ2_S.gguf is *misleadingly named* — it actually
+  ships IQ2_XS + IQ3_S tensors, NO IQ2_S. Use the Qwen2.5-0.5B IQ2_M file for IQ2_S
+  instead. Verified by remote-header probe 2026-04-22.
 
 Usage:
   pip install gguf numpy
@@ -76,6 +82,14 @@ FIXTURES = [
     # IQ4_XS (non-linear 4-bit super-block, 256 elements, 136 bytes). Most
     # widely used member of the IQ* family on HuggingFace as of 2025-2026.
     ("smollm2_iq4_xs", "SmolLM2-135M-Instruct-IQ4_XS.gguf", GGMLQuantizationType.IQ4_XS),
+    # IQ2 variants (2-bit super-quants, lattice codebooks).  Small models'
+    # "IQ2_M" mix quantisers mostly dropped IQ2_XXS/IQ2_XS in favour of
+    # IQ2_S for critical tensors, so IQ2_XXS and IQ2_XS fixtures come from
+    # Mistral-7B-v0.3 (smallest repo shipping pure IQ2_XXS/IQ2_XS files).
+    ("mistral_7b_iq2_xxs", "Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf", GGMLQuantizationType.IQ2_XXS),
+    ("mistral_7b_iq2_xs",  "Mistral-7B-Instruct-v0.3-IQ2_XS.gguf",  GGMLQuantizationType.IQ2_XS),
+    # IQ2_S from Qwen2.5-0.5B's IQ2_M mix (21 IQ2_S tensors inside).
+    ("qwen25_iq2_s", "Qwen2.5-0.5B-Instruct-IQ2_M.gguf", GGMLQuantizationType.IQ2_S),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
 

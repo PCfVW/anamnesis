@@ -12,10 +12,10 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor.
 //!
-//! Coverage: 12 of 14 production kernels from 3 real models
-//! (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`). `Q8_1` and `Q8_K` are
-//! not shipped by any real model — they are internal `llama.cpp` activation
-//! quant types, already covered by unit tests.
+//! Coverage: 15 of 17 production kernels from 5 real models (`Q4_0`–`Q8_0`,
+//! `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`). `Q8_1`
+//! and `Q8_K` are not shipped by any real model — they are internal
+//! `llama.cpp` activation quant types, already covered by unit tests.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -75,6 +75,9 @@ fn gguf_type_from_disc(disc: u32) -> GgufType {
         15 => GgufType::Q8_K,
         20 => GgufType::IQ4_NL,
         23 => GgufType::IQ4_XS,
+        16 => GgufType::IQ2_XXS,
+        17 => GgufType::IQ2_XS,
+        22 => GgufType::IQ2_S,
         other => panic!("unknown ggml_type discriminant: {other}"),
     }
 }
@@ -306,6 +309,47 @@ fn cross_validate_smollm2_iq4_xs() {
         "SmolLM2-135M IQ4_XS (bartowski)",
         include_bytes!("fixtures/gguf_reference/smollm2_iq4_xs.bin"),
         GgufType::IQ4_XS,
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// IQ2 variants (256-element super-blocks) — 3 kernels
+// ---------------------------------------------------------------------------
+//
+// Small models ship `IQ2_M` as the only IQ2 mix, which internally uses
+// `IQ2_S` for most critical layers and no `IQ2_XXS`/`IQ2_XS` at all. The
+// smallest repo shipping pure `IQ2_XXS.gguf` and `IQ2_XS.gguf` files is
+// `bartowski/Mistral-7B-Instruct-v0.3-GGUF`; `IQ2_S` fixtures come from
+// `bartowski/Qwen2.5-0.5B-Instruct-GGUF`'s `IQ2_M` mix (21 `IQ2_S` tensors
+// inside).
+
+#[test]
+fn cross_validate_mistral_7b_iq2_xxs() {
+    run_cross_validation(
+        "Mistral-7B-v0.3 IQ2_XXS (bartowski)",
+        include_bytes!("fixtures/gguf_reference/mistral_7b_iq2_xxs.bin"),
+        GgufType::IQ2_XXS,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_mistral_7b_iq2_xs() {
+    run_cross_validation(
+        "Mistral-7B-v0.3 IQ2_XS (bartowski)",
+        include_bytes!("fixtures/gguf_reference/mistral_7b_iq2_xs.bin"),
+        GgufType::IQ2_XS,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_qwen25_iq2_s() {
+    run_cross_validation(
+        "Qwen2.5-0.5B IQ2_S (bartowski)",
+        include_bytes!("fixtures/gguf_reference/qwen25_iq2_s.bin"),
+        GgufType::IQ2_S,
         0,
     );
 }
