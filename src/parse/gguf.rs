@@ -302,11 +302,12 @@ impl GgufType {
     /// `I8`–`I64`), the legacy block-wise quantised types (`Q4_0`, `Q4_1`,
     /// `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`), the K-quant super-blocks
     /// (`Q2_K`–`Q8_K`), the two non-linear 4-bit `IQ*` variants (`IQ4_NL`
-    /// at 18 bytes, `IQ4_XS` at 136 bytes), and the three 2-bit `IQ*`
+    /// at 18 bytes, `IQ4_XS` at 136 bytes), the three 2-bit `IQ*`
     /// variants (`IQ2_XXS` at 66 bytes, `IQ2_XS` at 74 bytes, `IQ2_S` at
-    /// 82 bytes). Returns `None` for the remaining `IQ*`, `TQ*`, and
-    /// `MXFP4` types — those block layouts will be tabulated when
-    /// dequantisation support lands in later Phase 4.5 commits.
+    /// 82 bytes), and the two 3-bit `IQ*` variants (`IQ3_XXS` at 98 bytes,
+    /// `IQ3_S` at 110 bytes). Returns `None` for the remaining `IQ1_*`,
+    /// `TQ*`, and `MXFP4` types — those block layouts will be tabulated
+    /// when dequantisation support lands in later Phase 4.5 commits.
     // `Q4_0` and `IQ4_NL` happen to both be 18 bytes (same `ggml_half` +
     // 16 nibble-packed bytes), and other pairs share byte counts too; keeping
     // the arms separate documents the distinct block-format semantics instead
@@ -349,16 +350,20 @@ impl GgufType {
             Self::IQ2_XXS => Some(66),
             Self::IQ2_XS => Some(74),
             Self::IQ2_S => Some(82),
-            // Remaining IQ*, TQ*, MXFP4 — byte sizes are defined by ggml struct
-            // layouts that this crate has not yet audited. Deferred to later
-            // Phase 4.5 commits.
-            Self::IQ3_XXS
-            | Self::IQ1_S
-            | Self::IQ3_S
-            | Self::IQ1_M
-            | Self::TQ1_0
-            | Self::TQ2_0
-            | Self::MXFP4 => None,
+            // 3-bit IQ super-quants (256-element super-blocks). IQ3_XXS reuses
+            // `ksigns_iq2xs` for sign indexing (like IQ2_XXS); IQ3_S stores
+            // sign masks inline (like IQ2_S). Both grids are [u32; N] (4-byte
+            // codebook vectors), unlike the IQ2 family's [u64; N].
+            // IQ3_XXS: d (f16, 2 B) + qs (u8[64], 64 B for grid indices)
+            //        + scales_and_signs (u32[8], 32 B)                     = 98 B.
+            // IQ3_S:   d (f16, 2 B) + qs (u8[64], 64 B) + qh (u8[8], 8 B)
+            //        + signs (u8[32], 32 B) + scales (u8[4], 4 B)          = 110 B.
+            Self::IQ3_XXS => Some(98),
+            Self::IQ3_S => Some(110),
+            // Remaining IQ1_*, TQ*, MXFP4 — byte sizes are defined by ggml
+            // struct layouts that this crate has not yet audited. Deferred
+            // to later Phase 4.5 commits.
+            Self::IQ1_S | Self::IQ1_M | Self::TQ1_0 | Self::TQ2_0 | Self::MXFP4 => None,
         }
     }
 
@@ -1118,8 +1123,8 @@ impl ParsedGguf {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if `info.byte_len` is `None`
     /// (the dtype's block layout is not yet tabulated — the remaining
-    /// `IQ3_*` / `IQ1_*` / `TQ*` / `MXFP4` types), or if the dtype is a
-    /// recognised but not-yet-implemented quantisation type.
+    /// `IQ1_*` / `TQ*` / `MXFP4` types), or if the dtype is a recognised
+    /// but not-yet-implemented quantisation type.
     ///
     /// Returns [`AnamnesisError::Parse`] if the element count overflows
     /// `usize`, the mmap slice is out of bounds, or the underlying
@@ -2432,16 +2437,24 @@ mod tests {
         assert_eq!(GgufType::IQ2_S.block_size(), 256);
         assert_eq!(GgufType::IQ2_S.type_size(), Some(82));
         assert_eq!(GgufType::IQ2_S.byte_size_for_n_elements(256).unwrap(), 82);
+
+        // 3-bit IQ super-quants landed in Phase 4.5 step 3.
+        assert_eq!(GgufType::IQ3_XXS.block_size(), 256);
+        assert_eq!(GgufType::IQ3_XXS.type_size(), Some(98));
+        assert_eq!(GgufType::IQ3_XXS.byte_size_for_n_elements(256).unwrap(), 98);
+        assert_eq!(GgufType::IQ3_S.block_size(), 256);
+        assert_eq!(GgufType::IQ3_S.type_size(), Some(110));
+        assert_eq!(GgufType::IQ3_S.byte_size_for_n_elements(256).unwrap(), 110);
     }
 
     #[test]
     fn iq_types_have_unknown_type_size() {
-        // IQ4_NL / IQ4_XS (step 1) and IQ2_XXS / IQ2_XS / IQ2_S (step 2) are
-        // supported; the remaining IQ* / TQ* / MXFP4 kernels are still deferred.
-        assert_eq!(GgufType::IQ3_XXS.type_size(), None);
-        assert_eq!(GgufType::IQ3_S.type_size(), None);
+        // IQ4_NL/XS (step 1), IQ2_XXS/XS/S (step 2), and IQ3_XXS/S (step 3) are
+        // supported; the remaining IQ1_* / TQ* / MXFP4 kernels are still deferred.
+        assert_eq!(GgufType::IQ1_S.type_size(), None);
+        assert_eq!(GgufType::IQ1_M.type_size(), None);
         assert_eq!(GgufType::MXFP4.type_size(), None);
-        let err = GgufType::IQ3_XXS.byte_size_for_n_elements(256).unwrap_err();
+        let err = GgufType::IQ1_S.byte_size_for_n_elements(256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 

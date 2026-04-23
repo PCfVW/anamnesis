@@ -12,11 +12,12 @@
 //! - **Legacy block quants** (32-element blocks): `Q4_0`, `Q4_1`, `Q5_0`,
 //!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
-//!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`.
+//!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
+//!   `IQ3_XXS`, `IQ3_S`.
 //!
-//! The remaining `IQ*` (`IQ3_*`, `IQ1_*`), `TQ*`, and `MXFP4` types are
-//! recognised by the parser but **not yet dequantised**; the dispatcher
-//! returns [`AnamnesisError::Unsupported`] for those types.
+//! The remaining `IQ1_*`, `TQ*`, and `MXFP4` types are recognised by the
+//! parser but **not yet dequantised**; the dispatcher returns
+//! [`AnamnesisError::Unsupported`] for those types.
 //!
 //! # Two public entry points
 //!
@@ -59,7 +60,9 @@
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
-use iq_grids::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+use iq_grids::{
+    IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
+};
 
 // ---------------------------------------------------------------------------
 // Block-size constants
@@ -172,8 +175,8 @@ fn write_scratch_to_bf16(scratch: &[f32], out_block: &mut [u8]) {
 /// - `data.len()` does not equal `n_blocks × dtype.type_size()`.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if `dtype.type_size()` is
-/// `None` (the remaining `IQ3_*` / `IQ1_*` / `TQ*` / `MXFP4` types —
-/// deferred to later Phase 4.5 commits).
+/// `None` (the remaining `IQ1_*` / `TQ*` / `MXFP4` types — deferred to
+/// later Phase 4.5 commits).
 fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> crate::Result<usize> {
     let block_size = dtype.block_size();
     if !n_elements.is_multiple_of(block_size) {
@@ -282,10 +285,10 @@ fn dispatch_streaming<F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result
 where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    // EXHAUSTIVE: internal dispatch over GgufType. The remaining IQ3_* /
-    // IQ1_* / TQ* / MXFP4 types have no implemented kernel yet; scalar
-    // (non-block) types are structurally dequantised (reinterpret bytes),
-    // not in scope here.
+    // EXHAUSTIVE: internal dispatch over GgufType. The remaining IQ1_* /
+    // TQ* / MXFP4 types have no implemented kernel yet; scalar (non-block)
+    // types are structurally dequantised (reinterpret bytes), not in scope
+    // here.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
         GgufType::Q4_0 => dequant_q4_0(data, sink),
@@ -305,6 +308,8 @@ where
         GgufType::IQ2_XXS => dequant_iq2_xxs(data, sink),
         GgufType::IQ2_XS => dequant_iq2_xs(data, sink),
         GgufType::IQ2_S => dequant_iq2_s(data, sink),
+        GgufType::IQ3_XXS => dequant_iq3_xxs(data, sink),
+        GgufType::IQ3_S => dequant_iq3_s(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!("dequantisation not yet supported for {dtype}"),
@@ -332,9 +337,9 @@ where
 /// byte count (`n_blocks × type_size`).
 ///
 /// Returns [`AnamnesisError::Unsupported`] if `dtype` is one of the
-/// recognised-but-not-yet-implemented types (`IQ3_XXS`, `IQ3_S`, `IQ1_S`,
-/// `IQ1_M`, `TQ1_0`, `TQ2_0`, `MXFP4`) or a scalar type that is not a
-/// quantised block format.
+/// recognised-but-not-yet-implemented types (`IQ1_S`, `IQ1_M`, `TQ1_0`,
+/// `TQ2_0`, `MXFP4`) or a scalar type that is not a quantised block
+/// format.
 ///
 /// # Memory
 ///
@@ -367,8 +372,8 @@ pub fn dequantize_gguf_to_bf16(
 /// The `sink` closure receives `64` bytes per call for 32-element block
 /// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`) and `512` bytes per call for
 /// 256-element super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`, `IQ2_XXS`,
-/// `IQ2_XS`, `IQ2_S`). Sink errors abort the stream and are propagated
-/// unchanged as the return value.
+/// `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`). Sink errors abort the stream
+/// and are propagated unchanged as the return value.
 ///
 /// This is the canonical form. [`dequantize_gguf_to_bf16`] is a thin
 /// wrapper that sinks into a `Vec::with_capacity`.
@@ -1163,6 +1168,164 @@ where
     })
 }
 
+/// `IQ3_XXS` kernel — 98-byte super-blocks: `d: f16` + `qs[64]: u8`
+/// (grid-index bytes) + `scales_and_signs[8]: u32` (packed at `qs[64..96]`).
+///
+/// ~3.06 bpw quant. Structurally analogous to [`dequant_iq2_xxs`]: for each
+/// `ib32 ∈ 0..8`, a 32-bit `aux32` word supplies a 4-bit sub-block scale
+/// in its top 4 bits and four 7-bit sign indices in bits `[0..28]`. Each
+/// group of 4 output values is selected by **two** grid entries of the
+/// 256-entry [`IQ3XXS_GRID`] (`[u32; 256]`, 4-byte codebook vectors) —
+/// their 4 + 4 bytes are concatenated into the 8-element packed grid
+/// [`write_signed_grid`] expects.
+///
+/// The scale formula is `db = d × (0.5 + scale_nibble) × 0.5` — the extra
+/// factor-of-2 vs `IQ2_XXS`'s `× 0.25` reflects the wider codebook vector
+/// range (3-bit codes → larger magnitudes per element).
+///
+/// Ported verbatim from `ggml-quants.c::dequantize_row_iq3_xxs`.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
+fn dequant_iq3_xxs<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_super_kernel(data, 98, sink, |in_block, scratch| {
+        // Field offsets: d [0..2], qs [2..98].
+        // Inside qs: qs[0..64] = grid-index bytes (8 per sub-block),
+        //            qs[64..96] = 8 × u32 scales_and_signs words.
+        let d = read_f16_bytes([in_block[0], in_block[1]]);
+        let qs = &in_block[2..98];
+
+        let mut y_off: usize = 0;
+        for ib32 in 0..8 {
+            let ss_off = 64 + 4 * ib32;
+            let aux32 =
+                u32::from_le_bytes([qs[ss_off], qs[ss_off + 1], qs[ss_off + 2], qs[ss_off + 3]]);
+            // BITWISE: top 4 bits of aux32 = 4-bit sub-block scale nibble (0..=15)
+            // CAST: u32 → f32 lossless for 0..=15
+            let db = d * (0.5 + ((aux32 >> 28) as f32)) * 0.5;
+
+            for l in 0..4 {
+                // BITWISE: 7-bit sign index for group `l` lives in bits [7l, 7l+7]
+                // CAST: l (usize ≤ 3) → u32 for shift amount
+                let l_u32 = l as u32;
+                let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l_u32)) & 0x7F) as usize];
+                let g1 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l])].to_le_bytes();
+                let g2 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l + 1])].to_le_bytes();
+                // Concatenate two 4-byte grid vectors into the 8-byte layout
+                // `write_signed_grid` expects. `signs` bits [0..4] gate g1,
+                // bits [4..8] gate g2 — same convention as `KMASK_IQ2XS[j]`.
+                let combined = [g1[0], g1[1], g1[2], g1[3], g2[0], g2[1], g2[2], g2[3]];
+                write_signed_grid(scratch, y_off, db, combined, signs);
+                y_off += 8;
+            }
+        }
+    })
+}
+
+/// `IQ3_S` kernel — 110-byte super-blocks: `d: f16` + `qs[64]: u8`
+/// (low 8 bits of a 9-bit grid index) + `qh[8]: u8` (high bit of the
+/// grid index, one `qh` byte covers two sub-blocks) + `signs[32]: u8`
+/// (inline sign masks) + `scales[4]: u8`.
+///
+/// ~3.44 bpw quant. Structurally the most elaborate of the IQ3 family:
+///
+/// - Each `scales[outer]` byte covers **two** consecutive sub-blocks. Its
+///   low nibble drives `db1 = d × (1 + 2·nibble)` for sub-block A, its
+///   high nibble drives `db2` for sub-block B. The unusual
+///   odd-integer-multiplier formula differs from the `(0.5 + n) × 0.x`
+///   pattern used by `IQ2_XXS` / `IQ2_XS` / `IQ2_S` / `IQ3_XXS`.
+/// - The 9-bit grid index (into [`IQ3S_GRID`], `[u32; 512]`) is assembled
+///   from `qs[l]` (low 8 bits) and a 1-bit contribution from `qh` shifted
+///   into position 8. Two different shift patterns —
+///   `(qh << (8 - 2·l)) & 0x100` for grid1 and `(qh << (7 - 2·l)) & 0x100`
+///   for grid2 — pull out adjacent bits of the same `qh` byte into the
+///   grid-index MSB across the 4 groups.
+/// - Signs are stored inline in `signs[]` rather than resolved through
+///   `KSIGNS_IQ2XS` — one 8-bit mask per 4-output group, same sign
+///   convention as [`dequant_iq2_s`].
+///
+/// Processing: 4 outer iterations × 2 sub-blocks per outer × 4 groups per
+/// sub-block × 8 outputs per group = 256 outputs per super-block. Ported
+/// verbatim from `ggml-quants.c::dequantize_row_iq3_s`.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    clippy::similar_names
+)]
+fn dequant_iq3_s<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_super_kernel(data, 110, sink, |in_block, scratch| {
+        // Field offsets: d [0..2], qs [2..66], qh [66..74], signs [74..106],
+        //                scales [106..110].
+        let d = read_f16_bytes([in_block[0], in_block[1]]);
+        let qs = &in_block[2..66];
+        let qh = &in_block[66..74];
+        let signs = &in_block[74..106];
+        let scales = &in_block[106..110];
+
+        let mut y_off: usize = 0;
+        for outer in 0..4 {
+            // BITWISE: low / high 4-bit scale nibbles for the two halves.
+            // CAST: u8 → f32 lossless for 0..=15; db = d × (1 + 2·nibble)
+            // yields odd-integer scale multipliers in [1, 31].
+            let scale_byte = scales[outer];
+            let db1 = d * (1.0 + 2.0 * f32::from(scale_byte & 0x0F));
+            let db2 = d * (1.0 + 2.0 * f32::from(scale_byte >> 4));
+
+            // Sub-block A (first of the pair): uses qh[2·outer], db1.
+            let qh_first = u32::from(qh[2 * outer]);
+            let qs_first = 16 * outer;
+            let sg_first = 8 * outer;
+            for l in 0..4 {
+                // CAST: l (usize ≤ 3) → u32 for shift amount
+                let l_u32 = l as u32;
+                // BITWISE: high bit of the 9-bit grid index — two different
+                // shift patterns pull out the l-th and (l+1)-th bits of qh
+                // into index position 8 (mask 0x100).
+                let hi1 = (qh_first << (8 - 2 * l_u32)) & 0x0100;
+                let hi2 = (qh_first << (7 - 2 * l_u32)) & 0x0100;
+                let idx1 = u32::from(qs[qs_first + 2 * l]) | hi1;
+                let idx2 = u32::from(qs[qs_first + 2 * l + 1]) | hi2;
+                let g1 = IQ3S_GRID[idx1 as usize].to_le_bytes();
+                let g2 = IQ3S_GRID[idx2 as usize].to_le_bytes();
+                let combined = [g1[0], g1[1], g1[2], g1[3], g2[0], g2[1], g2[2], g2[3]];
+                let signs_l = signs[sg_first + l];
+                write_signed_grid(scratch, y_off, db1, combined, signs_l);
+                y_off += 8;
+            }
+
+            // Sub-block B (second of the pair): uses qh[2·outer + 1], db2.
+            let qh_second = u32::from(qh[2 * outer + 1]);
+            let qs_second = 16 * outer + 8;
+            let sg_second = 8 * outer + 4;
+            for l in 0..4 {
+                let l_u32 = l as u32;
+                let hi1 = (qh_second << (8 - 2 * l_u32)) & 0x0100;
+                let hi2 = (qh_second << (7 - 2 * l_u32)) & 0x0100;
+                let idx1 = u32::from(qs[qs_second + 2 * l]) | hi1;
+                let idx2 = u32::from(qs[qs_second + 2 * l + 1]) | hi2;
+                let g1 = IQ3S_GRID[idx1 as usize].to_le_bytes();
+                let g2 = IQ3S_GRID[idx2 as usize].to_le_bytes();
+                let combined = [g1[0], g1[1], g1[2], g1[3], g2[0], g2[1], g2[2], g2[3]];
+                let signs_l = signs[sg_second + l];
+                write_signed_grid(scratch, y_off, db2, combined, signs_l);
+                y_off += 8;
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // K-quant scale extractors
 // ---------------------------------------------------------------------------
@@ -1291,11 +1454,11 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_dtype() {
-        // IQ3_XXS is still recognised by GgufType with type_size() == None
-        // (IQ4_NL/IQ4_XS landed in Phase 4.5 step 1; IQ2_XXS/IQ2_XS/IQ2_S
-        // landed in step 2; the IQ3_* / IQ1_* / TQ* / MXFP4 family stays
-        // deferred until later Phase 4.5 commits).
-        let err = dequantize_gguf_to_bf16(&[], GgufType::IQ3_XXS, 256).unwrap_err();
+        // IQ1_S is still recognised by GgufType with type_size() == None.
+        // IQ4_NL/IQ4_XS landed in Phase 4.5 step 1; IQ2_XXS/IQ2_XS/IQ2_S
+        // landed in step 2; IQ3_XXS/IQ3_S landed in step 3. The IQ1_* /
+        // TQ* / MXFP4 family stays deferred until later Phase 4.5 commits.
+        let err = dequantize_gguf_to_bf16(&[], GgufType::IQ1_S, 256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 
@@ -2008,6 +2171,158 @@ mod tests {
                 bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
                 1.0,
                 "IQ2_S sub-block >=1[{j}]"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // IQ3_XXS
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn iq3_xxs_all_zero_block() {
+        let block = vec![0u8; 98];
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_XXS, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn iq3_xxs_grid_entry_0_sign_entry_0_scale_nibble_0() {
+        // d = 1.0, all bytes zero → every aux32 word = 0
+        //   → scale nibble = 0 → db = (0.5 + 0) × 0.5 = 0.25
+        //   → grid entries both IQ3XXS_GRID[0] = 0x04040404 → bytes = 4
+        //   → KSIGNS_IQ2XS[0] = 0 → all signs +1
+        //   → output = 0.25 × 4 = 1.0 everywhere.
+        let mut block = vec![0u8; 98];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_XXS, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 1.0);
+        }
+    }
+
+    #[test]
+    fn iq3_xxs_scale_nibble_sweep() {
+        // d = 1.0, craft aux32 for sub-block 0 with top nibble = 0xF:
+        //   → db = (0.5 + 15) × 0.5 = 7.75
+        // Sign index = 0 → KSIGNS_IQ2XS[0] = 0 → all +1
+        // Grid bytes = 4 → output = 7.75 × 4 = 31.0 in sub-block 0, 1.0 elsewhere.
+        let mut block = vec![0u8; 98];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        // scales_and_signs for ib32=0 live at qs[64..68] = block[66..70].
+        // We want top 4 bits of aux32 = 0xF → byte 3 = 0xF0.
+        block[66 + 3] = 0xF0;
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_XXS, 256).unwrap();
+        for j in 0..32 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                31.0,
+                "IQ3_XXS sub-block 0[{j}]"
+            );
+        }
+        for j in 32..256 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                1.0,
+                "IQ3_XXS sub-block >=1[{j}]"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // IQ3_S
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn iq3_s_all_zero_block() {
+        let block = vec![0u8; 110];
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_S, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn iq3_s_scale_formula() {
+        // d = 1.0, scales[0] = 0x05 (low = 5, high = 0):
+        //   db1 = 1 + 2·5 = 11 (sub-block A, elements 0..32)
+        //   db2 = 1 + 2·0 = 1  (sub-block B, elements 32..64)
+        // qs/qh/signs zero → IQ3S_GRID[0] = 0x01010101 → grid bytes = 1
+        // → sub-block A outputs 11, sub-block B outputs 1.
+        // Sub-blocks 2..=7: scales[1..=3] = 0 → db1 = db2 = 1 → outputs 1.
+        let mut block = vec![0u8; 110];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        block[106] = 0x05; // scales[0]
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_S, 256).unwrap();
+        for j in 0..32 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                11.0,
+                "IQ3_S sub-block A[{j}]"
+            );
+        }
+        for j in 32..256 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                1.0,
+                "IQ3_S sub-block B+[{j}]"
+            );
+        }
+    }
+
+    #[test]
+    fn iq3_s_qh_high_bit_selects_grid_entry_256() {
+        // d = 1.0, scales[0] = 0x03 → db1 = 1 + 2·3 = 7.
+        // qh[0] = 0x01: for l=0, hi1 = (1 << 8) & 0x100 = 0x100 → grid1 idx = 256.
+        // For l=0, hi2 = (1 << 7) & 0x100 = 0x80 & 0x100 = 0 → grid2 idx = 0.
+        // Signs zero → all +1.
+        //
+        // Expected elements 0..4: db1 × IQ3S_GRID[256] bytes  = 7 × grid_bytes.
+        //          elements 4..8: db1 × IQ3S_GRID[0] bytes   = 7 × 1 = 7.
+        //          elements 8..64 (rest of A + B): scales[0] low = 3 → db1 = 7
+        //                                          scales[0] high = 0 → db2 = 1.
+        //          elements 64.. : scales[1..=3] = 0 → db = 1 → output 1.
+        let mut block = vec![0u8; 110];
+        block[0..2].copy_from_slice(&f16_bytes(1.0));
+        block[106] = 0x03; // scales[0] low nibble = 3
+        block[66] = 0x01; // qh[0] low bit = 1
+        let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_S, 256).unwrap();
+
+        // First 4 outputs sourced from IQ3S_GRID[256] × db1 = 7.
+        let grid256 = IQ3S_GRID[256].to_le_bytes();
+        for j in 0..4 {
+            let expected = f32::from(half::bf16::from_f32(7.0 * f32::from(grid256[j])));
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                expected,
+                "IQ3_S grid256[{j}]"
+            );
+        }
+        // Next 4 outputs sourced from IQ3S_GRID[0] = 0x01010101 (byte = 1) × db1 = 7.
+        for j in 4..8 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                7.0,
+                "IQ3_S group 1 low-half[{j}]"
+            );
+        }
+        // Elements 8..32: remaining l=1..=3 of sub-block A, all grid[0]×db1 = 7.
+        for j in 8..32 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                7.0,
+                "IQ3_S sub-block A rest[{j}]"
+            );
+        }
+        // Sub-block B (32..64): scales[0] high = 0 → db2 = 1, grid[0] = 1 → 1.
+        // Sub-blocks 2..=7 (64..256): scales[1..=3] = 0 → db = 1, grid[0] = 1 → 1.
+        for j in 32..256 {
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                1.0,
+                "IQ3_S sub-block B+[{j}]"
             );
         }
     }
@@ -3844,5 +4159,125 @@ mod iq_grids {
         0x2b2b2b2b082b2b08,
         0x2b2b2b2b2b082b08,
         0x2b2b2b2b2b2b2b2b,
+    ];
+
+    /// 256-entry lattice codebook for `IQ3_XXS` (8-bit index). Each entry
+    /// packs 4 unsigned codebook values as a little-endian `u32`.
+    pub(super) const IQ3XXS_GRID: [u32; 256] = [
+        0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404,
+        0x04041414, 0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c,
+        0x040c0c04, 0x040c0c14, 0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c,
+        0x040c2c24, 0x040c3e04, 0x04140404, 0x04140414, 0x04140424, 0x04140c0c, 0x04141404,
+        0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e, 0x04142c0c, 0x04142c3e, 0x04143e2c,
+        0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c, 0x041c3e04, 0x04240c1c,
+        0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c, 0x042c043e,
+        0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+        0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c,
+        0x0c04141c, 0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404,
+        0x0c0c0414, 0x0c0c0c0c, 0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04,
+        0x0c140c14, 0x0c14140c, 0x0c141c04, 0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404,
+        0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c, 0x0c24042c, 0x0c242c04, 0x0c2c1404,
+        0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414, 0x0c3e2404, 0x14040404,
+        0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434, 0x14041c0c,
+        0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+        0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c,
+        0x14140c3e, 0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c,
+        0x141c0c04, 0x141c0c24, 0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c,
+        0x142c143e, 0x142c240c, 0x142c3e24, 0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c,
+        0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c, 0x1c04141c, 0x1c042c04, 0x1c04342c,
+        0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c, 0x1c0c2424, 0x1c0c2434,
+        0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14, 0x1c1c0c0c,
+        0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+        0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424,
+        0x24040c3e, 0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404,
+        0x24141c3e, 0x24142404, 0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424,
+        0x24242c0c, 0x24243424, 0x242c142c, 0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04,
+        0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c, 0x2c043e04, 0x2c0c0404, 0x2c0c0434,
+        0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14, 0x2c1c0414, 0x2c1c2c1c,
+        0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c, 0x2c342c04,
+        0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+        0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c,
+        0x342c2c14, 0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e,
+        0x3e040c04, 0x3e041c14, 0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c,
+        0x3e142c14, 0x3e1c0404, 0x3e1c0c2c, 0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c,
+        0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+    ];
+
+    /// 512-entry lattice codebook for `IQ3_S` (9-bit index).
+    pub(super) const IQ3S_GRID: [u32; 512] = [
+        0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303,
+        0x01010305, 0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707,
+        0x01010901, 0x01010905, 0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01,
+        0x01010d05, 0x01010f03, 0x01010f09, 0x01010f0f, 0x01030101, 0x01030103, 0x01030105,
+        0x01030109, 0x01030301, 0x01030303, 0x0103030b, 0x01030501, 0x01030507, 0x0103050f,
+        0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b, 0x01030f05, 0x01050101,
+        0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d, 0x01050503,
+        0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+        0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501,
+        0x01070505, 0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05,
+        0x01070d0f, 0x01070f03, 0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503,
+        0x01090509, 0x01090705, 0x01090901, 0x01090907, 0x01090b03, 0x01090f01, 0x010b0105,
+        0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d, 0x010b0707, 0x010b0903, 0x010b090b,
+        0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303, 0x010d0307, 0x010d0703,
+        0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501, 0x010f0505,
+        0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+        0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501,
+        0x03010505, 0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03,
+        0x03010f05, 0x03030101, 0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309,
+        0x03030503, 0x03030701, 0x03030707, 0x03030903, 0x03030b01, 0x03030b05, 0x03030f01,
+        0x03030f0d, 0x03050101, 0x03050305, 0x0305030b, 0x0305030f, 0x03050501, 0x03050509,
+        0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01, 0x03050f05, 0x03070103,
+        0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f, 0x03070701,
+        0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+        0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09,
+        0x030b0103, 0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03,
+        0x030d0501, 0x030d0509, 0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107,
+        0x030f0301, 0x030f0305, 0x030f0503, 0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01,
+        0x05010101, 0x05010103, 0x05010107, 0x0501010b, 0x0501010f, 0x05010301, 0x05010305,
+        0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f, 0x05010701, 0x05010705,
+        0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f, 0x05010f01,
+        0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+        0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103,
+        0x05050109, 0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903,
+        0x05050b07, 0x05050b0f, 0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b,
+        0x05070303, 0x05070505, 0x05070509, 0x05070703, 0x05070707, 0x05070905, 0x05070b01,
+        0x05070d0d, 0x05090103, 0x0509010f, 0x05090501, 0x05090507, 0x05090705, 0x0509070b,
+        0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303, 0x050b0505, 0x050b070f,
+        0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f, 0x050d0503,
+        0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+        0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505,
+        0x07010703, 0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03,
+        0x07010d07, 0x07010f03, 0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503,
+        0x07030507, 0x07030901, 0x07030d01, 0x07030f05, 0x07030f0d, 0x07050101, 0x07050305,
+        0x07050501, 0x07050705, 0x07050709, 0x07050b01, 0x07070103, 0x07070301, 0x07070309,
+        0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903, 0x07070907, 0x0707090f,
+        0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505, 0x07090703,
+        0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+        0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103,
+        0x070f0107, 0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305,
+        0x09010501, 0x09010509, 0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01,
+        0x09030105, 0x0903010f, 0x09030303, 0x09030307, 0x09030505, 0x09030701, 0x0903070b,
+        0x09030907, 0x09030b03, 0x09030b0b, 0x09050103, 0x09050107, 0x09050301, 0x0905030b,
+        0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05, 0x09050f01, 0x09070109,
+        0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b, 0x09090101,
+        0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+        0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b,
+        0x090f0701, 0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505,
+        0x0b010901, 0x0b010909, 0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103,
+        0x0b030107, 0x0b03010b, 0x0b030305, 0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101,
+        0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d, 0x0b050b07, 0x0b070105, 0x0b07010f,
+        0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b, 0x0b070f07, 0x0b090103,
+        0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d, 0x0b0b0b03,
+        0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+        0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f,
+        0x0d030d09, 0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01,
+        0x0d070101, 0x0d070309, 0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05,
+        0x0d0b0101, 0x0d0b0107, 0x0d0b0709, 0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303,
+        0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f, 0x0f010501, 0x0f010505, 0x0f01070d,
+        0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303, 0x0f030509, 0x0f030907,
+        0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503, 0x0f050701,
+        0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+        0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703,
+        0x0f0f0101,
     ];
 }
