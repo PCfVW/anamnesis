@@ -26,8 +26,8 @@ All sizes from `ggml-common.h` at commit cut 2026-04-22. `QK_K = 256`.
 | `IQ2_XXS` | 16 | 256 | 66 | shipped (`Phase 4.5 step 2`) |
 | `IQ2_XS` | 17 | 256 | 74 | shipped (`Phase 4.5 step 2`) |
 | `IQ2_S` | 22 | 256 | 82 | shipped (`Phase 4.5 step 2`) |
-| `IQ3_XXS` | 18 | 256 | **TBD** (~98 B) | **step 3, pending** |
-| `IQ3_S` | 21 | 256 | **TBD** (~110 B) | **step 3, pending** |
+| `IQ3_XXS` | 18 | 256 | 98 | shipped (`Phase 4.5 step 3`) |
+| `IQ3_S` | 21 | 256 | 110 | shipped (`Phase 4.5 step 3`) |
 | `IQ1_S` | 19 | 256 | **TBD** (~50 B) | **step 4, pending** |
 | `IQ1_M` | 29 | 256 | **TBD** (~56 B) | **step 4, pending** |
 | `TQ1_0` | 34 | 256 | 54 | **step 5, pending** (confirmed via `gguf.GGML_QUANT_SIZES`) |
@@ -54,20 +54,20 @@ Download sizes and tensor counts from remote-header probes performed 2026-04-22.
 | `IQ2_XXS` | `mistral_7b_iq2_xxs.bin` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ2_XXS.gguf` | **1.86 GB** (one-off) |
 | `IQ2_XS` | `mistral_7b_iq2_xs.bin` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ2_XS.gguf` | **2.05 GB** (one-off) |
 | `IQ2_S` | `qwen25_iq2_s.bin` | `bartowski/Qwen2.5-0.5B-Instruct-GGUF` / `...-IQ2_M.gguf` | already local (313 MB) |
+| `IQ3_XXS` | `mistral_7b_iq3_xxs.bin` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ3_XXS.gguf` | **2.64 GB** (one-off) |
+| `IQ3_S` | `mistral_7b_iq3_s.bin` | same `...-IQ3_XXS.gguf` file (ships 33 `IQ3_S` secondary tensors) | already local (via `IQ3_XXS`) |
 
-### Pending kernels (Phase 4.5 steps 3–6)
+### Pending kernels (Phase 4.5 steps 4–6)
 
 | Kernel | Source strategy | HF source | New download |
 |---|---|---|---:|
-| `IQ3_XXS` | real model | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ3_XXS.gguf` — **96 `IQ3_XXS` tensors ≥ 65 K elem** (also ships 33 `IQ3_S` + 64 `IQ2_S`) | **2.64 GB** |
-| `IQ3_S` | real model — **already local** | `Mistral-7B-Instruct-v0.3-IQ2_S.gguf` ships **37 `IQ3_S` tensors**; alternatively `...-IQ3_XXS.gguf` (if downloaded for `IQ3_XXS`) gives 33 | **0 GB** |
 | `IQ1_S` | real model | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ1_S.gguf` — **156 `IQ1_S` tensors ≥ 65 K elem** | **1.50 GB** |
 | `IQ1_M` | real model | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ1_M.gguf` — **156 `IQ1_M` tensors ≥ 65 K elem** | **1.64 GB** |
 | `TQ1_0` | **synthetic** via `gguf.quants.quantize()` | `np.random.randn(65536) × 0.1`, f32 → `TQ1_0` → dequant reference | **0 GB** |
 | `TQ2_0` | **synthetic** via `gguf.quants.quantize()` | same | **0 GB** |
 | `MXFP4` | **synthetic** via `gguf.quants.quantize()` | same | **0 GB** |
 
-**Total new download to finish Phase 4.5:** **~5.78 GB** (only Mistral-7B `IQ3_XXS` + `IQ1_S` + `IQ1_M`).
+**Total new download to finish Phase 4.5:** **~3.14 GB** (only Mistral-7B `IQ1_S` + `IQ1_M`; step 3's `IQ3_XXS.gguf` is now also local).
 
 ### Alternative real-model sources (for future cross-checking)
 
