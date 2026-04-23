@@ -31,7 +31,9 @@ Models (download via ``hf-fm download-file --flat --output-dir models/``):
   bartowski/SmolLM2-135M-Instruct-GGUF — Q4_0, Q4_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS
   TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF — Q5_0
   bartowski/Qwen2.5-0.5B-Instruct-GGUF — IQ2_S (via the IQ2_M mix file)
-  bartowski/Mistral-7B-Instruct-v0.3-GGUF — IQ2_XXS, IQ2_XS (pure variants)
+  bartowski/Mistral-7B-Instruct-v0.3-GGUF — IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S
+    (IQ3_S via the IQ3_XXS.gguf file's 33 IQ3_S secondary tensors — one
+     download, two fixtures)
 
   NOTE: Mistral-7B-Instruct-v0.3-IQ2_S.gguf is *misleadingly named* — it actually
   ships IQ2_XS + IQ3_S tensors, NO IQ2_S. Use the Qwen2.5-0.5B IQ2_M file for IQ2_S
@@ -90,6 +92,12 @@ FIXTURES = [
     ("mistral_7b_iq2_xs",  "Mistral-7B-Instruct-v0.3-IQ2_XS.gguf",  GGMLQuantizationType.IQ2_XS),
     # IQ2_S from Qwen2.5-0.5B's IQ2_M mix (21 IQ2_S tensors inside).
     ("qwen25_iq2_s", "Qwen2.5-0.5B-Instruct-IQ2_M.gguf", GGMLQuantizationType.IQ2_S),
+    # ---- IQ3 variants (3-bit super-quants) ----
+    # Mistral-7B-v0.3-IQ3_XXS.gguf primary type is IQ3_XXS (96 tensors); it
+    # ALSO ships 33 IQ3_S tensors as the high-precision secondary — so a
+    # single file covers both IQ3 fixtures with no extra download.
+    ("mistral_7b_iq3_xxs", "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf", GGMLQuantizationType.IQ3_XXS),
+    ("mistral_7b_iq3_s",   "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf", GGMLQuantizationType.IQ3_S),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
 
