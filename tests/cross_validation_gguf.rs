@@ -12,10 +12,11 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor.
 //!
-//! Coverage: 17 of 19 production kernels from 4 real models (`Q4_0`–`Q8_0`,
+//! Coverage: 19 of 21 production kernels from 4 real models (`Q4_0`–`Q8_0`,
 //! `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`,
-//! `IQ3_S`). `Q8_1` and `Q8_K` are not shipped by any real model — they are
-//! internal `llama.cpp` activation quant types, already covered by unit tests.
+//! `IQ3_S`, `IQ1_S`, `IQ1_M`). `Q8_1` and `Q8_K` are not shipped by any real
+//! model — they are internal `llama.cpp` activation quant types, already
+//! covered by unit tests.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -80,6 +81,8 @@ fn gguf_type_from_disc(disc: u32) -> GgufType {
         22 => GgufType::IQ2_S,
         18 => GgufType::IQ3_XXS,
         21 => GgufType::IQ3_S,
+        19 => GgufType::IQ1_S,
+        29 => GgufType::IQ1_M,
         other => panic!("unknown ggml_type discriminant: {other}"),
     }
 }
@@ -382,6 +385,36 @@ fn cross_validate_mistral_7b_iq3_s() {
         "Mistral-7B-v0.3 IQ3_S (bartowski)",
         include_bytes!("fixtures/gguf_reference/mistral_7b_iq3_s.bin"),
         GgufType::IQ3_S,
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// IQ1 variants (256-element super-blocks) — 2 kernels
+// ---------------------------------------------------------------------------
+//
+// Smallest IQ-family quants. Both source files come from
+// `bartowski/Mistral-7B-Instruct-v0.3-GGUF` but, unlike IQ3, the IQ1
+// variants don't share a single file: `Mistral-7B-Instruct-v0.3-IQ1_S.gguf`
+// has 156 IQ1_S tensors but no IQ1_M; `...-IQ1_M.gguf` has 156 IQ1_M
+// tensors but no IQ1_S. Two downloads, two fixtures.
+
+#[test]
+fn cross_validate_mistral_7b_iq1_s() {
+    run_cross_validation(
+        "Mistral-7B-v0.3 IQ1_S (bartowski)",
+        include_bytes!("fixtures/gguf_reference/mistral_7b_iq1_s.bin"),
+        GgufType::IQ1_S,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_mistral_7b_iq1_m() {
+    run_cross_validation(
+        "Mistral-7B-v0.3 IQ1_M (bartowski)",
+        include_bytes!("fixtures/gguf_reference/mistral_7b_iq1_m.bin"),
+        GgufType::IQ1_M,
         0,
     );
 }

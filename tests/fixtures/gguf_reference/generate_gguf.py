@@ -31,9 +31,9 @@ Models (download via ``hf-fm download-file --flat --output-dir models/``):
   bartowski/SmolLM2-135M-Instruct-GGUF — Q4_0, Q4_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS
   TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF — Q5_0
   bartowski/Qwen2.5-0.5B-Instruct-GGUF — IQ2_S (via the IQ2_M mix file)
-  bartowski/Mistral-7B-Instruct-v0.3-GGUF — IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S
-    (IQ3_S via the IQ3_XXS.gguf file's 33 IQ3_S secondary tensors — one
-     download, two fixtures)
+  bartowski/Mistral-7B-Instruct-v0.3-GGUF — IQ2_XXS, IQ2_XS, IQ3_XXS,
+    IQ3_S (via the IQ3_XXS.gguf file — one download, two fixtures),
+    IQ1_S, IQ1_M (two separate files; no shared-file trick this time)
 
   NOTE: Mistral-7B-Instruct-v0.3-IQ2_S.gguf is *misleadingly named* — it actually
   ships IQ2_XS + IQ3_S tensors, NO IQ2_S. Use the Qwen2.5-0.5B IQ2_M file for IQ2_S
@@ -98,6 +98,12 @@ FIXTURES = [
     # single file covers both IQ3 fixtures with no extra download.
     ("mistral_7b_iq3_xxs", "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf", GGMLQuantizationType.IQ3_XXS),
     ("mistral_7b_iq3_s",   "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf", GGMLQuantizationType.IQ3_S),
+    # ---- IQ1 variants (1-bit super-quants, smallest IQ family members) ----
+    # Unlike IQ3, the IQ1 variants don't share files: Mistral-7B-IQ1_S.gguf
+    # has 156 IQ1_S + 32 IQ2_XXS (no IQ1_M); Mistral-7B-IQ1_M.gguf has 156
+    # IQ1_M + 32 IQ2_XXS (no IQ1_S). Two downloads, two fixtures.
+    ("mistral_7b_iq1_s", "Mistral-7B-Instruct-v0.3-IQ1_S.gguf", GGMLQuantizationType.IQ1_S),
+    ("mistral_7b_iq1_m", "Mistral-7B-Instruct-v0.3-IQ1_M.gguf", GGMLQuantizationType.IQ1_M),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
 
