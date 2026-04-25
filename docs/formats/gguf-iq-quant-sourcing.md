@@ -30,8 +30,8 @@ All sizes from `ggml-common.h` at commit cut 2026-04-22. `QK_K = 256`.
 | `IQ3_S` | 21 | 256 | 110 | shipped (`Phase 4.5 step 3`) |
 | `IQ1_S` | 19 | 256 | 50 | shipped (`Phase 4.5 step 4`) |
 | `IQ1_M` | 29 | 256 | 56 | shipped (`Phase 4.5 step 4`) |
-| `TQ1_0` | 34 | 256 | 54 | **step 5, pending** (confirmed via `gguf.GGML_QUANT_SIZES`) |
-| `TQ2_0` | 35 | 256 | 66 | **step 5, pending** (confirmed via `gguf.GGML_QUANT_SIZES`) |
+| `TQ1_0` | 34 | 256 | 54 | shipped (`Phase 4.5 step 5`) |
+| `TQ2_0` | 35 | 256 | 66 | shipped (`Phase 4.5 step 5`) |
 | `MXFP4` | 39 | 32 | 17 | **step 6, pending** (confirmed via `gguf.GGML_QUANT_SIZES`) |
 
 The shipped types' byte sizes can be verified in [`src/parse/gguf.rs::type_size()`](../../src/parse/gguf.rs). Pending types return `None` from `type_size()` today.
@@ -58,16 +58,16 @@ Download sizes and tensor counts from remote-header probes performed 2026-04-22.
 | `IQ3_S` | `mistral_7b_iq3_s.bin` | same `...-IQ3_XXS.gguf` file (ships 33 `IQ3_S` secondary tensors) | already local (via `IQ3_XXS`) |
 | `IQ1_S` | `mistral_7b_iq1_s.bin` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ1_S.gguf` | **1.50 GB** (one-off) |
 | `IQ1_M` | `mistral_7b_iq1_m.bin` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ1_M.gguf` (no shared file with IQ1_S) | **1.64 GB** (one-off) |
+| `TQ1_0` | `synthetic_tq1_0.bin` | **synthetic** via `gguf.quants.quantize()` (seed=42, scale=0.1) | already (no download) |
+| `TQ2_0` | `synthetic_tq2_0.bin` | **synthetic** via `gguf.quants.quantize()` (same seed) | already (no download) |
 
-### Pending kernels (Phase 4.5 steps 5–6)
+### Pending kernels (Phase 4.5 step 6)
 
 | Kernel | Source strategy | HF source | New download |
 |---|---|---|---:|
-| `TQ1_0` | **synthetic** via `gguf.quants.quantize()` | `np.random.randn(65536) × 0.1`, f32 → `TQ1_0` → dequant reference | **0 GB** |
-| `TQ2_0` | **synthetic** via `gguf.quants.quantize()` | same | **0 GB** |
-| `MXFP4` | **synthetic** via `gguf.quants.quantize()` | same | **0 GB** |
+| `MXFP4` | **synthetic** via `gguf.quants.quantize()` | `np.random.randn(65536) × 0.1`, f32 → `MXFP4` → dequant reference | **0 GB** |
 
-**Total new download to finish Phase 4.5:** **0 GB** (steps 5–6 are all synthesisable via Python `gguf.quants.quantize()`; no more model downloads needed).
+**Total new download to finish Phase 4.5:** **0 GB** (only MXFP4 left, and it's synthesisable via the same Python `gguf.quants.quantize()` path as TQ1_0/TQ2_0).
 
 ### Alternative real-model sources (for future cross-checking)
 
