@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CLI feature-gate fallback defect** — `detect_format` in [src/bin/main.rs](src/bin/main.rs) now returns a `Result<Format>` and emits an `AnamnesisError::Unsupported` carrying a feature-flag hint when the input matches a format whose Cargo feature is not enabled in this build. Previously a `.pth` / `.npz` / `.gguf` file (or a `.bin` file with the corresponding magic) silently fell through to the safetensors parser when its feature was disabled, producing cryptic downstream errors like `HeaderTooLarge` instead of a useful "rebuild with `--features cli,<flag>`" message. This matters in practice because `cli = ["dep:clap"]` does **not** transitively activate `pth` / `npz` / `gguf` — `cargo install anamnesis --features cli` ships a safetensors-only CLI. The library API (`anamnesis::parse_pth` etc.) was already returning `Unsupported` properly; this fix brings the CLI's UX in line.
 - **Rust 1.95 clippy lints** — fixed `clippy::unnecessary_trailing_comma` in `src/inspect.rs` and `clippy::map_unwrap_or` (with the `is_ok_and` suggestion) in `src/bin/main.rs`. Both lints landed/strengthened in Rust 1.95.0 (2026-04-14) and would have broken CI's `stable` matrix job under `#![deny(warnings)]`. No user-visible behavior change.
 
 ## [0.4.1] - 2026-04-13

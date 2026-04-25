@@ -57,13 +57,55 @@ enum Format {
     Gguf,
 }
 
+/// Builds an [`AnamnesisError::Unsupported`] explaining that the input
+/// matched a format whose Cargo feature is disabled in the current build.
+///
+/// `format_name` is the user-facing format name (e.g., `"PyTorch"`,
+/// `"GGUF"`). `kind` describes how the format was detected (extension or
+/// magic bytes). `feature_flag` is the Cargo feature that enables the
+/// corresponding parser.
+///
+/// Compiled only when at least one of `pth`, `npz`, `gguf` is **not**
+/// enabled — when the binary is built with all three the helper has no
+/// callers and triggers `dead_code`.
+#[cfg(not(all(feature = "pth", feature = "npz", feature = "gguf")))]
+fn missing_feature_err(
+    format_name: &str,
+    kind: &str,
+    feature_flag: &str,
+) -> anamnesis::AnamnesisError {
+    anamnesis::AnamnesisError::Unsupported {
+        format: format_name.into(),
+        detail: format!(
+            "input is {kind} but the `{feature_flag}` Cargo feature is not enabled in this \
+             build — rebuild with `cargo install anamnesis --features cli,{feature_flag}` \
+             (or `cargo build --features cli,{feature_flag}`) to add support"
+        ),
+    }
+}
+
 /// Detects the model format from file extension and magic bytes.
 ///
 /// `.safetensors` → `Safetensors`. `.pth`/`.pt` → `Pth`. `.npz` → `Npz`.
 /// `.gguf` → `Gguf`. `.bin` → check ZIP magic (`PK\x03\x04`) for
 /// `PyTorch`, then `GGUF` magic. Unknown extensions try `GGUF` magic
 /// before defaulting to `Safetensors`.
-fn detect_format(path: &std::path::Path) -> Format {
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] when the input matches a
+/// format whose Cargo feature (`pth`, `npz`, or `gguf`) is not enabled
+/// in this build. This replaces the previous silent fall-through to
+/// `Safetensors`, which produced cryptic downstream errors when users
+/// pointed the CLI at a `.pth` / `.npz` / `.gguf` file built without
+/// the matching feature.
+// `clippy::unnecessary_wraps`: when all three of `pth`, `npz`, `gguf`
+// are enabled every branch is `Ok(_)` and clippy can't see that other
+// feature combinations make the wrap load-bearing. This allow keeps
+// the all-features clippy build clean without weakening detection
+// elsewhere.
+#[allow(clippy::unnecessary_wraps)]
+fn detect_format(path: &std::path::Path) -> anamnesis::Result<Format> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -71,38 +113,96 @@ fn detect_format(path: &std::path::Path) -> Format {
         .to_ascii_lowercase();
 
     match ext.as_str() {
-        "safetensors" => Format::Safetensors,
-        #[cfg(feature = "pth")]
-        "pth" | "pt" => Format::Pth,
-        #[cfg(feature = "npz")]
-        "npz" => Format::Npz,
-        #[cfg(feature = "gguf")]
-        "gguf" => Format::Gguf,
-        "bin" => {
+        "safetensors" => Ok(Format::Safetensors),
+        "pth" | "pt" => {
             #[cfg(feature = "pth")]
-            if has_zip_magic(path) {
-                return Format::Pth;
+            {
+                Ok(Format::Pth)
             }
+            #[cfg(not(feature = "pth"))]
+            {
+                Err(missing_feature_err("PyTorch", "a .pth/.pt file", "pth"))
+            }
+        }
+        "npz" => {
+            #[cfg(feature = "npz")]
+            {
+                Ok(Format::Npz)
+            }
+            #[cfg(not(feature = "npz"))]
+            {
+                Err(missing_feature_err("NumPy NPZ", "a .npz file", "npz"))
+            }
+        }
+        "gguf" => {
             #[cfg(feature = "gguf")]
-            if has_gguf_magic(path) {
-                return Format::Gguf;
+            {
+                Ok(Format::Gguf)
             }
-            Format::Safetensors
+            #[cfg(not(feature = "gguf"))]
+            {
+                Err(missing_feature_err("GGUF", "a .gguf file", "gguf"))
+            }
+        }
+        "bin" => {
+            if has_zip_magic(path) {
+                #[cfg(feature = "pth")]
+                {
+                    return Ok(Format::Pth);
+                }
+                #[cfg(not(feature = "pth"))]
+                {
+                    return Err(missing_feature_err(
+                        "PyTorch",
+                        "a .bin file with ZIP magic (PyTorch pickle archive)",
+                        "pth",
+                    ));
+                }
+            }
+            if has_gguf_magic(path) {
+                #[cfg(feature = "gguf")]
+                {
+                    return Ok(Format::Gguf);
+                }
+                #[cfg(not(feature = "gguf"))]
+                {
+                    return Err(missing_feature_err(
+                        "GGUF",
+                        "a .bin file with GGUF magic",
+                        "gguf",
+                    ));
+                }
+            }
+            Ok(Format::Safetensors)
         }
         _ => {
-            #[cfg(feature = "gguf")]
             if has_gguf_magic(path) {
-                return Format::Gguf;
+                #[cfg(feature = "gguf")]
+                {
+                    return Ok(Format::Gguf);
+                }
+                #[cfg(not(feature = "gguf"))]
+                {
+                    return Err(missing_feature_err(
+                        "GGUF",
+                        "a file whose first four bytes are the GGUF magic",
+                        "gguf",
+                    ));
+                }
             }
-            Format::Safetensors
+            Ok(Format::Safetensors)
         }
     }
 }
 
-/// Returns `true` if the file starts with the ZIP local header magic `PK\x03\x04`.
+/// Returns `true` if the file starts with the ZIP local header magic
+/// `PK\x03\x04`. Reads only 4 bytes — does not load the file into memory.
 ///
-/// Reads only 4 bytes — does not load the file into memory.
-#[cfg(feature = "pth")]
+/// Always available (no feature gate) because [`detect_format`] needs to
+/// detect `.bin`-extension `PyTorch` archives even in builds where the
+/// `pth` feature is disabled, so it can return a helpful "feature not
+/// enabled" error instead of silently misrouting to the safetensors
+/// parser.
 fn has_zip_magic(path: &std::path::Path) -> bool {
     let mut buf = [0u8; 4];
     std::fs::File::open(path)
@@ -113,10 +213,13 @@ fn has_zip_magic(path: &std::path::Path) -> bool {
         .is_ok_and(|()| buf == *b"PK\x03\x04")
 }
 
-/// Returns `true` if the file starts with the `GGUF` magic bytes (`"GGUF"`).
+/// Returns `true` if the file starts with the `GGUF` magic bytes
+/// (`"GGUF"`). Reads only 4 bytes — does not load the file into memory.
 ///
-/// Reads only 4 bytes — does not load the file into memory.
-#[cfg(feature = "gguf")]
+/// Always available (no feature gate) for the same reason as
+/// [`has_zip_magic`]: feature-disabled builds still need to recognise
+/// GGUF files and produce a helpful error rather than silently falling
+/// through to the safetensors parser.
 fn has_gguf_magic(path: &std::path::Path) -> bool {
     let mut buf = [0u8; 4];
     std::fs::File::open(path)
@@ -142,7 +245,7 @@ fn run() -> anamnesis::Result<()> {
 }
 
 fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
-    match detect_format(path) {
+    match detect_format(path)? {
         Format::Safetensors => run_parse_safetensors(path),
         #[cfg(feature = "pth")]
         Format::Pth => run_parse_pth(path),
@@ -294,7 +397,7 @@ fn run_inspect_npz(path: &std::path::Path) -> anamnesis::Result<()> {
 }
 
 fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
-    match detect_format(path) {
+    match detect_format(path)? {
         Format::Safetensors => {
             let model = parse(path)?;
             let info = InspectInfo::from(&model.header);
@@ -323,7 +426,7 @@ fn run_remember(
     to: &str,
     output: Option<&std::path::Path>,
 ) -> anamnesis::Result<()> {
-    match detect_format(path) {
+    match detect_format(path)? {
         Format::Safetensors => run_remember_safetensors(path, to, output),
         #[cfg(feature = "pth")]
         Format::Pth => {
