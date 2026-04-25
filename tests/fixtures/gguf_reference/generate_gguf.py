@@ -112,6 +112,11 @@ FIXTURES = [
     # filename triggers the synthetic-source path below.
     ("synthetic_tq1_0", None, GGMLQuantizationType.TQ1_0),
     ("synthetic_tq2_0", None, GGMLQuantizationType.TQ2_0),
+    # ---- MXFP4 (microscaling FP4, OCP MX standard, added to ggml 2024) ----
+    # Python gguf.quants.quantize() supports it; same synthetic path as TQ*.
+    # Real-model MXFP4 mostly ships only inside the 11 GB gpt-oss-20b GGUF
+    # — too large to justify when the synthetic path is bit-exact.
+    ("synthetic_mxfp4", None, GGMLQuantizationType.MXFP4),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
 

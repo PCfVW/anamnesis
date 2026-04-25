@@ -12,15 +12,16 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor.
 //!
-//! Coverage: 21 of 22 production kernels from 4 real models + 2 synthetic
+//! Coverage: **22 of 22** production kernels from 4 real models + 3 synthetic
 //! fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`,
-//! `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`).
-//! `TQ1_0` / `TQ2_0` are synthetic-fixture cross-validated because only ~15
-//! BitNet-derivative GGUFs ship them on `HuggingFace` (Python `gguf.quants.
-//! quantize()` implements the encode side, so a deterministic random tensor
-//! is the practical fixture source). `Q8_1` and `Q8_K` are not shipped by
-//! any real model — they are internal `llama.cpp` activation quant types,
-//! already covered by unit tests.
+//! `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`,
+//! `MXFP4`). `TQ1_0` / `TQ2_0` / `MXFP4` are synthetic-fixture cross-validated
+//! — only ~15 BitNet-derivative GGUFs ship the `TQ*` types on `HuggingFace`,
+//! and mainstream `MXFP4` only ships inside the 11 GB `gpt-oss-20b` upload;
+//! Python `gguf.quants.quantize()` implements all three encode sides, so a
+//! deterministic random tensor is the practical fixture source. `Q8_1` and
+//! `Q8_K` are not shipped by any real model — they are internal `llama.cpp`
+//! activation quant types, already covered by unit tests.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -61,9 +62,9 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 
 /// Maps a `ggml_type` discriminant to a [`GgufType`].
 ///
-/// Covers the 14 currently dequantizable block types — the remaining
-/// `IQ*` / `TQ*` / `MXFP4` entries are not cross-validated here because
-/// they are still unsupported at the dequantiser level.
+/// Covers all 22 dequantizable block types — Phase 4.5 step 6 closed
+/// the GGUF coverage gap, so every block-quantised `GgufType` variant
+/// is exercised here.
 fn gguf_type_from_disc(disc: u32) -> GgufType {
     match disc {
         2 => GgufType::Q4_0,
@@ -89,6 +90,7 @@ fn gguf_type_from_disc(disc: u32) -> GgufType {
         29 => GgufType::IQ1_M,
         34 => GgufType::TQ1_0,
         35 => GgufType::TQ2_0,
+        39 => GgufType::MXFP4,
         other => panic!("unknown ggml_type discriminant: {other}"),
     }
 }
@@ -453,6 +455,27 @@ fn cross_validate_synthetic_tq2_0() {
         "Synthetic TQ2_0 (seed=42)",
         include_bytes!("fixtures/gguf_reference/synthetic_tq2_0.bin"),
         GgufType::TQ2_0,
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 (32-element block) — synthetic fixture, completes Phase 4.5
+// ---------------------------------------------------------------------------
+//
+// Microscaling FP4 (OCP MX standard from late 2023, added to ggml in 2024).
+// Mainstream MXFP4 GGUFs only ship inside the 11 GB `gpt-oss-20b` upload —
+// too large to justify when Python `gguf.quants.quantize()` supports MXFP4
+// and a deterministic synthetic random tensor (seed=42, scale=0.1) gives
+// bit-exact cross-validation. Reuses the synthetic-fixture path established
+// for TQ1_0 / TQ2_0 in step 5.
+
+#[test]
+fn cross_validate_synthetic_mxfp4() {
+    run_cross_validation(
+        "Synthetic MXFP4 (seed=42)",
+        include_bytes!("fixtures/gguf_reference/synthetic_mxfp4.bin"),
+        GgufType::MXFP4,
         0,
     );
 }
