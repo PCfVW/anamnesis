@@ -143,10 +143,10 @@ Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors
 | IQ2_S | Qwen2.5-0.5B | 4.10x faster |
 | IQ3_XXS | Mistral-7B-v0.3 | 3.32x faster |
 | IQ3_S | Mistral-7B-v0.3 | 4.37x faster |
-| IQ1_S | Mistral-7B-v0.3 | 13.77x faster |
-| IQ1_M | Mistral-7B-v0.3 | 7.88x faster |
+| IQ1_S | Mistral-7B-v0.3 | 15.00x faster |
+| IQ1_M | Mistral-7B-v0.3 | 7.85x faster |
 
-> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` and `IQ3_*` kernels land in the 2.8×–4.4× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. The `IQ1_*` kernels are notably faster (7.9×–13.8×) because their inner loop replaces the per-element sign branch with a single scalar `±delta` per 8-element group, and the codebook gather is a plain `[u64; 2048]` table lookup. Phase 9 (CPU SIMD pass) will further address the IQ2/IQ3 case with hand-written AVX2 intrinsics.
+> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` and `IQ3_*` kernels land in the 2.8×–4.4× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. The `IQ1_*` kernels are notably faster (7.9×–15.0×) because their inner loop replaces the per-element sign branch with a single scalar `±delta` per 8-element group, and the codebook gather is a plain `[u64; 2048]` table lookup. Phase 9 (CPU SIMD pass) will further address the IQ2/IQ3 case with hand-written AVX2 intrinsics.
 
 ### NPZ/NPY Parsing
 
