@@ -103,6 +103,18 @@ fn read_f32_bytes(bytes: [u8; 4]) -> f32 {
     f32::from_le_bytes(bytes)
 }
 
+/// Unpacks an `IQ1S_GRID` `u64` entry into 8 signed `i8` codebook values.
+///
+/// The C reference reinterprets `(int8_t *)&iq1s_grid[idx]`; in Rust we
+/// pull the 8 little-endian bytes and cast each to `i8`. Used by both
+/// `IQ1_S` and `IQ1_M` (every group's grid lookup goes through this).
+#[inline]
+#[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
+fn iq1s_grid_as_i8(packed: u64) -> [i8; 8] {
+    // CAST: u8 → i8 intentional signed reinterpret of the IQ1S_GRID codebook.
+    packed.to_le_bytes().map(|b| b as i8)
+}
+
 /// Reads a 12-byte packed scales field out of a block at `offset`.
 ///
 /// Used by `Q3_K`, `Q4_K`, and `Q5_K` to lift the packed 6-bit scales
@@ -1351,8 +1363,9 @@ where
 
 /// `IQ1_S` kernel — 50-byte super-blocks: `d: f16` + `qs[32]: u8` (low 8
 /// bits of an 11-bit grid index) + `qh[8]: u16` (one u16 word per `ib32`,
-/// holding 4 × 3-bit high-index nibbles for the four groups + a 3-bit
-/// sub-block scale + a 1-bit delta-sign flag in the top byte).
+/// packing four 3-bit high-index fields at bits `[0..12]`, a 3-bit
+/// sub-block scale at bits `[12..15]`, and a 1-bit delta-sign flag at
+/// bit `[15]`).
 ///
 /// ~1.56 bpw quant. The smallest member of the `IQ*` family with a top-
 /// level `d` field. Each `ib32 ∈ 0..8` reads one `qh` u16 word that
@@ -1390,8 +1403,8 @@ where
         for ib32 in 0..8 {
             let qh_off = 2 * ib32;
             let qh = u16::from_le_bytes([qh_bytes[qh_off], qh_bytes[qh_off + 1]]);
-            // BITWISE: top 3 bits of qh = sub-block 3-bit scale; bit 15 = delta sign
-            // CAST: u16 → f32 lossless for the 1..=15 odd-integer multiplier
+            // BITWISE: bits [12..15] of qh = sub-block 3-bit scale; bit 15 = delta sign.
+            // The scale yields the odd-integer multiplier `2·n + 1 ∈ [1, 15]`.
             let dl = d * f32::from(2 * ((qh >> 12) & 7) + 1);
             let delta = if qh & 0x8000 == 0 {
                 IQ1S_DELTA
@@ -1399,23 +1412,12 @@ where
                 -IQ1S_DELTA
             };
             for l in 0..4 {
-                // BITWISE: 11-bit grid index = qs[l] | (qh>>(3l) & 7) << 8
+                // BITWISE: 11-bit grid index = qs[l] | (qh>>(3·l) & 7) << 8
                 // CAST: l (usize ≤ 3) → u32 for the shift amount
                 let l_u32 = l as u32;
                 let hi = ((u32::from(qh) >> (3 * l_u32)) & 7) << 8;
                 let idx = u32::from(qs[4 * ib32 + l]) | hi;
-                let g_bytes = IQ1S_GRID[idx as usize].to_le_bytes();
-                // CAST: u8 → i8 reinterpret — IQ1S_GRID stores signed codebook
-                let grid: [i8; 8] = [
-                    g_bytes[0] as i8,
-                    g_bytes[1] as i8,
-                    g_bytes[2] as i8,
-                    g_bytes[3] as i8,
-                    g_bytes[4] as i8,
-                    g_bytes[5] as i8,
-                    g_bytes[6] as i8,
-                    g_bytes[7] as i8,
-                ];
+                let grid = iq1s_grid_as_i8(IQ1S_GRID[idx as usize]);
                 write_delta_grid(scratch, y_off, dl, grid, delta);
                 y_off += 8;
             }
@@ -1477,11 +1479,21 @@ where
 
         let sc = [sc0, sc1, sc2, sc3];
 
+        // Pick ±IQ1S_DELTA according to one bit in a `qh` byte.
+        let delta_for = |qh_byte: u8, mask: u8| -> f32 {
+            if qh_byte & mask == 0 {
+                IQ1S_DELTA
+            } else {
+                -IQ1S_DELTA
+            }
+        };
+
         let mut y_off: usize = 0;
         for ib32 in 0..8 {
-            // BITWISE: each scales-u16 word carries two 3-bit nibbles per
-            // `ib32`; ib32 even → low 6 bits, ib32 odd → bits [6..12].
-            // CAST: u16 → u32 for the shift amount; then masked to 3 bits.
+            // BITWISE: each `sc[ib32/2]` u16 carries two 3-bit sub-block
+            // scales per ib32 — ib32-even uses bits [0..6], ib32-odd uses
+            // bits [6..12]. The scale yields odd-integer multipliers `2·n + 1`.
+            // CAST: usize → u32 for the shift amount.
             let shift_a = 6 * ((ib32 % 2) as u32);
             let dl1 = d * f32::from(2 * ((sc[ib32 / 2] >> shift_a) & 7) + 1);
             let dl2 = d * f32::from(2 * ((sc[ib32 / 2] >> (shift_a + 3)) & 7) + 1);
@@ -1489,66 +1501,39 @@ where
             // Each ib32 consumes 4 qs bytes + 2 qh bytes.
             let qs_off = 4 * ib32;
             let qh_off = 2 * ib32;
-            let qh0 = u32::from(qh[qh_off]);
-            let qh1 = u32::from(qh[qh_off + 1]);
+            let qh_a = qh[qh_off];
+            let qh_b = qh[qh_off + 1];
+            let qh_a_u32 = u32::from(qh_a);
+            let qh_b_u32 = u32::from(qh_b);
 
             // BITWISE: 11-bit grid index = qs | ((qh shifted) & 0x700).
-            let idx0 = u32::from(qs[qs_off]) | ((qh0 << 8) & 0x0700);
-            let idx1 = u32::from(qs[qs_off + 1]) | ((qh0 << 4) & 0x0700);
-            let idx2 = u32::from(qs[qs_off + 2]) | ((qh1 << 8) & 0x0700);
-            let idx3 = u32::from(qs[qs_off + 3]) | ((qh1 << 4) & 0x0700);
-
-            // BITWISE: per-group delta sign — qh bit 3 (group 0,2) and bit 7
-            // (group 1,3) of the corresponding qh byte.
-            let delta0 = if qh[qh_off] & 0x08 == 0 {
-                IQ1S_DELTA
-            } else {
-                -IQ1S_DELTA
-            };
-            let delta1 = if qh[qh_off] & 0x80 == 0 {
-                IQ1S_DELTA
-            } else {
-                -IQ1S_DELTA
-            };
-            let delta2 = if qh[qh_off + 1] & 0x08 == 0 {
-                IQ1S_DELTA
-            } else {
-                -IQ1S_DELTA
-            };
-            let delta3 = if qh[qh_off + 1] & 0x80 == 0 {
-                IQ1S_DELTA
-            } else {
-                -IQ1S_DELTA
-            };
-
+            // Per-group delta sign: bit 3 of qh_a (group 0), bit 7 of qh_a
+            // (group 1), bit 3 of qh_b (group 2), bit 7 of qh_b (group 3).
             // Groups 0,1 use dl1; groups 2,3 use dl2.
-            for &(idx, dl, delta) in &[(idx0, dl1, delta0), (idx1, dl1, delta1)] {
-                let g_bytes = IQ1S_GRID[idx as usize].to_le_bytes();
-                let grid: [i8; 8] = [
-                    g_bytes[0] as i8,
-                    g_bytes[1] as i8,
-                    g_bytes[2] as i8,
-                    g_bytes[3] as i8,
-                    g_bytes[4] as i8,
-                    g_bytes[5] as i8,
-                    g_bytes[6] as i8,
-                    g_bytes[7] as i8,
-                ];
-                write_delta_grid(scratch, y_off, dl, grid, delta);
-                y_off += 8;
-            }
-            for &(idx, dl, delta) in &[(idx2, dl2, delta2), (idx3, dl2, delta3)] {
-                let g_bytes = IQ1S_GRID[idx as usize].to_le_bytes();
-                let grid: [i8; 8] = [
-                    g_bytes[0] as i8,
-                    g_bytes[1] as i8,
-                    g_bytes[2] as i8,
-                    g_bytes[3] as i8,
-                    g_bytes[4] as i8,
-                    g_bytes[5] as i8,
-                    g_bytes[6] as i8,
-                    g_bytes[7] as i8,
-                ];
+            let groups: [(u32, f32, f32); 4] = [
+                (
+                    u32::from(qs[qs_off]) | ((qh_a_u32 << 8) & 0x0700),
+                    dl1,
+                    delta_for(qh_a, 0x08),
+                ),
+                (
+                    u32::from(qs[qs_off + 1]) | ((qh_a_u32 << 4) & 0x0700),
+                    dl1,
+                    delta_for(qh_a, 0x80),
+                ),
+                (
+                    u32::from(qs[qs_off + 2]) | ((qh_b_u32 << 8) & 0x0700),
+                    dl2,
+                    delta_for(qh_b, 0x08),
+                ),
+                (
+                    u32::from(qs[qs_off + 3]) | ((qh_b_u32 << 4) & 0x0700),
+                    dl2,
+                    delta_for(qh_b, 0x80),
+                ),
+            ];
+            for &(idx, dl, delta) in &groups {
+                let grid = iq1s_grid_as_i8(IQ1S_GRID[idx as usize]);
                 write_delta_grid(scratch, y_off, dl, grid, delta);
                 y_off += 8;
             }
