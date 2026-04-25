@@ -16,7 +16,7 @@
 //! fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`,
 //! `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`).
 //! `TQ1_0` / `TQ2_0` are synthetic-fixture cross-validated because only ~15
-//! BitNet-derivative GGUFs ship them on HuggingFace (Python `gguf.quants.
+//! BitNet-derivative GGUFs ship them on `HuggingFace` (Python `gguf.quants.
 //! quantize()` implements the encode side, so a deterministic random tensor
 //! is the practical fixture source). `Q8_1` and `Q8_K` are not shipped by
 //! any real model — they are internal `llama.cpp` activation quant types,

@@ -76,12 +76,12 @@ const QK_K: usize = 256;
 
 /// Powers of 3 used for the base-3 packing trick in `TQ1_0`.
 ///
-/// After `byte * POW3_IQ_TQ[n]` (wrapping `u8` arithmetic), the n-th
+/// After `byte * POW3_TQ1_0[n]` (wrapping `u8` arithmetic), the n-th
 /// ternary digit of the byte's encoded value lives in the high bits and
 /// is recovered by `(_ * 3) >> 8`. The 6th entry (`243`) is unused by
-/// the decoders today but kept for parity with `ggml-quants.c`'s
-/// `pow3[6]` declaration.
-const POW3_IQ_TQ: [u8; 6] = [1, 3, 9, 27, 81, 243];
+/// the decoder but kept for parity with `ggml-quants.c`'s `pow3[6]`
+/// declaration.
+const POW3_TQ1_0: [u8; 6] = [1, 3, 9, 27, 81, 243];
 
 /// Non-linear 4-bit codebook shared by `IQ4_NL` and `IQ4_XS`.
 ///
@@ -1623,21 +1623,21 @@ where
         // qs main loop: one 32-byte chunk × 5 ternaries × 32 elements = 160 outputs.
         for n in 0..5 {
             for m in 0..32 {
-                scratch[y_off] = decode_pow3_ternary(qs[m], POW3_IQ_TQ[n], d);
+                scratch[y_off] = decode_pow3_ternary(qs[m], POW3_TQ1_0[n], d);
                 y_off += 1;
             }
         }
         // qs tail: one 16-byte chunk × 5 ternaries × 16 elements = 80 outputs.
         for n in 0..5 {
             for m in 0..16 {
-                scratch[y_off] = decode_pow3_ternary(qs[32 + m], POW3_IQ_TQ[n], d);
+                scratch[y_off] = decode_pow3_ternary(qs[32 + m], POW3_TQ1_0[n], d);
                 y_off += 1;
             }
         }
         // qh: 4 ternaries × 4 bytes = 16 outputs.
         for n in 0..4 {
             for j in 0..4 {
-                scratch[y_off] = decode_pow3_ternary(qh[j], POW3_IQ_TQ[n], d);
+                scratch[y_off] = decode_pow3_ternary(qh[j], POW3_TQ1_0[n], d);
                 y_off += 1;
             }
         }
