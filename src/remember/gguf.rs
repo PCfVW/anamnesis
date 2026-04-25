@@ -1349,9 +1349,10 @@ where
     })
 }
 
-/// `IQ1_S` kernel — 66-byte super-blocks: `d: f16` + `qs[32]: u8` (low 8
-/// bits of an 11-bit grid index) + `qh[16]: u16` (high 3 bits of the
-/// index per group + a 3-bit sub-block scale + a 1-bit delta-sign flag).
+/// `IQ1_S` kernel — 50-byte super-blocks: `d: f16` + `qs[32]: u8` (low 8
+/// bits of an 11-bit grid index) + `qh[8]: u16` (one u16 word per `ib32`,
+/// holding 4 × 3-bit high-index nibbles for the four groups + a 3-bit
+/// sub-block scale + a 1-bit delta-sign flag in the top byte).
 ///
 /// ~1.56 bpw quant. The smallest member of the `IQ*` family with a top-
 /// level `d` field. Each `ib32 ∈ 0..8` reads one `qh` u16 word that
@@ -1378,11 +1379,12 @@ fn dequant_iq1_s<F>(data: &[u8], sink: F) -> crate::Result<()>
 where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 66, sink, |in_block, scratch| {
-        // Field offsets: d [0..2], qs [2..34], qh [34..66] (u16[16] LE).
+    run_super_kernel(data, 50, sink, |in_block, scratch| {
+        // Field offsets: d [0..2], qs [2..34], qh [34..50] (u16[8] LE — one
+        // qh word per ib32, totalling 16 bytes).
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let qs = &in_block[2..34];
-        let qh_bytes = &in_block[34..66];
+        let qh_bytes = &in_block[34..50];
 
         let mut y_off: usize = 0;
         for ib32 in 0..8 {
@@ -2561,7 +2563,7 @@ mod tests {
 
     #[test]
     fn iq1_s_all_zero_block() {
-        let block = vec![0u8; 66];
+        let block = vec![0u8; 50];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ1_S, 256).unwrap();
         for chunk in out.chunks_exact(2) {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
@@ -2576,7 +2578,7 @@ mod tests {
         //   idx   = 0 → IQ1S_GRID[0] = 0xFFFFFFFFFFFFFFFF
         //         → all 8 grid bytes = 0xFF = -1 as i8
         // Output = 1.0 × (-1 + 0.125) = -0.875 everywhere.
-        let mut block = vec![0u8; 66];
+        let mut block = vec![0u8; 50];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ1_S, 256).unwrap();
         for chunk in out.chunks_exact(2) {
@@ -2592,7 +2594,7 @@ mod tests {
         //              and 0x8000 >> {3,6,9} all yield (... & 7) == 0)
         //              → grid byte = -1, output = 1.0 × (-1 + -0.125) = -1.125
         // ib32=1..=7: qh = 0 → delta = +0.125, output = -0.875
-        let mut block = vec![0u8; 66];
+        let mut block = vec![0u8; 50];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         // qh starts at byte 34. qh[0] u16 = 0x8000, low byte first (LE).
         block[34] = 0x00;

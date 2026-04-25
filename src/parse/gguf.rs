@@ -306,7 +306,7 @@ impl GgufType {
     /// variants (`IQ2_XXS` at 66 bytes, `IQ2_XS` at 74 bytes, `IQ2_S` at
     /// 82 bytes), the two 3-bit `IQ*` variants (`IQ3_XXS` at 98 bytes,
     /// `IQ3_S` at 110 bytes), and the two 1-bit `IQ*` variants (`IQ1_S`
-    /// at 66 bytes, `IQ1_M` at 56 bytes). Returns `None` for the remaining
+    /// at 50 bytes, `IQ1_M` at 56 bytes). Returns `None` for the remaining
     /// `TQ*` and `MXFP4` types — those block layouts will be tabulated
     /// when dequantisation support lands in later Phase 4.5 commits.
     // `Q4_0` and `IQ4_NL` happen to both be 18 bytes (same `ggml_half` +
@@ -364,11 +364,11 @@ impl GgufType {
             // 1-bit IQ super-quants (256-element super-blocks). Both share
             // the 2048-entry IQ1S_GRID (signed i8 codebook) and the
             // IQ1S_DELTA = 0.125 additive bias.
-            // IQ1_S: d (f16, 2 B) + qs (u8[32], 32 B) + qh (u16[16], 32 B) = 66 B.
+            // IQ1_S: d (f16, 2 B) + qs (u8[32], 32 B) + qh (u16[8], 16 B) = 50 B.
             // IQ1_M: qs (u8[32], 32 B) + qh (u8[16], 16 B) + scales (u8[8], 8 B)
             //        = 56 B (no top-level d — super-block scale is reconstructed
             //        from a scattered 16-bit pattern across `scales`).
-            Self::IQ1_S => Some(66),
+            Self::IQ1_S => Some(50),
             Self::IQ1_M => Some(56),
             // Remaining TQ*, MXFP4 — byte sizes are defined by ggml struct
             // layouts that this crate has not yet audited. Deferred to later
@@ -2458,8 +2458,8 @@ mod tests {
 
         // 1-bit IQ super-quants landed in Phase 4.5 step 4.
         assert_eq!(GgufType::IQ1_S.block_size(), 256);
-        assert_eq!(GgufType::IQ1_S.type_size(), Some(66));
-        assert_eq!(GgufType::IQ1_S.byte_size_for_n_elements(256).unwrap(), 66);
+        assert_eq!(GgufType::IQ1_S.type_size(), Some(50));
+        assert_eq!(GgufType::IQ1_S.byte_size_for_n_elements(256).unwrap(), 50);
         assert_eq!(GgufType::IQ1_M.block_size(), 256);
         assert_eq!(GgufType::IQ1_M.type_size(), Some(56));
         assert_eq!(GgufType::IQ1_M.byte_size_for_n_elements(256).unwrap(), 56);
