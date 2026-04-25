@@ -305,10 +305,11 @@ impl GgufType {
     /// at 18 bytes, `IQ4_XS` at 136 bytes), the three 2-bit `IQ*`
     /// variants (`IQ2_XXS` at 66 bytes, `IQ2_XS` at 74 bytes, `IQ2_S` at
     /// 82 bytes), the two 3-bit `IQ*` variants (`IQ3_XXS` at 98 bytes,
-    /// `IQ3_S` at 110 bytes), and the two 1-bit `IQ*` variants (`IQ1_S`
-    /// at 50 bytes, `IQ1_M` at 56 bytes). Returns `None` for the remaining
-    /// `TQ*` and `MXFP4` types — those block layouts will be tabulated
-    /// when dequantisation support lands in later Phase 4.5 commits.
+    /// `IQ3_S` at 110 bytes), the two 1-bit `IQ*` variants (`IQ1_S` at 50
+    /// bytes, `IQ1_M` at 56 bytes), and the two ternary `TQ*` variants
+    /// (`TQ1_0` at 54 bytes, `TQ2_0` at 66 bytes). Returns `None` for the
+    /// remaining `MXFP4` type — that block layout will be tabulated when
+    /// dequantisation support lands in the final Phase 4.5 commit.
     // `Q4_0` and `IQ4_NL` happen to both be 18 bytes (same `ggml_half` +
     // 16 nibble-packed bytes), and other pairs share byte counts too; keeping
     // the arms separate documents the distinct block-format semantics instead
@@ -370,10 +371,19 @@ impl GgufType {
             //        from a scattered 16-bit pattern across `scales`).
             Self::IQ1_S => Some(50),
             Self::IQ1_M => Some(56),
-            // Remaining TQ*, MXFP4 — byte sizes are defined by ggml struct
-            // layouts that this crate has not yet audited. Deferred to later
-            // Phase 4.5 commits.
-            Self::TQ1_0 | Self::TQ2_0 | Self::MXFP4 => None,
+            // Ternary super-quants (256-element super-blocks). Both decode
+            // values in {-d, 0, +d}.
+            // TQ1_0: qs (u8[48], 48 B base-3 packed, 5 ternaries/byte)
+            //      + qh (u8[4], 4 B base-3 packed, 4 ternaries/byte)
+            //      + d (f16, 2 B) = 54 B.
+            // TQ2_0: qs (u8[64], 64 B, 4 ternaries/byte at 2 bits each)
+            //      + d (f16, 2 B) = 66 B.
+            Self::TQ1_0 => Some(54),
+            Self::TQ2_0 => Some(66),
+            // Remaining MXFP4 — byte size is defined by a ggml struct that
+            // this crate has not yet audited. Deferred to the final Phase
+            // 4.5 commit.
+            Self::MXFP4 => None,
         }
     }
 
@@ -1132,8 +1142,8 @@ impl ParsedGguf {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Unsupported`] if `info.byte_len` is `None`
-    /// (the dtype's block layout is not yet tabulated — the remaining
-    /// `TQ*` and `MXFP4` types), or if the dtype is a recognised but
+    /// (the dtype's block layout is not yet tabulated — only `MXFP4`
+    /// remains in this state), or if the dtype is a recognised but
     /// not-yet-implemented quantisation type.
     ///
     /// Returns [`AnamnesisError::Parse`] if the element count overflows
@@ -2463,17 +2473,23 @@ mod tests {
         assert_eq!(GgufType::IQ1_M.block_size(), 256);
         assert_eq!(GgufType::IQ1_M.type_size(), Some(56));
         assert_eq!(GgufType::IQ1_M.byte_size_for_n_elements(256).unwrap(), 56);
+
+        // Ternary TQ super-quants landed in Phase 4.5 step 5.
+        assert_eq!(GgufType::TQ1_0.block_size(), 256);
+        assert_eq!(GgufType::TQ1_0.type_size(), Some(54));
+        assert_eq!(GgufType::TQ1_0.byte_size_for_n_elements(256).unwrap(), 54);
+        assert_eq!(GgufType::TQ2_0.block_size(), 256);
+        assert_eq!(GgufType::TQ2_0.type_size(), Some(66));
+        assert_eq!(GgufType::TQ2_0.byte_size_for_n_elements(256).unwrap(), 66);
     }
 
     #[test]
     fn iq_types_have_unknown_type_size() {
-        // IQ4_NL/XS (step 1), IQ2_XXS/XS/S (step 2), IQ3_XXS/S (step 3), and
-        // IQ1_S/IQ1_M (step 4) are supported; only the TQ* / MXFP4 kernels
-        // remain deferred for the final Phase 4.5 commits.
-        assert_eq!(GgufType::TQ1_0.type_size(), None);
-        assert_eq!(GgufType::TQ2_0.type_size(), None);
+        // IQ4_NL/XS (step 1), IQ2_XXS/XS/S (step 2), IQ3_XXS/S (step 3),
+        // IQ1_S/IQ1_M (step 4), and TQ1_0/TQ2_0 (step 5) are supported;
+        // only MXFP4 remains deferred for the final Phase 4.5 commit.
         assert_eq!(GgufType::MXFP4.type_size(), None);
-        let err = GgufType::TQ1_0.byte_size_for_n_elements(256).unwrap_err();
+        let err = GgufType::MXFP4.byte_size_for_n_elements(256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 

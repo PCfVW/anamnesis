@@ -13,11 +13,10 @@
 //!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
 //!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
-//!   `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`.
+//!   `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`.
 //!
-//! The remaining `TQ*` and `MXFP4` types are recognised by the parser
-//! but **not yet dequantised**; the dispatcher returns
-//! [`AnamnesisError::Unsupported`] for those types.
+//! Only `MXFP4` remains recognised but **not yet dequantised**; the
+//! dispatcher returns [`AnamnesisError::Unsupported`] for it.
 //!
 //! # Two public entry points
 //!
@@ -74,6 +73,15 @@ const QK_SMALL: usize = 32;
 
 /// Element count per K-quant super-block (`Q2_K`..`Q8_K`, `IQ4_XS`).
 const QK_K: usize = 256;
+
+/// Powers of 3 used for the base-3 packing trick in `TQ1_0`.
+///
+/// After `byte * POW3_IQ_TQ[n]` (wrapping `u8` arithmetic), the n-th
+/// ternary digit of the byte's encoded value lives in the high bits and
+/// is recovered by `(_ * 3) >> 8`. The 6th entry (`243`) is unused by
+/// the decoders today but kept for parity with `ggml-quants.c`'s
+/// `pow3[6]` declaration.
+const POW3_IQ_TQ: [u8; 6] = [1, 3, 9, 27, 81, 243];
 
 /// Non-linear 4-bit codebook shared by `IQ4_NL` and `IQ4_XS`.
 ///
@@ -188,8 +196,8 @@ fn write_scratch_to_bf16(scratch: &[f32], out_block: &mut [u8]) {
 /// - `data.len()` does not equal `n_blocks × dtype.type_size()`.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if `dtype.type_size()` is
-/// `None` (the remaining `TQ*` and `MXFP4` types — deferred to the final
-/// Phase 4.5 commits).
+/// `None` — only `MXFP4` remains in this state, deferred to the final
+/// Phase 4.5 commit.
 fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> crate::Result<usize> {
     let block_size = dtype.block_size();
     if !n_elements.is_multiple_of(block_size) {
@@ -298,10 +306,9 @@ fn dispatch_streaming<F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result
 where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    // EXHAUSTIVE: internal dispatch over GgufType. The remaining TQ* and
-    // MXFP4 types have no implemented kernel yet; scalar (non-block)
-    // types are structurally dequantised (reinterpret bytes), not in scope
-    // here.
+    // EXHAUSTIVE: internal dispatch over GgufType. Only MXFP4 has no
+    // implemented kernel yet; scalar (non-block) types are structurally
+    // dequantised (reinterpret bytes), not in scope here.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
         GgufType::Q4_0 => dequant_q4_0(data, sink),
@@ -325,6 +332,8 @@ where
         GgufType::IQ3_S => dequant_iq3_s(data, sink),
         GgufType::IQ1_S => dequant_iq1_s(data, sink),
         GgufType::IQ1_M => dequant_iq1_m(data, sink),
+        GgufType::TQ1_0 => dequant_tq1_0(data, sink),
+        GgufType::TQ2_0 => dequant_tq2_0(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!("dequantisation not yet supported for {dtype}"),
@@ -351,9 +360,9 @@ where
 /// (32-bit targets only), or if `data.len()` does not equal the expected
 /// byte count (`n_blocks × type_size`).
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `dtype` is one of the
-/// recognised-but-not-yet-implemented types (`TQ1_0`, `TQ2_0`, `MXFP4`)
-/// or a scalar type that is not a quantised block format.
+/// Returns [`AnamnesisError::Unsupported`] if `dtype` is the
+/// recognised-but-not-yet-implemented `MXFP4` type, or a scalar type
+/// that is not a quantised block format.
 ///
 /// # Memory
 ///
@@ -386,8 +395,9 @@ pub fn dequantize_gguf_to_bf16(
 /// The `sink` closure receives `64` bytes per call for 32-element block
 /// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`) and `512` bytes per call for
 /// 256-element super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`, `IQ2_XXS`,
-/// `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`). Sink errors
-/// abort the stream and are propagated unchanged as the return value.
+/// `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
+/// `TQ2_0`). Sink errors abort the stream and are propagated unchanged
+/// as the return value.
 ///
 /// This is the canonical form. [`dequantize_gguf_to_bf16`] is a thin
 /// wrapper that sinks into a `Vec::with_capacity`.
@@ -1052,6 +1062,40 @@ fn write_delta_grid(scratch: &mut [f32], y_off: usize, dl: f32, grid: [i8; 8], d
     }
 }
 
+/// Decodes one ternary digit out of a `TQ1_0` packed byte.
+///
+/// `TQ1_0` stores up to 5 ternary digits per `qs` byte (4 per `qh` byte)
+/// using the base-3 packing identity `byte = d0 + 3·d1 + 9·d2 + 27·d3 +
+/// 81·d4` where each `d_n ∈ {0, 1, 2}` and the byte is constrained to
+/// `<= 242 = 3^5 - 1`. To extract the n-th digit, multiply by `3^n` in
+/// wrapping `u8` arithmetic — this places the n-th digit in the byte's
+/// top bits — then map the resulting bin via `(q * 3) >> 8`:
+/// - `q ∈ [0, 86)`     → digit 0
+/// - `q ∈ [86, 171)`   → digit 1
+/// - `q ∈ [171, 256)`  → digit 2
+///
+/// The decoded ternary digit is then biased by `-1` (yielding `{-1, 0,
+/// +1}`) and scaled by `d`. Used by [`dequant_tq1_0`] in three call
+/// sites (qs main loop, qs tail loop, qh loop).
+#[inline]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn decode_pow3_ternary(packed: u8, pow3_n: u8, d: f32) -> f32 {
+    // BITWISE: extract the topmost ternary digit via the base-3 unpacking
+    // trick. After `packed * pow3[n]` (wrapping u8), the n-th digit is in
+    // the high bits; `(_ * 3) >> 8` then maps it back to {0, 1, 2}.
+    let q = packed.wrapping_mul(pow3_n);
+    // CAST: u8 → u16 lossless for the ×3 multiplication; the >> 8 then
+    // truncates the u16 result to fit in u8's value range, so the i16
+    // intermediate lossless-narrows to i8 below.
+    let xi = ((u16::from(q) * 3) >> 8) as i16;
+    // CAST: i16 → f32 lossless; (xi - 1) ∈ {-1, 0, +1}.
+    f32::from(xi - 1) * d
+}
+
 /// `IQ2_XXS` kernel — 66-byte super-blocks: `d: f16` + `qs[32]: u16`.
 ///
 /// ~2.06 bpw quant. Each `ib32 ∈ 0..8` reads 8 bytes from `qs` as two
@@ -1541,6 +1585,101 @@ where
     })
 }
 
+/// `TQ1_0` kernel — 54-byte super-blocks: `qs[48]: u8` (base-3-packed
+/// ternaries, 5 per byte) + `qh[4]: u8` (base-3-packed, 4 per byte) +
+/// `d: f16`.
+///
+/// ~1.6875 bpw quant, ternary (values in `{-d, 0, +d}`). Invented for
+/// BitNet-style 1.58-bit models. Each `qs` byte encodes 5 ternary
+/// digits via `byte = d0 + 3·d1 + 9·d2 + 27·d3 + 81·d4` (constraint
+/// `byte ≤ 242 = 3^5 - 1`); each `qh` byte encodes 4 ternaries
+/// (`byte = d0 + 3·d1 + 9·d2 + 27·d3`, constraint `byte ≤ 80 = 3^4 - 1`).
+///
+/// The C reference uses an unusual chunked iteration order — qs is
+/// processed in 32-byte chunks then 16-byte chunks, with each chunk
+/// emitting all 5 ternary digits for each of its bytes before moving
+/// on. The output element ordering depends on this chunking, so the
+/// Rust port must replicate it for bit-exactness:
+/// - qs main loop: `chunk_off = 0`, n ∈ 0..5, m ∈ 0..32 → 160 outputs
+/// - qs tail loop: `chunk_off = 32`, n ∈ 0..5, m ∈ 0..16 → 80 outputs
+/// - qh loop:      n ∈ 0..4, j ∈ 0..4                   → 16 outputs
+///
+/// Total: 256 outputs per super-block. Each digit decode goes through
+/// the shared [`decode_pow3_ternary`] helper.
+///
+/// Ported verbatim from `ggml-quants.c::dequantize_row_tq1_0`.
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
+fn dequant_tq1_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_super_kernel(data, 54, sink, |in_block, scratch| {
+        // Field offsets: qs [0..48], qh [48..52], d [52..54].
+        let qs = &in_block[0..48];
+        let qh = &in_block[48..52];
+        let d = read_f16_bytes([in_block[52], in_block[53]]);
+
+        let mut y_off: usize = 0;
+        // qs main loop: one 32-byte chunk × 5 ternaries × 32 elements = 160 outputs.
+        for n in 0..5 {
+            for m in 0..32 {
+                scratch[y_off] = decode_pow3_ternary(qs[m], POW3_IQ_TQ[n], d);
+                y_off += 1;
+            }
+        }
+        // qs tail: one 16-byte chunk × 5 ternaries × 16 elements = 80 outputs.
+        for n in 0..5 {
+            for m in 0..16 {
+                scratch[y_off] = decode_pow3_ternary(qs[32 + m], POW3_IQ_TQ[n], d);
+                y_off += 1;
+            }
+        }
+        // qh: 4 ternaries × 4 bytes = 16 outputs.
+        for n in 0..4 {
+            for j in 0..4 {
+                scratch[y_off] = decode_pow3_ternary(qh[j], POW3_IQ_TQ[n], d);
+                y_off += 1;
+            }
+        }
+    })
+}
+
+/// `TQ2_0` kernel — 66-byte super-blocks: `qs[64]: u8` (4 ternaries per
+/// byte, 2 bits each) + `d: f16`.
+///
+/// ~2.0625 bpw quant, ternary (values in `{-d, 0, +d}`). Simpler
+/// packing than `TQ1_0`: each `qs` byte holds 4 × 2-bit values, where
+/// each 2-bit value `q ∈ {0, 1, 2}` decodes as `(q - 1) × d`. Output
+/// element ordering follows the C reference's nested loop: 32-byte
+/// chunks of qs × 4 bit-positions × 32 elements per chunk-position.
+///
+/// Ported verbatim from `ggml-quants.c::dequantize_row_tq2_0`.
+#[allow(clippy::indexing_slicing)]
+fn dequant_tq2_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_super_kernel(data, 66, sink, |in_block, scratch| {
+        // Field offsets: qs [0..64], d [64..66].
+        let qs = &in_block[0..64];
+        let d = read_f16_bytes([in_block[64], in_block[65]]);
+
+        let mut y_off: usize = 0;
+        // Two 32-byte chunks of qs.
+        for chunk_off in [0_usize, 32] {
+            for l in 0..4_u32 {
+                for m in 0..32 {
+                    // BITWISE: extract the 2-bit ternary at position l*2 in qs[m].
+                    // CAST: u8 → f32 via From; (q - 1) ∈ {-1, 0, +1}.
+                    let q = (qs[chunk_off + m] >> (l * 2)) & 3;
+                    scratch[y_off] = (f32::from(q) - 1.0) * d;
+                    y_off += 1;
+                }
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // K-quant scale extractors
 // ---------------------------------------------------------------------------
@@ -1669,11 +1808,11 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_dtype() {
-        // TQ1_0 is still recognised by GgufType with type_size() == None.
+        // MXFP4 is the only remaining recognised type with type_size() == None.
         // IQ4_NL/IQ4_XS landed in Phase 4.5 step 1; IQ2_XXS/IQ2_XS/IQ2_S in
-        // step 2; IQ3_XXS/IQ3_S in step 3; IQ1_S/IQ1_M in step 4. Only the
-        // TQ* / MXFP4 family stays deferred until later Phase 4.5 commits.
-        let err = dequantize_gguf_to_bf16(&[], GgufType::TQ1_0, 256).unwrap_err();
+        // step 2; IQ3_XXS/IQ3_S in step 3; IQ1_S/IQ1_M in step 4; TQ1_0/TQ2_0
+        // in step 5. Only MXFP4 stays deferred until the final Phase 4.5 step.
+        let err = dequantize_gguf_to_bf16(&[], GgufType::MXFP4, 256).unwrap_err();
         assert!(matches!(err, AnamnesisError::Unsupported { .. }));
     }
 
@@ -2679,6 +2818,86 @@ mod tests {
                 bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
                 -0.875,
                 "IQ1_M ib32>=1[{j}]"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // TQ1_0
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tq1_0_all_zero_block() {
+        // d = 0.0 → all outputs 0.0 regardless of qs/qh contents.
+        let block = vec![0u8; 54];
+        let out = dequantize_gguf_to_bf16(&block, GgufType::TQ1_0, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn tq1_0_zero_qs_qh_with_d_one() {
+        // d = 1.0, all qs/qh = 0 → for every (n, m, j) the decode produces
+        // q = 0 → xi = 0 → output = (0 - 1) × 1 = -1.0 at all 256 positions.
+        // Sanity-checks that the chunked iteration covers every output slot.
+        let mut block = vec![0u8; 54];
+        block[52..54].copy_from_slice(&f16_bytes(1.0));
+        let out = dequantize_gguf_to_bf16(&block, GgufType::TQ1_0, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), -1.0);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // TQ2_0
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tq2_0_all_zero_block() {
+        let block = vec![0u8; 66];
+        let out = dequantize_gguf_to_bf16(&block, GgufType::TQ2_0, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn tq2_0_zero_qs_with_d_one() {
+        // d = 1.0, qs = 0 → q = 0 at every 2-bit position → output = -1.0.
+        let mut block = vec![0u8; 66];
+        block[64..66].copy_from_slice(&f16_bytes(1.0));
+        let out = dequantize_gguf_to_bf16(&block, GgufType::TQ2_0, 256).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), -1.0);
+        }
+    }
+
+    #[test]
+    fn tq2_0_first_byte_all_twos() {
+        // d = 1.0, qs[0] = 0xAA = 0b10_10_10_10 → all four 2-bit ternaries = 2
+        // → outputs (2 - 1) × 1 = +1.0 at the four positions where qs[0]'s
+        // bit-position is read.
+        //
+        // Iteration order: chunk_off=0, l ∈ 0..4, m ∈ 0..32. Element
+        // y_off = chunk × 128 + l × 32 + m. So qs[0]'s 4 ternary slots land
+        // at y_off ∈ {0, 32, 64, 96} — outputs 1.0 there, -1.0 elsewhere
+        // in the first chunk's 128 elements; second chunk (qs[32..64] = 0)
+        // gives -1.0 throughout its 128 outputs.
+        let mut block = vec![0u8; 66];
+        block[0] = 0xAA;
+        block[64..66].copy_from_slice(&f16_bytes(1.0));
+        let out = dequantize_gguf_to_bf16(&block, GgufType::TQ2_0, 256).unwrap();
+        for j in 0..256 {
+            let expected = if matches!(j, 0 | 32 | 64 | 96) {
+                1.0
+            } else {
+                -1.0
+            };
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                expected,
+                "TQ2_0 output[{j}]"
             );
         }
     }
