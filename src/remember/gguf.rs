@@ -125,8 +125,13 @@ fn read_f32_bytes(bytes: [u8; 4]) -> f32 {
 /// Decodes a 1-byte E8M0 exponent into the `MXFP4` per-block scale (the
 /// `_HALF` variant from `ggml-impl.h`).
 ///
-/// Returns `2^(e - 128)` for `e >= 2`, falling back to `2^-129` and
-/// `2^-128` for `e ∈ {0, 1}` via a left shift on the f32 mantissa bits.
+/// Returns `2^(e - 128)` uniformly for every `e ∈ 0..=255`. The `e < 2`
+/// branch exists only because IEEE 754 binary32 cannot encode `2^-128`
+/// or `2^-127` as normal numbers — the function emits the corresponding
+/// subnormal bit patterns directly (`0x0020_0000 = 2^-128` for `e=0`,
+/// `0x0040_0000 = 2^-127` for `e=1`). For `e >= 2` the value is normal
+/// and reachable as a plain `(e - 1) << 23` mantissa-region write.
+///
 /// **No NaN guard for `e == 0xFF`** — `llama.cpp`'s `_half` helper
 /// returns `2^127` there rather than NaN, deviating from the raw OCP MX
 /// spec. We match `llama.cpp` bit-for-bit so cross-validation against
@@ -138,16 +143,19 @@ fn read_f32_bytes(bytes: [u8; 4]) -> f32 {
 #[inline]
 fn e8m0_to_fp32_half(e: u8) -> f32 {
     // BITWISE: assemble the f32 directly from the E8M0 byte (no float
-    // arithmetic). For e >= 2, the byte minus one is the IEEE 754 biased
-    // exponent; mantissa is zero. For e ∈ {0, 1}, shift the smallest
-    // normal mantissa pattern (0x0020_0000 = 2^-129 sign-bit-zero) left
-    // by `e` to land on 2^-129 / 2^-128.
+    // arithmetic). The two branches are not different formulas — both
+    // realise `2^(e - 128)` — they differ only in whether the result is
+    // representable as a normal f32 (`e >= 2`) or has to be emitted as
+    // a subnormal bit pattern (`e ∈ {0, 1}`).
     let bits: u32 = if e < 2 {
-        // CAST: u8 → u32 lossless for the shift amount; e < 2 so 0x0020_0000 << e
-        // never overflows the 23-bit mantissa region.
+        // CAST: u8 → u32 lossless for the shift amount. `0x0020_0000 << 0`
+        // is the f32 bit pattern for 2^-128 (subnormal, mantissa = 2^21);
+        // shifting left by 1 yields `0x0040_0000` = 2^-127.
         0x0020_0000_u32 << u32::from(e)
     } else {
-        // CAST: u8 → u32 lossless for the (e - 1) << 23 mantissa-region shift.
+        // CAST: u8 → u32 lossless. `(e - 1) << 23` writes the IEEE 754
+        // biased exponent so the resulting f32 equals `2^(e - 128)`
+        // (e.g., e=2 → biased exp = 1 → 2^(1 - 127) = 2^-126).
         (u32::from(e) - 1) << 23
     };
     f32::from_bits(bits)
@@ -2999,10 +3007,11 @@ mod tests {
 
     #[test]
     fn mxfp4_e_one_yields_subnormal_scale() {
-        // e = 1 → d = 0x0040_0000 as f32 = 2^-128. qs[0] = 0x71:
+        // e = 1 → d = 0x0040_0000 as f32 = 2^-127 (subnormal mantissa
+        // 2^22 × 2^-126). qs[0] = 0x71:
         //   low nibble 1 → K_VALUES_MXFP4[1] = 1
         //   high nibble 7 → K_VALUES_MXFP4[7] = 12
-        // Output position 0 = 1 × 2^-128, position 16 = 12 × 2^-128. The
+        // Output position 0 = 1 × 2^-127, position 16 = 12 × 2^-127. The
         // expected BF16 is computed end-to-end via `f32_bits_to_bf16_bits`
         // so this test exercises the rounding rule alongside the kernel
         // (rather than baking a fragile constant into the assertion).
