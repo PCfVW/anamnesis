@@ -57,7 +57,7 @@ enum Format {
     Gguf,
 }
 
-/// Builds an [`AnamnesisError::Unsupported`] explaining that the input
+/// Builds an `AnamnesisError::Unsupported` explaining that the input
 /// matched a format whose Cargo feature is disabled in the current build.
 ///
 /// `format_name` is the user-facing format name (e.g., `"PyTorch"`,
@@ -93,7 +93,7 @@ fn missing_feature_err(
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Unsupported`] when the input matches a
+/// Returns `AnamnesisError::Unsupported` when the input matches a
 /// format whose Cargo feature (`pth`, `npz`, or `gguf`) is not enabled
 /// in this build. This replaces the previous silent fall-through to
 /// `Safetensors`, which produced cryptic downstream errors when users
