@@ -424,7 +424,15 @@ where
 /// output. Uses `Vec::with_capacity` + `extend_from_slice` to avoid the
 /// `vec![0u8; n]` zero-init memset that would otherwise touch every byte
 /// of the output before the dequant loop overwrites them. Peak heap is
-/// the output buffer itself — O(n).
+/// the output buffer itself — O(n) per call.
+///
+/// Callers that dequantise many tensors should drop each result before
+/// allocating the next, or use [`dequantize_gguf_blocks_to_bf16`] to
+/// stream block bytes directly into a writer. The crate's high-level
+/// orchestrators (`ParsedModel::remember`, the `amn remember model.gguf`
+/// CLI path) currently retain every tensor's `Vec<u8>` in heap memory
+/// until `safetensors::serialize_to_file` returns — see the streaming
+/// output milestone (ROADMAP Phase 10) for the planned fix.
 pub fn dequantize_gguf_to_bf16(
     data: &[u8],
     dtype: GgufType,

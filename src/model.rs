@@ -246,11 +246,20 @@ impl ParsedModel {
     ///
     /// # Memory
     ///
-    /// Peak memory is roughly `input_file_size + dequantized_output_size`
-    /// (~3× the `FP8` file size when dequantizing to `BF16`). The input
-    /// buffer is held for the duration of the call (passthrough tensors
-    /// borrow from it). Dequantized tensors are allocated individually
-    /// and freed after serialization.
+    /// Peak heap is roughly `input_file_size + total_dequantized_output_size`
+    /// (~3× the `FP8` file size when dequantizing to `BF16`; up to ~4–8×
+    /// a packed `Q4_*` `GGUF` file size when dequantising to `BF16`). The
+    /// input buffer is held for the duration of the call (passthrough
+    /// tensors borrow from it). **Every dequantised tensor's `Vec<u8>`
+    /// is retained simultaneously** until the underlying
+    /// `safetensors::serialize_to_file` call returns — peak heap is the
+    /// sum of all dequantised tensor sizes, not one tensor at a time. The
+    /// safetensors crate's writer itself streams tensor bodies one at a
+    /// time, but the eager buffering happens in this method's caller-side
+    /// `Vec` collection. Comfortable for `≤ 7 B` models on a 32 GB
+    /// system; tight at 13 B; OOMs at 70 B+. A streaming output path
+    /// (planned ROADMAP Phase 10) will drop this to
+    /// `O(largest_tensor_BF16)`.
     pub fn remember(
         &self,
         output_path: impl AsRef<Path>,

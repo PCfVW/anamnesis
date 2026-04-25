@@ -447,17 +447,41 @@ Per [`CONVENTIONS.md`](CONVENTIONS.md)'s accepted-unsafe table, all of the follo
 - [ ] **`f32x4_to_bf16x4` NEON intrinsic** — ARM64 equivalent for Apple Silicon and AWS Graviton. Same bit-exactness requirement as the AVX2 path — **commit**
 - [ ] **Runtime dispatch in `write_scratch_to_bf16`** — move the shared helper out of `src/remember/gguf.rs` into `src/remember/simd.rs` (or a new `remember::bf16_writer` shim). Retrofit FP8, GPTQ, AWQ, BnB, and GGUF pass-2 loops to call the shared dispatcher. Delete the per-kernel scalar copies — single source of truth — **commit**
 - [ ] **Criterion bench harness** — benchmarks comparing scalar vs SIMD vs PyTorch CPU on the existing FP8/GPTQ/AWQ/BnB/GGUF cross-validation fixtures. Target: ≥ 4× speedup on `BF16`-writing pass 2 for tensors ≥ 1 MB. Publish the numbers in the crate README — **commit**
+- [ ] **`copy_to_contiguous` flat-index pass-2 conversion** — replace the cross-iteration `coords[]` carry chain in [`src/parse/pth.rs::copy_to_contiguous`](src/parse/pth.rs) with the stateless `c_i = (flat_idx / stride_i) % shape_i` formula plus specialised fast paths for `ndim ∈ {1, 2, 3}`. Verify with `cargo-show-asm` that the loop emits SIMD strided gathers on AVX2/NEON. Path is rare (<0.1% of `state_dict` files) so this is a polish item, not a hot-path priority. Bit-exact unit tests already cover the function — **commit**
+- [ ] **AWQ/GPTQ pass-2 zip-chain audit** — verify whether the four-way `chunks_exact_mut(2).zip(unpacked).zip(zeros).zip(scales)` pattern in [`src/remember/awq.rs`](src/remember/awq.rs) and [`src/remember/gptq.rs`](src/remember/gptq.rs) actually pessimises auto-vectorisation under stable LLVM. If `cargo-show-asm` shows scalar fallback, refactor to an indexed `for i in 0..len { … }` loop over pre-validated equal-length slices (per [`CONVENTIONS.md`](CONVENTIONS.md) "Reconciling bounds checking with vectorization"). Bit-exactness against PyTorch must hold at 0 ULP after refactor — **commit**
 - [ ] **Cross-format correctness sweep** — re-run every Phase 1–4.5 cross-validation test with `--features simd` and assert bit-identical output against the scalar path. No format may regress — **commit** — **PUSH + tag `v0.9.0`**
 
 **Deliverable:** `anamnesis` v0.9.0 — `BF16`-writing pass 2 runs 4–8× faster on AVX2 and NEON CPUs, scalar fallback preserved for `forbid(unsafe_code)` users, with cross-kernel consistency (FP8 / GPTQ / AWQ / BnB / GGUF all benefit from the same single-source-of-truth SIMD helper). — **PUSH + tag `v0.9.0`**
 
 **New dependencies:** None at runtime — uses `std::arch` intrinsics directly. Optional dev-dependency on `criterion` for the bench harness.
 
+### Phase 10: Streaming Output
+
+**Goal:** Drop peak heap from `O(total_dequantised_size)` to `O(largest_tensor_BF16)` for whole-model dequantisation paths (`ParsedModel::remember` and the `amn remember model.gguf -o out.safetensors` CLI). Unblocks 70 B+ model conversion on commodity hardware (≤ 32 GB) where the current eager-buffering approach OOMs.
+
+**Background:** The dequantisation kernels already provide streaming entry points — [`dequantize_gguf_blocks_to_bf16`](src/remember/gguf.rs) is `O(one block)` per call, and the `FP8`/`GPTQ`/`AWQ`/`BnB` kernels emit one tensor at a time. The orchestrators do not stream: [`ParsedModel::remember_bf16_inner`](src/model.rs) accumulates every dequantised tensor's `Vec<u8>` into a `dequantized_data: Vec<(name, bytes, shape)>` and then hands all `TensorView`s to `safetensors::serialize_to_file` simultaneously. The same pattern lives in [`src/bin/main.rs::run_remember_gguf`](src/bin/main.rs). The `safetensors` 0.4 crate's writer **already streams tensor bodies** (one `BufWriter::write_all` per tensor inside `serialize_to_file`) — the eager buffering is ours, not the crate's.
+
+**Approach:** Implement a custom `View` impl whose `data()` lazily dequantises a single tensor on demand, paired with an iterator that yields `(name, LazyView)` derived from the parsed model. The crate's `prepare()` step only needs `data_len()` / `dtype()` / `shape()` for the header — all deterministic and cheap. Hand the iterator to `safetensors::serialize_to_file`; the writer pulls bytes per tensor and drops them after each `write_all`. Peak heap drops to `O(largest_tensor_BF16)` — for a 70 B model's biggest layer (~500 MB BF16) this fits on commodity hardware. True per-block O(1) streaming is **out of scope** for Phase 10 — it would require a custom safetensors writer (the `View` trait returns a single `Cow<[u8]>`, not a stream) and the per-tensor variant is sufficient for every model size in current circulation.
+
+- [ ] **`LazyDequantView<'a>` type** in `src/remember/streaming.rs` — implements `safetensors::tensor::View`, captures a borrow into the parsed model + the per-tensor metadata needed to dispatch into the right kernel, and returns `Cow::Owned(dequantised_bytes)` from `data()` on demand — **commit**
+- [ ] **`ParsedModel::remember_streaming`** — yields lazy views to `safetensors::serialize_to_file`. Rewrite `remember()` to delegate to `remember_streaming()` so existing call sites pick up the win automatically — **commit**
+- [ ] **GGUF CLI streaming path** — refactor `run_remember_gguf` in `src/bin/main.rs` to drop the `tensor_data: Vec<(...)>` accumulator in favour of a lazy iterator. Same `LazyDequantView` infrastructure — **commit**
+- [ ] **Peak-heap regression tests via `dhat-rs`** — assert peak heap ≤ `2 × largest_tensor_BF16 + small_constant` on a representative 7 B fixture (FP8 + GGUF). Reuses Phase 6.5 dhat-rs infrastructure — **commit**
+- [ ] **Cross-format correctness sweep** — re-run every Phase 1–4.5 cross-validation test against the streaming output path; output bytes must be byte-identical to the eager path on the same input — **commit** — **PUSH + tag `v0.10.0`**
+
+**Deliverable:** `anamnesis` v0.10.0 — peak heap drops from `O(model_size)` to `O(largest_tensor)` for whole-model dequantisation. 70 B+ models become convertible on commodity hardware. All existing public APIs preserved (`remember()` becomes a thin wrapper). — **PUSH + tag `v0.10.0`**
+
+**New dependencies:** None at runtime. Reuses the Phase 6.5 `dhat-rs` dev-dependency for peak-heap assertions.
+
+**Out of scope:**
+
+- **True per-block O(1) streaming** — requires a custom safetensors writer (the `View::data()` method returns `Cow<[u8]>`, not a stream). Per-tensor lazy dequant covers every plausible model size; per-block remains a Future Directions item if real-world peak-heap measurements after Phase 10 ever show insufficient headroom.
+- **`WASM32` linear-memory adaptation** — WASM32's 4 GB memory cap is independent of `usize` typing; supporting it requires WASM64 or a fundamentally different I/O model. Listed under Future Directions.
+
 ### Future Directions
 
-The following are potential extensions beyond Phase 8, listed for context. They will be promoted to full phases when a concrete need arises.
+The following are potential extensions beyond Phase 10, listed for context. They will be promoted to full phases when a concrete need arises.
 
-- **Streaming / memory-mapped processing** — mmap-based safetensors/GGUF parsing for 70B+ models (100+ GB) that exceed available RAM
 - **Model surgery** — extract specific layers, merge LoRA adapters with base weights at the file level, split/shard for distributed loading
 - **Quantization quality analysis** — per-layer distortion reports, optimal mixed-precision selection, diff two quantized versions of the same model
 - **WASM target** — compile anamnesis to WASM for browser-based model inspection (drop a safetensors file, see tensor layout and quantization scheme instantly)
