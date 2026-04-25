@@ -2,7 +2,7 @@
 
 One-page reference for finding HuggingFace GGUF files that ship each of the `IQ*`, `TQ*`, and `MXFP4` block types, for use in anamnesis cross-validation fixtures. Distilled from a sourcing investigation on 2026-04-22 after Phase 4.5 steps 1–2 landed.
 
-Phase 4.5 step 7 (`cross-validation extension`) requires a 65 536-element fixture per block type, extracted from a real model tensor where possible and synthesised via the Python `gguf` package where not. This document tracks where each type comes from, which downloads we've already committed, and which we still owe.
+Phase 4.5 step 7 (`cross-validation extension`) requires a 65 536-element fixture per block type, extracted from a real model tensor where possible and synthesised via the Python `gguf` package where not. **As of step 6 (MXFP4) the last remaining coverage gap was closed** — anamnesis dequantises every GGUF block type shipping on HuggingFace today (22 of 22 production kernels). This document tracks where each type comes from and is now a historical reference rather than a live to-do list.
 
 ## Contents
 
@@ -32,9 +32,9 @@ All sizes from `ggml-common.h` at commit cut 2026-04-22. `QK_K = 256`.
 | `IQ1_M` | 29 | 256 | 56 | shipped (`Phase 4.5 step 4`) |
 | `TQ1_0` | 34 | 256 | 54 | shipped (`Phase 4.5 step 5`) |
 | `TQ2_0` | 35 | 256 | 66 | shipped (`Phase 4.5 step 5`) |
-| `MXFP4` | 39 | 32 | 17 | **step 6, pending** (confirmed via `gguf.GGML_QUANT_SIZES`) |
+| `MXFP4` | 39 | 32 | 17 | shipped (`Phase 4.5 step 6`) |
 
-The shipped types' byte sizes can be verified in [`src/parse/gguf.rs::type_size()`](../../src/parse/gguf.rs). Pending types return `None` from `type_size()` today.
+Every type's byte size is verifiable in [`src/parse/gguf.rs::type_size()`](../../src/parse/gguf.rs). After step 6 every variant returns `Some(_)` — there is no longer any deferred type.
 
 ---
 
@@ -60,14 +60,11 @@ Download sizes and tensor counts from remote-header probes performed 2026-04-22.
 | `IQ1_M` | `mistral_7b_iq1_m.bin` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` / `...-IQ1_M.gguf` (no shared file with IQ1_S) | **1.64 GB** (one-off) |
 | `TQ1_0` | `synthetic_tq1_0.bin` | **synthetic** via `gguf.quants.quantize()` (seed=42, scale=0.1) | already (no download) |
 | `TQ2_0` | `synthetic_tq2_0.bin` | **synthetic** via `gguf.quants.quantize()` (same seed) | already (no download) |
+| `MXFP4` | `synthetic_mxfp4.bin` | **synthetic** via `gguf.quants.quantize()` (same seed) | already (no download) |
 
 ### Pending kernels (Phase 4.5 step 6)
 
-| Kernel | Source strategy | HF source | New download |
-|---|---|---|---:|
-| `MXFP4` | **synthetic** via `gguf.quants.quantize()` | `np.random.randn(65536) × 0.1`, f32 → `MXFP4` → dequant reference | **0 GB** |
-
-**Total new download to finish Phase 4.5:** **0 GB** (only MXFP4 left, and it's synthesisable via the same Python `gguf.quants.quantize()` path as TQ1_0/TQ2_0).
+**All Phase 4.5 kernels shipped.** The pending-kernels table is intentionally empty after step 6 — every recognised `GgufType` block-quant variant has a dedicated kernel and a committed cross-validation fixture. Future GGUF format additions will reopen this section.
 
 ### Alternative real-model sources (for future cross-checking)
 
@@ -116,9 +113,9 @@ Confirmed 2026-04-22 on `gguf==0.17+`:
 | `IQ4_NL`, `IQ4_XS` | ✅ | ✅ | `ggml` hand-coded |
 | `IQ2_XXS`, `IQ2_XS`, `IQ2_S` | ❌ `NotImplementedError` | ✅ | **real-model source required** |
 | `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` | ❌ `NotImplementedError` | ✅ | **real-model source required** |
-| `TQ1_0`, `TQ2_0`, `MXFP4` | ✅ | ✅ | **synthetic fixtures viable** |
+| `TQ1_0`, `TQ2_0`, `MXFP4` | ✅ | ✅ | **all three backed by Phase 4.5 step 5 + 6 synthetic fixtures** |
 
-This asymmetry drives the "synthetic vs real-model" column in the sourcing matrix above.
+This asymmetry drove the "synthetic vs real-model" split in the sourcing matrix above. With step 6 landed every variant has a committed fixture.
 
 ---
 
