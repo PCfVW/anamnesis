@@ -298,18 +298,20 @@ impl GgufType {
     /// Number of bytes per storage block, or `None` for types whose block
     /// layout is not yet hard-coded in this crate.
     ///
-    /// Returns `Some` for the scalar types (`F32`, `F16`, `BF16`, `F64`,
-    /// `I8`–`I64`), the legacy block-wise quantised types (`Q4_0`, `Q4_1`,
-    /// `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`), the K-quant super-blocks
-    /// (`Q2_K`–`Q8_K`), the two non-linear 4-bit `IQ*` variants (`IQ4_NL`
-    /// at 18 bytes, `IQ4_XS` at 136 bytes), the three 2-bit `IQ*`
-    /// variants (`IQ2_XXS` at 66 bytes, `IQ2_XS` at 74 bytes, `IQ2_S` at
-    /// 82 bytes), the two 3-bit `IQ*` variants (`IQ3_XXS` at 98 bytes,
-    /// `IQ3_S` at 110 bytes), the two 1-bit `IQ*` variants (`IQ1_S` at 50
-    /// bytes, `IQ1_M` at 56 bytes), and the two ternary `TQ*` variants
-    /// (`TQ1_0` at 54 bytes, `TQ2_0` at 66 bytes). Returns `None` for the
-    /// remaining `MXFP4` type — that block layout will be tabulated when
-    /// dequantisation support lands in the final Phase 4.5 commit.
+    /// Returns `Some` for every recognised `GgufType`: scalar types
+    /// (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`), legacy block-wise
+    /// quantised types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`),
+    /// K-quant super-blocks (`Q2_K`–`Q8_K`), the non-linear 4-bit `IQ*`
+    /// variants (`IQ4_NL` at 18 bytes, `IQ4_XS` at 136 bytes), the
+    /// three 2-bit `IQ*` variants (`IQ2_XXS` at 66 bytes, `IQ2_XS` at
+    /// 74 bytes, `IQ2_S` at 82 bytes), the two 3-bit `IQ*` variants
+    /// (`IQ3_XXS` at 98 bytes, `IQ3_S` at 110 bytes), the two 1-bit
+    /// `IQ*` variants (`IQ1_S` at 50 bytes, `IQ1_M` at 56 bytes), the
+    /// two ternary `TQ*` variants (`TQ1_0` at 54 bytes, `TQ2_0` at 66
+    /// bytes), and the microscaling `MXFP4` variant (17 bytes). The
+    /// return type is kept as `Option<usize>` for API stability — every
+    /// arm currently returns `Some(_)`, so callers can `.unwrap_or(0)`
+    /// or unwrap defensively without ever exercising the `None` branch.
     // `Q4_0` and `IQ4_NL` happen to both be 18 bytes (same `ggml_half` +
     // 16 nibble-packed bytes), and other pairs share byte counts too; keeping
     // the arms separate documents the distinct block-format semantics instead
@@ -380,10 +382,10 @@ impl GgufType {
             //      + d (f16, 2 B) = 66 B.
             Self::TQ1_0 => Some(54),
             Self::TQ2_0 => Some(66),
-            // Remaining MXFP4 — byte size is defined by a ggml struct that
-            // this crate has not yet audited. Deferred to the final Phase
-            // 4.5 commit.
-            Self::MXFP4 => None,
+            // Microscaling FP4 (32-element block, OCP MX standard, added to
+            // ggml in 2024). e (E8M0 byte exponent, 1 B) + qs (4-bit packed,
+            // 16 B) = 17 B per block.
+            Self::MXFP4 => Some(17),
         }
     }
 
@@ -1046,13 +1048,13 @@ impl ParsedGguf {
     /// Returns an iterator of tensor views borrowing directly from the
     /// mmap and from `self`.
     ///
-    /// For every tensor whose dtype has a known byte size (scalars, legacy
-    /// `Q*_0`/`Q*_1`, K-quants), `data` is a zero-copy `Cow::Borrowed` slice
-    /// into the mapped file. `name` and `shape` are `&'a str` / `&'a [usize]`
+    /// For every tensor `data` is a zero-copy `Cow::Borrowed` slice into
+    /// the mapped file. `name` and `shape` are `&'a str` / `&'a [usize]`
     /// borrowed from the internal `Vec<GgufTensorInfo>` — **no per-tensor
-    /// heap allocation**. Tensors whose dtype is not yet tabulated
-    /// (`IQ*`, `TQ*`, `MXFP4`) are skipped silently; they are still listed
-    /// in [`tensor_info`](Self::tensor_info).
+    /// heap allocation**. Every recognised `GgufType` has a known byte
+    /// size, so this iterator yields every tensor in the file (no silent
+    /// skipping); for the inventory-only view that does not borrow data,
+    /// see [`tensor_info`](Self::tensor_info).
     ///
     /// Callers that want random access can materialise the iterator with
     /// `.collect::<Vec<_>>()`.
@@ -1141,10 +1143,10 @@ impl ParsedGguf {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Unsupported`] if `info.byte_len` is `None`
-    /// (the dtype's block layout is not yet tabulated — only `MXFP4`
-    /// remains in this state), or if the dtype is a recognised but
-    /// not-yet-implemented quantisation type.
+    /// Returns [`AnamnesisError::Unsupported`] if the dtype is a
+    /// recognised scalar (non-block-quant) type for which dequantisation
+    /// is structurally meaningless — every block-quantised `GgufType`
+    /// has a dedicated kernel after Phase 4.5 step 6.
     ///
     /// Returns [`AnamnesisError::Parse`] if the element count overflows
     /// `usize`, the mmap slice is out of bounds, or the underlying
@@ -1754,10 +1756,11 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
                     info.name, data_section_start, relative_offset
                 ),
             })?;
-        // Sanity-check that the tensor at least starts inside the file,
-        // even when its dtype's `type_size` is not yet known. This catches
-        // adversarial `IQ*`/`TQ*`/`MXFP4` files that would otherwise hand
-        // a nonsense `data_offset` out through `tensor_info()`.
+        // Sanity-check that the tensor at least starts inside the file.
+        // After Phase 4.5 every recognised dtype has a known `type_size`,
+        // but this guard remains as a defence against adversarial inputs
+        // whose `data_offset` claims would otherwise leak through to
+        // `tensor_info()`.
         if absolute > file_len_u64 {
             return Err(AnamnesisError::Parse {
                 reason: format!(
@@ -2481,16 +2484,13 @@ mod tests {
         assert_eq!(GgufType::TQ2_0.block_size(), 256);
         assert_eq!(GgufType::TQ2_0.type_size(), Some(66));
         assert_eq!(GgufType::TQ2_0.byte_size_for_n_elements(256).unwrap(), 66);
-    }
 
-    #[test]
-    fn iq_types_have_unknown_type_size() {
-        // IQ4_NL/XS (step 1), IQ2_XXS/XS/S (step 2), IQ3_XXS/S (step 3),
-        // IQ1_S/IQ1_M (step 4), and TQ1_0/TQ2_0 (step 5) are supported;
-        // only MXFP4 remains deferred for the final Phase 4.5 commit.
-        assert_eq!(GgufType::MXFP4.type_size(), None);
-        let err = GgufType::MXFP4.byte_size_for_n_elements(256).unwrap_err();
-        assert!(matches!(err, AnamnesisError::Unsupported { .. }));
+        // Microscaling FP4 landed in Phase 4.5 step 6 — the final block
+        // type, closing the GGUF coverage gap. Every `GgufType` variant
+        // now returns `Some(_)` from `type_size()`.
+        assert_eq!(GgufType::MXFP4.block_size(), 32);
+        assert_eq!(GgufType::MXFP4.type_size(), Some(17));
+        assert_eq!(GgufType::MXFP4.byte_size_for_n_elements(64).unwrap(), 34);
     }
 
     #[test]

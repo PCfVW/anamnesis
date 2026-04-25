@@ -10,13 +10,15 @@
 //! # Supported types
 //!
 //! - **Legacy block quants** (32-element blocks): `Q4_0`, `Q4_1`, `Q5_0`,
-//!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`.
+//!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`, `MXFP4`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
 //!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 //!   `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`.
 //!
-//! Only `MXFP4` remains recognised but **not yet dequantised**; the
-//! dispatcher returns [`AnamnesisError::Unsupported`] for it.
+//! Phase 4.5 closed in step 6 with `MXFP4` — every block-quantised
+//! `GgufType` variant has a dedicated kernel. The dispatcher's only
+//! remaining `Unsupported` path is for scalar (non-block-quant) types
+//! that are reinterpret-only and never reach the dequantisation layer.
 //!
 //! # Two public entry points
 //!
@@ -92,6 +94,15 @@ const K_VALUES_IQ4_NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
+/// `MXFP4` codebook — 16 signed `i8` values that are **2× the OCP E2M1
+/// magnitudes**. The doubling is cancelled by the `_HALF` factor inside
+/// [`e8m0_to_fp32_half`], so the final dequantised value matches the
+/// raw OCP E2M1 spec.
+///
+/// Ported verbatim from `ggml-common.h::kvalues_mxfp4`. Indexed by the
+/// 4-bit storage nibble (`0..16`).
+const K_VALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 // ---------------------------------------------------------------------------
 // Infallible byte readers
 // ---------------------------------------------------------------------------
@@ -109,6 +120,37 @@ fn read_f16_bytes(bytes: [u8; 2]) -> f32 {
 #[inline]
 fn read_f32_bytes(bytes: [u8; 4]) -> f32 {
     f32::from_le_bytes(bytes)
+}
+
+/// Decodes a 1-byte E8M0 exponent into the `MXFP4` per-block scale (the
+/// `_HALF` variant from `ggml-impl.h`).
+///
+/// Returns `2^(e - 128)` for `e >= 2`, falling back to `2^-129` and
+/// `2^-128` for `e ∈ {0, 1}` via a left shift on the f32 mantissa bits.
+/// **No NaN guard for `e == 0xFF`** — `llama.cpp`'s `_half` helper
+/// returns `2^127` there rather than NaN, deviating from the raw OCP MX
+/// spec. We match `llama.cpp` bit-for-bit so cross-validation against
+/// `dequantize_row_mxfp4` is exact.
+///
+/// The "half" suffix denotes that the scale is half the OCP `2^(e-127)`
+/// value; the lost factor of 2 is folded into [`K_VALUES_MXFP4`], whose
+/// entries are themselves 2× the OCP E2M1 codebook magnitudes.
+#[inline]
+fn e8m0_to_fp32_half(e: u8) -> f32 {
+    // BITWISE: assemble the f32 directly from the E8M0 byte (no float
+    // arithmetic). For e >= 2, the byte minus one is the IEEE 754 biased
+    // exponent; mantissa is zero. For e ∈ {0, 1}, shift the smallest
+    // normal mantissa pattern (0x0020_0000 = 2^-129 sign-bit-zero) left
+    // by `e` to land on 2^-129 / 2^-128.
+    let bits: u32 = if e < 2 {
+        // CAST: u8 → u32 lossless for the shift amount; e < 2 so 0x0020_0000 << e
+        // never overflows the 23-bit mantissa region.
+        0x0020_0000_u32 << u32::from(e)
+    } else {
+        // CAST: u8 → u32 lossless for the (e - 1) << 23 mantissa-region shift.
+        (u32::from(e) - 1) << 23
+    };
+    f32::from_bits(bits)
 }
 
 /// Unpacks an `IQ1S_GRID` `u64` entry into 8 signed `i8` codebook values.
@@ -195,9 +237,10 @@ fn write_scratch_to_bf16(scratch: &[f32], out_block: &mut [u8]) {
 ///   output), or
 /// - `data.len()` does not equal `n_blocks × dtype.type_size()`.
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `dtype.type_size()` is
-/// `None` — only `MXFP4` remains in this state, deferred to the final
-/// Phase 4.5 commit.
+/// Returns [`AnamnesisError::Unsupported`] only if a future `GgufType`
+/// variant is added without a `type_size()` arm — every variant
+/// recognised today returns `Some(_)`, so this branch is a forward-
+/// compatibility safety net rather than a current code path.
 fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> crate::Result<usize> {
     let block_size = dtype.block_size();
     if !n_elements.is_multiple_of(block_size) {
@@ -306,9 +349,10 @@ fn dispatch_streaming<F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result
 where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    // EXHAUSTIVE: internal dispatch over GgufType. Only MXFP4 has no
-    // implemented kernel yet; scalar (non-block) types are structurally
-    // dequantised (reinterpret bytes), not in scope here.
+    // EXHAUSTIVE: internal dispatch over GgufType. Scalar (non-block)
+    // types fall through to the wildcard arm — they are reinterpret-
+    // only and never reach the dequantisation layer. After Phase 4.5
+    // step 6 every block-quantised variant has a dedicated kernel.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
         GgufType::Q4_0 => dequant_q4_0(data, sink),
@@ -334,6 +378,7 @@ where
         GgufType::IQ1_M => dequant_iq1_m(data, sink),
         GgufType::TQ1_0 => dequant_tq1_0(data, sink),
         GgufType::TQ2_0 => dequant_tq2_0(data, sink),
+        GgufType::MXFP4 => dequant_mxfp4(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!("dequantisation not yet supported for {dtype}"),
@@ -360,9 +405,10 @@ where
 /// (32-bit targets only), or if `data.len()` does not equal the expected
 /// byte count (`n_blocks × type_size`).
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `dtype` is the
-/// recognised-but-not-yet-implemented `MXFP4` type, or a scalar type
-/// that is not a quantised block format.
+/// Returns [`AnamnesisError::Unsupported`] if `dtype` is a scalar
+/// (non-block-quant) type that is structurally not a quantised block
+/// format. Every block-quantised variant has a dedicated kernel after
+/// Phase 4.5 step 6.
 ///
 /// # Memory
 ///
@@ -393,11 +439,11 @@ pub fn dequantize_gguf_to_bf16(
 /// tensor size.
 ///
 /// The `sink` closure receives `64` bytes per call for 32-element block
-/// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`) and `512` bytes per call for
-/// 256-element super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`, `IQ2_XXS`,
-/// `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
-/// `TQ2_0`). Sink errors abort the stream and are propagated unchanged
-/// as the return value.
+/// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`, `MXFP4`) and `512` bytes per call
+/// for 256-element super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`,
+/// `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`,
+/// `TQ1_0`, `TQ2_0`). Sink errors abort the stream and are propagated
+/// unchanged as the return value.
 ///
 /// This is the canonical form. [`dequantize_gguf_to_bf16`] is a thin
 /// wrapper that sinks into a `Vec::with_capacity`.
@@ -639,6 +685,39 @@ where
         for j in 0..16 {
             let lo = K_VALUES_IQ4_NL[usize::from(in_block[2 + j] & 0x0F)];
             let hi = K_VALUES_IQ4_NL[usize::from(in_block[2 + j] >> 4)];
+            scratch[j] = f32::from(lo) * d;
+            scratch[j + 16] = f32::from(hi) * d;
+        }
+    })
+}
+
+/// `MXFP4` kernel — 17-byte blocks: `e: u8` (E8M0 exponent) + `qs[16]`
+/// (4-bit packed nibbles).
+///
+/// 32-element microscaling FP4 quant (OCP MX standard from late 2023,
+/// added to `ggml` in 2024). Formula: `y[j] = K_VALUES_MXFP4[nibble] × d`
+/// where `d = e8m0_to_fp32_half(e)`. Low nibbles of `qs[0..16]` fill
+/// output positions `0..16`; high nibbles fill `16..32` — the same
+/// **split-half** ordering used by `Q4_0` and `IQ4_NL`.
+///
+/// The codebook ([`K_VALUES_MXFP4`]) stores 2× the OCP E2M1 magnitudes;
+/// the doubling is cancelled by the `_HALF` factor inside
+/// [`e8m0_to_fp32_half`], so the dequantised value matches the raw OCP
+/// E2M1 spec.
+///
+/// Ported verbatim from `ggml-quants.c::dequantize_row_mxfp4`.
+#[allow(clippy::indexing_slicing)]
+fn dequant_mxfp4<F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_legacy_kernel(data, 17, sink, |in_block, scratch| {
+        let d = e8m0_to_fp32_half(in_block[0]);
+        // BITWISE: split each qs byte into two 4-bit codebook indices.
+        // INDEX: nibble masked to 0..16 — K_VALUES_MXFP4 lookup is in-bounds.
+        for j in 0..16 {
+            let lo = K_VALUES_MXFP4[usize::from(in_block[1 + j] & 0x0F)];
+            let hi = K_VALUES_MXFP4[usize::from(in_block[1 + j] >> 4)];
             scratch[j] = f32::from(lo) * d;
             scratch[j + 16] = f32::from(hi) * d;
         }
@@ -1807,13 +1886,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_dtype() {
-        // MXFP4 is the only remaining recognised type with type_size() == None.
-        // IQ4_NL/IQ4_XS landed in Phase 4.5 step 1; IQ2_XXS/IQ2_XS/IQ2_S in
-        // step 2; IQ3_XXS/IQ3_S in step 3; IQ1_S/IQ1_M in step 4; TQ1_0/TQ2_0
-        // in step 5. Only MXFP4 stays deferred until the final Phase 4.5 step.
-        let err = dequantize_gguf_to_bf16(&[], GgufType::MXFP4, 256).unwrap_err();
-        assert!(matches!(err, AnamnesisError::Unsupported { .. }));
+    fn mxfp4_now_supported_returns_parse_error_on_bad_length() {
+        // Phase 4.5 step 6 added the MXFP4 dequant kernel — it no longer
+        // triggers `Unsupported`. Passing an empty data slice with a
+        // non-zero element count now flows into `validate_dequant_input`,
+        // which surfaces a `Parse` error on the data-length mismatch
+        // (1 block of MXFP4 = 17 bytes; 0 bytes is not 17).
+        let err = dequantize_gguf_to_bf16(&[], GgufType::MXFP4, 32).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
     }
 
     #[test]
@@ -2900,6 +2980,82 @@ mod tests {
                 "TQ2_0 output[{j}]"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // MXFP4
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn mxfp4_zero_block_zero_output() {
+        // e = 0, qs all zero. Every nibble indexes K_VALUES_MXFP4[0] = 0,
+        // so every output is 0.0 regardless of the e8m0 sub-2 branch.
+        let block = vec![0u8; 17];
+        let out = dequantize_gguf_to_bf16(&block, GgufType::MXFP4, 32).unwrap();
+        for chunk in out.chunks_exact(2) {
+            assert_eq!(bf16_pair_to_f32(chunk), 0.0);
+        }
+    }
+
+    #[test]
+    fn mxfp4_e_one_yields_subnormal_scale() {
+        // e = 1 → d = 0x0040_0000 as f32 = 2^-128. qs[0] = 0x71:
+        //   low nibble 1 → K_VALUES_MXFP4[1] = 1
+        //   high nibble 7 → K_VALUES_MXFP4[7] = 12
+        // Output position 0 = 1 × 2^-128, position 16 = 12 × 2^-128. The
+        // expected BF16 is computed end-to-end via `f32_bits_to_bf16_bits`
+        // so this test exercises the rounding rule alongside the kernel
+        // (rather than baking a fragile constant into the assertion).
+        let mut block = vec![0u8; 17];
+        block[0] = 1;
+        block[1] = 0x71;
+        let out = dequantize_gguf_to_bf16(&block, GgufType::MXFP4, 32).unwrap();
+        let d = f32::from_bits(0x0040_0000);
+        let expected_pos_0 = 1.0_f32 * d;
+        let expected_pos_16 = 12.0_f32 * d;
+        let bits_pos_0 = f32_bits_to_bf16_bits(expected_pos_0.to_bits());
+        let bits_pos_16 = f32_bits_to_bf16_bits(expected_pos_16.to_bits());
+        let actual_pos_0 = u16::from_le_bytes([out[0], out[1]]);
+        let actual_pos_16 = u16::from_le_bytes([out[32], out[33]]);
+        assert_eq!(actual_pos_0, bits_pos_0, "MXFP4 e=1 position 0");
+        assert_eq!(actual_pos_16, bits_pos_16, "MXFP4 e=1 position 16");
+    }
+
+    #[test]
+    fn mxfp4_e_normal_simple() {
+        // e = 128 → d = (128 - 1) << 23 = 0x3F80_0000 = 1.0. qs[0] = 0x71:
+        //   low nibble 1 → 1.0; high nibble 7 → 12.0.
+        // qs[1..16] = 0 → all four positions in the 32-element block decode
+        // to 0.0 except positions 0 and 16.
+        let mut block = vec![0u8; 17];
+        block[0] = 128;
+        block[1] = 0x71;
+        let out = dequantize_gguf_to_bf16(&block, GgufType::MXFP4, 32).unwrap();
+        for j in 0..32 {
+            let expected = match j {
+                0 => 1.0,
+                16 => 12.0,
+                _ => 0.0,
+            };
+            assert_eq!(
+                bf16_pair_to_f32(&out[j * 2..j * 2 + 2]),
+                expected,
+                "MXFP4 e=128 output[{j}]"
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp4_e_normal_negative_codebook() {
+        // e = 128 → d = 1.0. qs[0] = 0xF9:
+        //   low nibble 9 → K_VALUES_MXFP4[9] = -1
+        //   high nibble 15 → K_VALUES_MXFP4[15] = -12
+        let mut block = vec![0u8; 17];
+        block[0] = 128;
+        block[1] = 0xF9;
+        let out = dequantize_gguf_to_bf16(&block, GgufType::MXFP4, 32).unwrap();
+        assert_eq!(bf16_pair_to_f32(&out[0..2]), -1.0);
+        assert_eq!(bf16_pair_to_f32(&out[32..34]), -12.0);
     }
 }
 
