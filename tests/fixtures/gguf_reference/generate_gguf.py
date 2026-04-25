@@ -49,7 +49,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from gguf import GGUFReader, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize
+from gguf import GGUFReader, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
 
 # Number of elements to extract per fixture.  65 536 = 256 × 256, same
 # slice size the FP8/GPTQ/AWQ/BnB fixtures use.  For legacy quants
@@ -104,6 +104,14 @@ FIXTURES = [
     # IQ1_M + 32 IQ2_XXS (no IQ1_S). Two downloads, two fixtures.
     ("mistral_7b_iq1_s", "Mistral-7B-Instruct-v0.3-IQ1_S.gguf", GGMLQuantizationType.IQ1_S),
     ("mistral_7b_iq1_m", "Mistral-7B-Instruct-v0.3-IQ1_M.gguf", GGMLQuantizationType.IQ1_M),
+    # ---- TQ variants (ternary, BitNet-style 1.58-bit) ----
+    # Only ~15 BitNet-derivative GGUFs exist on HuggingFace, none from
+    # mainstream model providers. Python `gguf.quants.quantize()` implements
+    # both TQ types, so we synthesise fixtures from a deterministic random
+    # f32 tensor instead of downloading multi-GB BitNet GGUFs. A `None`
+    # filename triggers the synthetic-source path below.
+    ("synthetic_tq1_0", None, GGMLQuantizationType.TQ1_0),
+    ("synthetic_tq2_0", None, GGMLQuantizationType.TQ2_0),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
 
@@ -182,10 +190,68 @@ def generate_fixture(name: str, gguf_path: Path, target_type: GGMLQuantizationTy
     )
 
 
+def generate_synthetic_fixture(name: str, target_type: GGMLQuantizationType) -> None:
+    """Synthesise one fixture from a deterministic random f32 tensor.
+
+    Used for quant types where (a) no mainstream model ships the type as a
+    distributable GGUF and (b) Python ``gguf.quants.quantize()`` implements
+    the encoding side. The seed and scale are fixed so fixtures are
+    reproducible across runs.
+    """
+    rng = np.random.default_rng(seed=42)
+    f32_input = (rng.standard_normal(SLICE_ELEMENTS) * 0.1).astype(np.float32)
+
+    block_size, type_size = GGML_QUANT_SIZES[target_type]
+    n_blocks = SLICE_ELEMENTS // block_size
+    raw_byte_len = n_blocks * type_size
+
+    raw_bytes = quantize(f32_input, target_type).tobytes()
+    assert len(raw_bytes) == raw_byte_len, (
+        f"quantize produced {len(raw_bytes)} bytes, expected {raw_byte_len}"
+    )
+
+    # Dequantize (best-of-5) to get the golden f32 reference.
+    best_us = float("inf")
+    for _ in range(5):
+        t0 = time.perf_counter()
+        f32 = dequantize(np.frombuffer(raw_bytes, dtype=np.uint8), target_type)
+        t1 = time.perf_counter()
+        best_us = min(best_us, (t1 - t0) * 1e6)
+
+    assert f32.shape == (SLICE_ELEMENTS,), f"expected {SLICE_ELEMENTS}, got {f32.shape}"
+    assert f32.dtype == np.float32
+
+    golden_bytes = f32_array_to_bf16_bytes(f32)
+    golden_len = SLICE_ELEMENTS * 2
+    assert len(golden_bytes) == golden_len
+
+    output_path = Path(__file__).parent / f"{name}.bin"
+    disc = target_type.value
+    with open(output_path, "wb") as out:
+        out.write(struct.pack("<I", disc))
+        out.write(struct.pack("<I", SLICE_ELEMENTS))
+        out.write(struct.pack("<I", raw_byte_len))
+        out.write(struct.pack("<I", golden_len))
+        out.write(raw_bytes)
+        out.write(golden_bytes)
+
+    print(
+        f"  {name}: synthetic (seed=42), {target_type.name} (disc={disc}), "
+        f"{SLICE_ELEMENTS} elements, "
+        f"raw={raw_byte_len} B, golden={golden_len} B, "
+        f"fixture={output_path.stat().st_size} B, "
+        f"gguf dequant={best_us:.1f} µs (best of 5)"
+    )
+
+
 if __name__ == "__main__":
     print("Generating GGUF cross-validation fixtures...")
     print(f"Models directory: {MODELS_DIR}")
     for name, filename, target_type in FIXTURES:
+        if filename is None:
+            # Synthetic-source path: no model file needed.
+            generate_synthetic_fixture(name, target_type)
+            continue
         gguf_path = MODELS_DIR / filename
         if not gguf_path.exists():
             print(f"\n  SKIP {name}: model not found at {gguf_path}")

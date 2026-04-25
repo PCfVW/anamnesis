@@ -12,11 +12,15 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor.
 //!
-//! Coverage: 19 of 21 production kernels from 4 real models (`Q4_0`–`Q8_0`,
-//! `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`,
-//! `IQ3_S`, `IQ1_S`, `IQ1_M`). `Q8_1` and `Q8_K` are not shipped by any real
-//! model — they are internal `llama.cpp` activation quant types, already
-//! covered by unit tests.
+//! Coverage: 21 of 22 production kernels from 4 real models + 2 synthetic
+//! fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`,
+//! `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`).
+//! `TQ1_0` / `TQ2_0` are synthetic-fixture cross-validated because only ~15
+//! BitNet-derivative GGUFs ship them on HuggingFace (Python `gguf.quants.
+//! quantize()` implements the encode side, so a deterministic random tensor
+//! is the practical fixture source). `Q8_1` and `Q8_K` are not shipped by
+//! any real model — they are internal `llama.cpp` activation quant types,
+//! already covered by unit tests.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -83,6 +87,8 @@ fn gguf_type_from_disc(disc: u32) -> GgufType {
         21 => GgufType::IQ3_S,
         19 => GgufType::IQ1_S,
         29 => GgufType::IQ1_M,
+        34 => GgufType::TQ1_0,
+        35 => GgufType::TQ2_0,
         other => panic!("unknown ggml_type discriminant: {other}"),
     }
 }
@@ -415,6 +421,38 @@ fn cross_validate_mistral_7b_iq1_m() {
         "Mistral-7B-v0.3 IQ1_M (bartowski)",
         include_bytes!("fixtures/gguf_reference/mistral_7b_iq1_m.bin"),
         GgufType::IQ1_M,
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TQ variants (256-element super-blocks) — 2 kernels, synthetic fixtures
+// ---------------------------------------------------------------------------
+//
+// Ternary quantizations invented for BitNet-style 1.58-bit models. Only ~15
+// community uploads exist on HuggingFace; mainstream model providers don't
+// ship TQ variants. Python `gguf.quants.quantize()` implements both, so the
+// fixtures come from a deterministic synthetic random tensor (seed=42,
+// scale=0.1) — see `generate_gguf.py::generate_synthetic_fixture`. Same
+// `gguf.dequantize()` reference path as real-model fixtures, just a
+// different input source.
+
+#[test]
+fn cross_validate_synthetic_tq1_0() {
+    run_cross_validation(
+        "Synthetic TQ1_0 (seed=42)",
+        include_bytes!("fixtures/gguf_reference/synthetic_tq1_0.bin"),
+        GgufType::TQ1_0,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_synthetic_tq2_0() {
+    run_cross_validation(
+        "Synthetic TQ2_0 (seed=42)",
+        include_bytes!("fixtures/gguf_reference/synthetic_tq2_0.bin"),
+        GgufType::TQ2_0,
         0,
     );
 }
