@@ -122,7 +122,7 @@ Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-
 
 ### GGUF Block-Quant Dequantization
 
-Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on 19 block-quant kernels from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct). Bit-exact output (0 ULP difference). Feature-gated behind `gguf`.
+Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on 21 block-quant kernels from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct) plus 2 synthetic fixtures (`TQ1_0` / `TQ2_0` — only ~15 BitNet-derivative GGUFs ship them on HuggingFace, so a deterministic random tensor is the practical fixture source). Bit-exact output (0 ULP difference). Feature-gated behind `gguf`.
 
 | Kernel | Model | vs `gguf` Python (AVX2) |
 |---|---|---|
@@ -145,8 +145,10 @@ Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors
 | IQ3_S | Mistral-7B-v0.3 | 4.37x faster |
 | IQ1_S | Mistral-7B-v0.3 | 15.00x faster |
 | IQ1_M | Mistral-7B-v0.3 | 7.85x faster |
+| TQ1_0 | synthetic | 35.59x faster |
+| TQ2_0 | synthetic | 26.31x faster |
 
-> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` and `IQ3_*` kernels land in the 2.8×–4.4× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. The `IQ1_*` kernels are notably faster (7.9×–15.0×) because their inner loop replaces the per-element sign branch with a single scalar `±delta` per 8-element group, and the codebook gather is a plain `[u64; 2048]` table lookup. Phase 9 (CPU SIMD pass) will further address the IQ2/IQ3 case with hand-written AVX2 intrinsics.
+> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` and `IQ3_*` kernels land in the 2.8×–4.4× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. The `IQ1_*` kernels are notably faster (7.9×–15.0×) because their inner loop replaces the per-element sign branch with a single scalar `±delta` per 8-element group, and the codebook gather is a plain `[u64; 2048]` table lookup. The ternary `TQ*` kernels are the **fastest in the crate** (26×–36×) — no codebook lookup at all, just bit shifts (`TQ2_0`) or a base-3 multiplication trick (`TQ1_0`) decoding directly to `{-d, 0, +d}`. Phase 9 (CPU SIMD pass) will further address the IQ2/IQ3 case with hand-written AVX2 intrinsics.
 
 ### NPZ/NPY Parsing
 
