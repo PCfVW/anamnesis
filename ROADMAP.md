@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated April 12, 2026)
-**Status:** Phases 1–4 complete (v0.4.0 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization (12 block-quant kernels, bit-exact against `llama.cpp` reference). **Next:** Phase 4.5 (GGUF completeness: `IQ*`/`TQ*`/`MXFP4` kernels).
+**Date:** March 20, 2026 (updated April 28, 2026)
+**Status:** Phases 1–4.5 complete (v0.4.2 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels (12 from Phase 4 + 10 IQ/TQ/MXFP4 from Phase 4.5), bit-exact against the `gguf` Python reference (mirrors `llama.cpp`'s `ggml-quants.c`). **Next:** Phase 5 (Lethe — BnB encode + round-trip validation harness, v0.5.0).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -30,8 +30,10 @@
   - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
   - [Phase 6.5: Benchmarking & Performance Validation](#phase-65-benchmarking--performance-validation)
   - [Phase 7: Python Bindings (PyO3)](#phase-7-python-bindings-pyo3)
+  - [Phase 7.5: Lethe Encode Completion](#phase-75-lethe-encode-completion)
   - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
   - [Phase 9: CPU SIMD Pass](#phase-9-cpu-simd-pass)
+  - [Phase 10: Streaming Output](#phase-10-streaming-output)
   - [Future Directions](#future-directions)
 - [4. Key Design Decisions](#4-key-design-decisions)
 - [5. Relationship to Other Projects](#5-relationship-to-other-projects)
@@ -126,6 +128,14 @@ anamnesis (library crate)
 │   └── gguf               GGUF K-quant dequantization (Phase 4)
 │
 ├── lethe/              ← built on parse: precision reduction (quantize)
+│   ├── bnb                BnB encode (NF4, FP4, INT8) (Phase 5)
+│   ├── round_trip         Bit-exact decode↔encode validation harness (Phase 5)
+│   ├── fp8                FP8 encode (E4M3, E5M2; per-tensor / per-channel / fine-grained) (Phase 7.5)
+│   ├── gguf_legacy        GGUF legacy block encode (Q4_0–Q8_1) (Phase 7.5)
+│   ├── gguf_kquants       GGUF K-quant encode (Q2_K–Q8_K) (Phase 7.5)
+│   ├── gguf_iq            GGUF IQ-quant encode (IQ1/IQ2/IQ3/IQ4) (Phase 7.5)
+│   ├── gguf_tq            GGUF TQ encode (TQ1_0, TQ2_0) (Phase 7.5)
+│   └── mxfp4              MXFP4 encode (Phase 7.5)
 │
 ├── inspect             ← built on parse: report without transforming
 │
@@ -324,7 +334,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [x] **`IQ1_S` and `IQ1_M` dequant kernels** (`src/remember/gguf.rs`, commits `16bd880` + `ecaca11` + `891e4b6`) — two 1-bit super-quants, smallest footprint in the IQ family. `IQ1_S` (50 B/block, top-level `d: f16`, 11-bit grid index, ±`IQ1S_DELTA = 0.125` additive bias); `IQ1_M` (56 B/block, **no top-level `d`** — super-block scale reconstructed from a scattered 16-bit pattern across `scales[8]` reinterpreted as `f16`). Both share the 2048-entry `IQ1S_GRID: [u64; 2048]` codebook of signed `i8` 8-element vectors (~16 KB, the largest single grid in the crate). Inner-loop math is `dl × (grid[j] + delta)` — additive bias instead of IQ2/IQ3's multiplicative ±1 sign — needing the new `write_delta_grid` helper. Bit-exact (0 ULP) against the `gguf` Python reference on 65 536-element slices from `bartowski/Mistral-7B-Instruct-v0.3-GGUF` (separate `IQ1_S.gguf` and `IQ1_M.gguf` files; no shared-file trick available like step 3). 6 new unit tests + 2 new cross-validation tests (13.77× / 7.88× faster than Python reference, release-mode best-of-5 — fastest IQ kernels in the crate).
 - [x] **`TQ1_0` and `TQ2_0` dequant kernels** (`src/remember/gguf.rs`, commits `72f8e3c` + `111de18` + `53dd3ab`) — two ternary super-quants (54 / 66 B/block) decoding to `{-d, 0, +d}`. `TQ1_0` uses base-3 packing (5 ternaries per `qs` byte, 4 per `qh` byte) decoded via the `pow3 = [1, 3, 9, 27, 81, 243]` multiplication trick. `TQ2_0` is plain 2-bit packing. New `decode_pow3_ternary` helper alongside the existing `write_signed_grid` / `write_delta_grid` family. **First step using synthetic fixtures** — only ~15 BitNet-derivative GGUFs ship TQ types on HuggingFace, but Python `gguf.quants.quantize()` implements both, so a deterministic synthetic random tensor (seed=42, scale=0.1) is the practical fixture source. Bit-exact (0 ULP) against the `gguf` Python reference. 5 new unit tests + 2 new cross-validation tests (35.59× / 26.31× faster than Python reference, release-mode best-of-5 — fastest GGUF kernels in the crate, beating Q5_0's 31.3× record).
 - [x] **`MXFP4` dequant kernel** (`src/remember/gguf.rs`, commits `b87d877` + `acfe8a6` + `89e596d`) — 32-element microscaling FP4 (OCP MX standard, added to `ggml` in 2024), 17 B/block: `e: u8` (E8M0 byte exponent) + `qs[16]` (4-bit packed). Distinct from the `IQ*` / `TQ*` family because it uses a standardised IEEE-like sub-block exponent (`E8M0`) rather than a learned codebook, decoded by a new `e8m0_to_fp32_half` helper that matches `llama.cpp`'s `ggml_e8m0_to_fp32_half` (no NaN guard for `e == 0xFF`, deviating from raw OCP MX spec). 16-entry signed `i8` codebook (`K_VALUES_MXFP4`, storing 2× the OCP E2M1 magnitudes) with the doubling cancelled by the half-scale exponent. Same low/high split-nibble layout as `Q4_0` / `IQ4_NL` via the existing `run_legacy_kernel` runner. Bit-exact (0 ULP) against the `gguf` Python reference on a deterministic synthetic fixture (Python `gguf.quants.quantize()` supports MXFP4 too — same synthetic-fixture path as TQ1_0/TQ2_0 from step 5). 4 new unit tests + 1 new cross-validation test (30.14× faster than Python reference, release-mode best-of-5).
-- [x] **Cross-validation extension** — landed incrementally with steps 1–6: every `IQ*` / `TQ*` / `MXFP4` kernel ships its own cross-validation test against the `gguf` Python reference (mirrors `ggml-quants.c`). Bit-exactness contract holds at 0 ULP for all 22 of 22 production kernels — **PUSH + tag `v0.4.2`** (deferred — local CI dry-run completed before push, awaiting user review).
+- [x] **Cross-validation extension** — landed incrementally with steps 1–6: every `IQ*` / `TQ*` / `MXFP4` kernel ships its own cross-validation test against the `gguf` Python reference (mirrors `ggml-quants.c`). Bit-exactness contract holds at 0 ULP for all 22 of 22 production kernels — **PUSH + tag `v0.4.2`**.
 
 **Deliverable:** `anamnesis` v0.4.2 — anamnesis now dequantises every GGUF block type shipping on HuggingFace. `IQ*`/`TQ*`/`MXFP4` are the last meaningful coverage gap; after this release anamnesis is a drop-in replacement for `llama.cpp`'s CPU dequant path. — **PUSH + tag `v0.4.2`**
 
@@ -339,33 +349,34 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Goal:** The opposite direction — take full-precision weights and quantize them. Built on parse (read the source) + lethe (compress). With Phase 4 complete, this enables **cross-format conversion** via the dequantize-then-requantize path (e.g., GPTQ safetensors → BF16 → GGUF Q4_K_M). No Rust tool can do this today.
 
-- [ ] FP8 quantization (`src/lethe/fp8.rs`) — BF16/F32 → FP8 E4M3 with fine-grained block scale factors — **commit**
-- [ ] INT8/INT4 quantization — per-channel and group-wise schemes — **commit**
-- [ ] `ParsedModel::forget()` public API + `forget` CLI subcommand (alias `quantize`) — **commit**
-- [ ] Round-trip validation — quantize then dequantize, measure lethe distance — **commit** — **PUSH**
+**Strategy:** Phase 5 ships a deliberately narrow first cut and **claims its own minor version (`v0.5.0`)** because Lethe is the architectural inverse of Anamnesis (Phases 1–4.5) and deserves a minor-version namespace of its own — even when the initial coverage is one quant family rather than the full encode-side matrix. The minimum viable end-to-end pipeline ships **BnB encode** as step 1 (this Phase), then proceeds through Phase 6 (Format Conversion Matrix), Phase 6.5 (Benchmarking), and Phase 7 (Python Bindings) to validate the complete `parse → remember → forget → convert → bind` chain on a single quant family. Once the architecture is proven end-to-end, the remaining encode kernel families (FP8, GGUF legacy block, GGUF K-quants, etc.) land in **Phase 7.5+** as a focused encode-completion milestone.
 
-**Deliverable:** `anamnesis` v0.5.0 — full quantize + dequantize cycle. — **PUSH + tag `v0.5.0`**
+- [ ] **Step 1 — `BnB` encode (`NF4` + `FP4` + `INT8`) + round-trip validation harness** (`src/lethe/bnb.rs` + `src/lethe/round_trip.rs`) — three encode kernels mirroring the Phase 2 BnB decode kernels (shipped at v0.2.0, refactored at v0.4.0): `encode_nf4` and `encode_fp4` use the same fixed compile-time codebooks (no search — just nearest-codebook-entry lookup over the 16-entry table); `encode_bnb_int8` is per-row absmax-derived scale + `round(x / scale)`. The round-trip validation harness asserts bit-exactness for `encode(decode(q, scale)) == q` across the entire valid index range — the codebook itself is the oracle, no external Python reference needed. Plus cross-validation against PyTorch `bitsandbytes` on the existing 4 BnB fixtures: encode → load in PyTorch → assert equal. The harness pattern (generic `assert_bit_exact_decode_encode` helper) is the foundation for every subsequent encode kernel; subsequent steps extend it rather than reinvent it. ~1100 LOC, ~4 effort units — **commit** — **PUSH + tag `v0.5.0`**
+
+**Deliverable:** `anamnesis` v0.5.0 — **Lethe lands.** Phase 5 ships BnB encode (NF4 / FP4 / INT8) + the round-trip validation harness that every subsequent encode kernel will reuse. Lethe gets its own minor version even though the initial coverage is one quant family — the architectural commitment (`src/lethe/`, the round-trip oracle, the encode-side public API surface) is what `v0.5.0` represents. The remaining encode kernel families (FP8, GGUF legacy block, GGUF K-quants, IQ4_NL/XS, MXFP4, TQ) move to **Phase 7.5: Lethe Encode Completion**, landing after the full chain has been validated through Python bindings in Phase 7. — **PUSH + tag `v0.5.0`**
 
 ### Phase 6: Format Conversion Matrix
 
-**Goal:** Wire the full pipeline — any supported input format to any supported output format in a single command. With Phases 1–5 complete, the core is `parse → remember → forget → write`. Phase 6 adds the CLI for end-to-end conversion, plus output writers for each target format.
+**Goal:** Wire the conversion pipeline — `parse → remember → forget → write` end-to-end via a single CLI primitive. With Phase 5 complete (BnB encode), v0.6.0 ships every decode-side conversion (any input format → safetensors BF16) plus the BnB encode path (any input → BnB safetensors); the remaining encode-side rows of the matrix (GGUF / FP8 / IQ / TQ / MXFP4) light up at v0.7.5 once Phase 7.5 lands the missing encode kernels, accessible through the same `convert()` API and the same `amn convert` subcommand.
 
-**Key conversions unlocked:**
+**Key conversions unlocked (cumulative across Phase 6 and Phase 7.5):**
 
-| From | To | Use case |
-|------|----|----------|
-| GPTQ safetensors | GGUF Q4_K_M | Deploy HuggingFace models in llama.cpp/Ollama |
-| AWQ safetensors | safetensors BF16 | Remove quantization for fine-tuning |
-| GGUF | safetensors BF16 | Load llama.cpp models in candle/burn |
-| safetensors BF16 | GGUF Q4_K_M | Quantize for local inference |
-| NPZ | safetensors | Migrate JAX weights to HuggingFace ecosystem |
-| PyTorch .pth | safetensors | Migrate legacy PyTorch weights (already supported since v0.3.1) |
+| From | To | Use case | Available |
+|------|----|----------|-----------|
+| AWQ safetensors | safetensors BF16 | Remove quantization for fine-tuning | v0.6.0 |
+| GGUF | safetensors BF16 | Load llama.cpp models in candle/burn | v0.6.0 |
+| NPZ | safetensors | Migrate JAX weights to HuggingFace ecosystem | v0.6.0 |
+| PyTorch .pth | safetensors | Migrate legacy PyTorch weights | v0.3.1 (shipped) |
+| safetensors BF16 | safetensors BnB-NF4 | Compact BnB-quantized model from BF16 source | v0.6.0 (Phase 5 forget) |
+| GPTQ safetensors | GGUF Q4_K_M | Deploy HuggingFace models in llama.cpp/Ollama | **v0.7.5** (Phase 7.5) |
+| safetensors BF16 | GGUF Q4_K_M | Quantize for local inference | **v0.7.5** (Phase 7.5) |
+| safetensors BF16 | GGUF IQ4_XS | Compact "small but accurate" GGUF for local inference | **v0.7.5** (Phase 7.5) |
 
-- [ ] GGUF output writer — write GGUF files with K-quant types from BF16 input — **commit**
-- [ ] `amn convert` CLI subcommand — `amn convert model.safetensors --to gguf-q4km -o model.gguf` — **commit**
-- [ ] Cross-format round-trip validation — convert, then convert back, measure distortion — **commit** — **PUSH**
+- [ ] GGUF output writer (header + tensor info + F32 / BF16 passthrough emit) — full quantized-block emit (K-quant / IQ / TQ / MXFP4) unlocks once Phase 7.5 encoders land and plug into the same writer scaffold — **commit**
+- [ ] `amn convert` CLI subcommand — `amn convert model.gguf --to safetensors -o model.safetensors` (and `--to bnb-nf4` from v0.6.0); `--to gguf-q4km` and other quantized targets light up at v0.7.5 via the same dispatch — **commit**
+- [ ] Cross-format round-trip validation — convert through every v0.6.0-available pair, then back, measure distortion — **commit** — **PUSH**
 
-**Deliverable:** `anamnesis` v0.6.0 — any-to-any format conversion. No Rust or Python tool does this today. — **PUSH + tag `v0.6.0`**
+**Deliverable:** `anamnesis` v0.6.0 — the convert primitive plus every decode-side conversion (any input → safetensors BF16) and the BnB encode path (any input → BnB safetensors). No Rust or Python tool offers this convert primitive today. The remaining encode-side rows complete in Phase 7.5. — **PUSH + tag `v0.6.0`**
 
 ### Phase 6.5: Benchmarking & Performance Validation
 
@@ -389,7 +400,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 ### Phase 7: Python Bindings (PyO3)
 
-**Goal:** Expose anamnesis to the Python ecosystem via `pip install anamnesis`. Phases 1–6 give anamnesis the fastest dequantization (2.7–54× vs PyTorch), the fastest NPZ parser (17.7× vs npyz), PyTorch `.pth` parsing, GGUF support, quantization, and any-to-any format conversion — all in pure Rust. Python bindings multiply the audience by ~100×, replacing ad-hoc dequantization scripts across the ML community. By shipping after the format conversion matrix, `pip install anamnesis` includes `convert()` from day one.
+**Goal:** Expose anamnesis to the Python ecosystem via `pip install anamnesis`. Phases 1–6 give anamnesis the fastest dequantization (2.7–54× vs PyTorch), the fastest NPZ parser (17.7× vs npyz), PyTorch `.pth` parsing, GGUF support, BnB encoding, and the `convert()` pipeline scaffold — all in pure Rust. Python bindings multiply the audience by ~100×, replacing ad-hoc dequantization scripts across the ML community. By shipping after the format conversion scaffold, `pip install anamnesis` exposes `convert()` from day one; the remaining encode-side targets (GGUF / FP8 / IQ / TQ / MXFP4) light up at v0.7.5 / Phase 7.5 through the same Python API once those kernels land.
 
 **Approach:** Use [PyO3](https://pyo3.rs/) + [maturin](https://github.com/PyO3/maturin) to build a native Python extension. The Python API should mirror the Rust library API closely: `parse()`, `inspect()`, `remember()`, `forget()`, `convert()`, `parse_npz()`. Returns NumPy arrays (via `numpy` interop) or raw bytes. Ships as a wheel on PyPI.
 
@@ -403,6 +414,40 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 **Deliverable:** `anamnesis` v0.7.0 — `pip install anamnesis` works, with the full conversion matrix exposed. — **PUSH + tag `v0.7.0`**
 
 **New dependencies:** `pyo3`, `numpy` (PyO3 interop). Feature-gated behind `python`.
+
+### Phase 7.5: Lethe Encode Completion
+
+**Goal:** Close the encode-side coverage gap left by Phase 5's narrow first cut. `v0.5.0` ships **BnB** encode (`NF4` / `FP4` / `INT8`) plus the round-trip validation harness; this phase extends that harness to every other codebook-style kernel family already supported on the decode side: **FP8** (Phase 1), **GGUF legacy block** + **K-quants** (Phase 4), and **GGUF IQ-quants** + **TQ** + **MXFP4** (Phase 4.5). After this release, anamnesis can encode into every block-quant format it can decode — closing the loop that the Phase 6 conversion matrix opened against the BnB-only encode side, and giving Phase 7's Python bindings a complete encode surface.
+
+**Approach:** Mirror the Phase 4 / Phase 4.5 playbook on the encode side. Every kernel here is a codebook-LUT inversion (find the nearest entry in a fixed table) plus a per-block scale derivation (per-row absmax, per-block max, or sub-block stats). The encode loop body is structurally identical across families; only the codebook constants and the per-block scale formula differ — exactly the same pattern that justified collapsing six decode-kernel families into Phase 4.5.
+
+Each kernel reuses the generic `assert_bit_exact_decode_encode` round-trip harness from Phase 5 (the codebook itself is the oracle for codebook-LUT kernels — no external Python reference needed for the round-trip). Each kernel ALSO ships a cross-validation test against the same Python reference used on the decode side: `gguf.quants.quantize()` for the GGUF families (legacy block, K-quants, IQ, TQ, MXFP4), and `torch.float8_e4m3fn` / `torch.float8_e5m2` casts for FP8. Fixtures are the existing `bartowski/...` GGUF slices and the seven FP8 model slices from Phase 1 — no new downloads.
+
+**Why now (not earlier):** sequencing this *after* Phase 7 means the full `parse → remember → forget → convert → bind` chain has already been validated end-to-end through Python on a single quant family (BnB). Architectural mistakes in `lethe/` would have been caught by then. Phase 7.5 is then a focused encode-completion sweep against a stable architecture rather than co-evolving with one.
+
+- [ ] **Step 1 — `FP8` encode (`E4M3` + `E5M2`, per-tensor / per-channel / fine-grained block schemes)** (`src/lethe/fp8.rs`) — three encode flows mirroring the v0.1.0 decode kernels: per-tensor (single scale), per-channel (one scale per row, `[N,1]`), and fine-grained 128×128 block scales. For each scheme, `scale = absmax / fp8_max` at the appropriate granularity, divide and round-to-nearest-even via `float8::F8E4M3::from_f32` (and `F8E5M2::from_f32` for the E5M2 variant). The round-trip harness asserts `decode(encode(x)) ≈ x` to within FP8 representation error (FP8 is lossy by construction); the *re-encode* path on the existing 7 FP8 fixtures DOES require bit-exactness — `encode(decode(q)) == q` once the scales stabilise. Cross-validation against `torch.float8_e4m3fn` cast on 256×256 slices from the existing `Llama-3.2-1B-Instruct-FP8`, `Qwen3-1.7B-FP8`, and `EXAONE-4.0-1.2B-FP8` fixtures. ~600 LOC, ~3 effort units — **commit**
+
+- [ ] **Step 2 — GGUF legacy block encode (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`)** (`src/lethe/gguf_legacy.rs`) — six encode kernels for the 32-element legacy block family. Per-block absmax → `d` (block scale); divide and round each element to the nearest signed integer in the block-type's bit width; pack low/high nibbles for the 4-bit and 5-bit variants exactly inverting the decode-side unpack. `Q*_1` variants additionally derive `m` (block min) for asymmetric quantisation, mirroring the `(scale, min)` pair the decode side reads. Reuses the legacy-block runner that Phase 4 introduced (`run_legacy_kernel`) on the encode side. Cross-validation against `gguf.quants.quantize()` on the same `bartowski/SmolLM2-135M-Instruct-GGUF` slices used for decode-side validation. ~800 LOC, ~4 effort units — **commit**
+
+- [ ] **Step 3 — GGUF K-quants encode (`Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`)** (`src/lethe/gguf_kquants.rs`) — six encode kernels for the 256-element super-block family. Per-block absmax → top-level `d`; per-sub-block `(scale, min)` derivation matching the decode-side `get_scale_min_k4` 6-bit packed-scale layout. `Q3_K` requires the inverse of the `kmask1`/`kmask2` permute (`q3_k_pack_scales` mirroring the existing `q3_k_unpack_scales`); a private `#[inline]` helper with its own unit tests, same pattern as the decode side. Reuses every constant table already ported from `ggml-common.h`. Cross-validation against `gguf.quants.quantize()` on the existing `bartowski/TinyLlama-1.1B-Chat` and `SmolLM2-135M-Instruct` slices. ~1200 LOC, ~5 effort units — **commit**
+
+- [ ] **Step 4 — IQ4 + IQ2 family encode (`IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`)** (`src/lethe/gguf_iq.rs`) — five codebook-LUT encode kernels. `IQ4_NL` / `IQ4_XS` walk the 16-entry `kvalues_iq4nl` codebook finding the nearest signed value per element, then pack into the existing low/high-nibble layout. `IQ2_XXS` / `IQ2_XS` / `IQ2_S` walk the 256 / 512 / 1024-entry signed-vector grids (`IQ2XXS_GRID`, `IQ2XS_GRID`, `IQ2S_GRID`) finding the nearest 8-element signed-vector entry per source chunk, then pack the index plus the matching `ksigns_iq2xs` sign mask into the block's `qs` / `qh` / `scales` fields. Lattice search is the new primitive; a single `nearest_signed_vector_index` helper covers all three IQ2 variants by varying grid size. Cross-validation against `gguf.quants.quantize()` on the existing `bartowski/Mistral-7B-Instruct-v0.3-GGUF` slices. ~1500 LOC, ~7 effort units — **commit**
+
+- [ ] **Step 5 — IQ3 + IQ1 family encode (`IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`)** (`src/lethe/gguf_iq.rs`) — four codebook-LUT encode kernels with two new wrinkles. `IQ3_XXS` / `IQ3_S` reuse the lattice-search helper from step 4 against the 256-entry `IQ3XXS_GRID` and 512-entry `IQ3S_GRID`; `IQ3_S` additionally inverts the unusual odd-integer scale formula `d × (1 + 2·nibble)` and the low/high nibble pairing across two consecutive sub-blocks. `IQ1_S` / `IQ1_M` use the 2048-entry `IQ1S_GRID` plus the `±IQ1S_DELTA = 0.125` *additive* bias — encode subtracts the bias before nearest-grid lookup, instead of IQ2/IQ3's multiplicative ±1 sign. `IQ1_M`'s scattered-`f16` super-scale layout (no top-level `d`) requires the inverse pack of the four-byte `scales[8]`-as-`f16` reconstruction. Cross-validation on the existing `bartowski/Mistral-7B-Instruct-v0.3-GGUF` slices (`IQ3_XXS` and `IQ3_S` ride the same shared file as decode-side step 3; `IQ1_S` / `IQ1_M` use their dedicated fixtures). ~1300 LOC, ~6 effort units — **commit**
+
+- [ ] **Step 6 — TQ + MXFP4 encode (`TQ1_0`, `TQ2_0`, `MXFP4`)** (`src/lethe/gguf_tq.rs` + `src/lethe/mxfp4.rs`) — three encode kernels sharing the synthetic-fixture validation pattern the decode side established for the same kernels. **TQ:** per-block absmax → `d`; map each element to `{-1, 0, +1}` via threshold `d/2`; for `TQ1_0` re-pack five ternaries per byte using base-3 multiplication (inverse of the `pow3` decode trick); for `TQ2_0` re-pack four ternaries per byte using plain 2-bit packing. **MXFP4:** per-block absmax → `e: u8` (E8M0 byte exponent) via a new `f32_to_e8m0_half` helper (inverse of the existing `e8m0_to_fp32_half`); divide each element by the half-scale, find nearest entry in the 16-entry signed `K_VALUES_MXFP4` codebook, pack low/high nibbles. Reuses the `run_legacy_kernel` outer-loop runner. Synthetic-fixture cross-validation against `gguf.quants.quantize()` (Python supports both, mirrors Phase 4.5 step 5/6). ~600 LOC, ~3 effort units — **commit**
+
+- [ ] **Step 7 — `forget()` dispatch + `forget` CLI subcommand + cumulative cross-validation** (`src/lib.rs` + `src/bin/main.rs`) — extend the `TargetKernel` enum and `ParsedModel::forget()` dispatch (introduced in Phase 5 for BnB) to recognise every kernel landed in steps 1–6, plus the `amn forget model.safetensors --to <kernel> -o out.gguf` CLI subcommand (alias `quantize`). The cross-validation suite is the cumulative roll-up of every per-step cross-validation test — bit-exactness contract holds at 0 ULP for the codebook-LUT kernels (steps 2–6) and within FP8 representation error for the FP8 path (step 1). Mirrors the v0.4.2 closeout step from Phase 4.5. ~300 LOC, ~2 effort units — **commit** — **PUSH + tag `v0.7.5`**
+
+**Deliverable:** `anamnesis` v0.7.5 — Lethe encode completion. Every block-quant format anamnesis can decode out of can now also be encoded into. Combined with Phase 6's any-to-any conversion CLI and Phase 7's Python bindings, `pip install anamnesis` ships a complete read/write/convert matrix for the GGUF + FP8 + BnB universe — the first time any tool, Rust or Python, has covered all three families end-to-end. — **PUSH + tag `v0.7.5`**
+
+**New dependencies:** None. Reuses the `lethe/` namespace (introduced in Phase 5), the `gguf` and `bnb` feature gates, `half`, and `float8`. Codebook constants from Phase 4.5 are reused verbatim — encode-side helpers live alongside them in the existing `iq_grids` submodule.
+
+**Explicitly out of scope:**
+
+- **GPTQ encoding** — requires a calibration dataset and OBQ/Hessian-based weight optimisation. Calibration-aware quantisation is a fundamentally different architecture (gradient computation, per-layer quant search) and belongs in its own dedicated phase, not in the codebook-LUT family of Phase 7.5.
+- **AWQ encoding** — same reason as GPTQ; needs activation statistics from a calibration loop.
+- **Big-endian GGUF v3 emit** — mirrors the Phase 4.5 deferral on the decode side. No committed target.
 
 ### Phase 8: Emerging Quantization Formats
 
@@ -430,6 +475,8 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 **Goal:** Replace the scalar pass-2 `f32 → BF16` loop in every dequantiser with an explicit AVX2 / NEON vectorised version, giving a 4–8× speedup on the hot path without touching the correctness-verified scalar kernels. This is the first time anamnesis commits to explicit SIMD intrinsics — up to v0.8.0 the project has relied entirely on auto-vectorisation through the loop-fission + `chunks_exact_mut(2)` pattern.
 
 **Why this is a single phase and not per-format work:** Phases 1–4.5 all share the same `f32_bits_to_bf16_bits` pattern (defined once at [src/remember/fp8.rs:101](src/remember/fp8.rs#L101) and reused verbatim by `gptq.rs`, `awq.rs`, `bnb.rs`, and `gguf.rs`). A single `f32x8_to_bf16x8` SIMD helper retrofits every existing dequantiser at once, with one `unsafe` module, one `// SAFETY:` contract, one benchmark harness, and one cross-format round of cross-validation. Splitting the work per format would duplicate the intrinsic surface area across five modules and violate `CONVENTIONS.md`'s "unsafe lives in a single, dedicated module" rule.
+
+The Phase 5 / 7.5 encode kernels write quantized bytes (not BF16), so they don't share this exact pass — but their absmax-then-round-and-pack inner loops are similarly auto-vectorisation friendly and could pick up SIMD intrinsics in a Phase 9 follow-up if encode-side benchmarks (Phase 6.5 + Phase 7.5 cross-validation results) demand it.
 
 **Why now (not earlier):** Auto-vectorisation handles the pass-2 loop reasonably well already — the branch-free `chunks_exact_mut(2)` pattern was chosen specifically to give LLVM a clean target. Phase 9 is triggered when benchmark pressure from real users (enabled by the Phase 6 format conversion CLI and the Phase 7 Python bindings) surfaces kernels where the scalar fallback is a bottleneck. A `TODO(phase4-followup)` comment already sits on [`write_scratch_to_bf16`](src/remember/gguf.rs) flagging the intent.
 

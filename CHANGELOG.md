@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`ROADMAP.md`** — added Phase 7.5 (Lethe Encode Completion, v0.7.5) and applied a consistency pass: refreshed header status (Phases 1–4.5 / v0.4.2 / next Phase 5), added Phase 7.5 + Phase 10 to the TOC, populated the `lethe/` module box, scoped Phase 6 / Phase 7 claims to actual v0.6.0 / v0.7.0 reality (BnB-only encode at v0.6.0, full encode matrix at v0.7.5), corrected the "v0.4.0 BnB decode kernels" reference in Phase 5 step 1, removed the v0.4.2 "awaiting user review" note now that the tag has shipped, and added a Phase 9 follow-up note covering Phase 5/7.5 encode-side pass-2 loops.
+
 ## [0.4.2] - 2026-04-25
 
 ### Added
