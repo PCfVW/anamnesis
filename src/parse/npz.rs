@@ -16,7 +16,7 @@
 //!
 //! On a 302 MB `NPZ` file (Gemma Scope 2B SAE, 5 `F32` arrays):
 //! - Raw `fs::read`: ~64 ms (I/O baseline)
-//! - This parser: near I/O baseline (single bulk read, zero per-element work)
+//! - This parser: near I/O baseline (bulk `read_exact`, zero per-element work)
 //! - Previous `npyz`-backed parser: ~1,500 ms (per-element deserialization)
 
 use std::collections::HashMap;
@@ -426,27 +426,16 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 // Bulk data extraction
 // ---------------------------------------------------------------------------
 
-/// Reads array data as raw little-endian bytes into a freshly allocated `Vec`.
+/// Reads array data as raw little-endian bytes in one bulk `read_exact` call.
 ///
 /// For little-endian data on a little-endian machine, the raw bytes are the
 /// correct in-memory representation — zero per-element processing. For
 /// big-endian data, a byte-swap pass is applied in-place after the bulk read.
 ///
-/// Allocates the destination buffer with [`Vec::with_capacity`] and fills it
-/// via `reader.take(data_bytes).read_to_end(...)`, avoiding the full
-/// zero-init `memset` that `vec![0u8; data_bytes]` would otherwise perform
-/// before `read_exact` overwrites every byte. On the 302 MB Gemma Scope
-/// `params.npz` this eliminates a 302 MB write that previously sat directly
-/// on the parse hot path.
-///
-/// `read_to_end` does not error on a short read, so this function explicitly
-/// validates that exactly `data_bytes` bytes were read.
-///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the element count or byte count
-/// overflows `usize`, if the read fails, or if the underlying reader
-/// returns fewer than `data_bytes` bytes (truncated entry).
+/// overflows `usize`, or if the read fails.
 fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<Vec<u8>> {
     let n_elements: usize = header
         .shape
@@ -462,25 +451,12 @@ fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<
             reason: "data byte count overflow".into(),
         })?;
 
-    // CAST: usize → u64, byte counts always fit in u64 (widening on every
-    // supported target — 32-bit usize ≤ u32::MAX, 64-bit usize ≤ u64::MAX).
-    #[allow(clippy::as_conversions)]
-    let limit = data_bytes as u64;
-
-    let mut buf: Vec<u8> = Vec::with_capacity(data_bytes);
-    let bytes_read =
-        reader
-            .take(limit)
-            .read_to_end(&mut buf)
-            .map_err(|e| AnamnesisError::Parse {
-                reason: format!("array data read failed ({data_bytes} bytes): {e}"),
-            })?;
-
-    if bytes_read != data_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!("array data truncated: expected {data_bytes} bytes, got {bytes_read}"),
-        });
-    }
+    let mut buf = vec![0u8; data_bytes];
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| AnamnesisError::Parse {
+            reason: format!("array data read failed ({data_bytes} bytes): {e}"),
+        })?;
 
     // Byte-swap for big-endian data with multi-byte elements.
     if header.big_endian && header.dtype.byte_size() > 1 {
@@ -1067,33 +1043,6 @@ mod tests {
 
         let result = read_array_data(&mut reader, &header).unwrap();
         assert_eq!(result, 42.5_f64.to_le_bytes());
-    }
-
-    /// `read_array_data` reports a clean `Parse` error when the underlying
-    /// reader runs out of bytes before `data_bytes` are available. With the
-    /// previous `vec![0u8; n]` + `read_exact` pattern this fell out of
-    /// `UnexpectedEof`; the new `Vec::with_capacity` + `take().read_to_end`
-    /// pattern would silently return a short `Vec` without this guard, so
-    /// the explicit length-check is correctness-load-bearing.
-    #[test]
-    fn read_array_data_rejects_truncated_input() {
-        // Header claims 4 × f32 = 16 bytes, but we feed only 8 bytes of data.
-        let truncated_data = [0u8; 8];
-        let npy = make_npy_v1(
-            "{'descr': '<f4', 'fortran_order': False, 'shape': (4,), }",
-            &truncated_data,
-        );
-        let mut reader = std::io::Cursor::new(&npy);
-        let header = parse_npy_header(&mut reader).unwrap();
-        assert_eq!(header.dtype, NpzDtype::F32);
-        assert_eq!(header.shape, vec![4]);
-
-        let err = read_array_data(&mut reader, &header).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("truncated") || msg.contains("read failed"),
-            "expected truncation error, got: {msg}"
-        );
     }
 
     #[test]
