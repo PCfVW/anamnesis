@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **NPZ `read_array_data` zero-init eliminated** — replaced the
+  `vec![0u8; data_bytes]` + `read_exact` pattern with
+  `Vec::with_capacity(data_bytes)` + `reader.take(...).read_to_end(...)` and
+  an explicit truncation check on the byte count. The previous pattern paid
+  for a full zero-init `memset` of `data_bytes` bytes immediately before
+  `read_exact` overwrote every byte — pure dead work. On the 302 MB Gemma
+  Scope `params.npz` this eliminates a 302 MB write that previously sat
+  directly on the parse hot path. The truncation guard preserves the
+  external behavioural contract (a short reader yields
+  `AnamnesisError::Parse`), since `read_to_end` does not error on a short
+  read the way `read_exact` does. No `unsafe`, no public-API change.
+  Identified by the v0.4.x algorithmic-weakness audit (finding #4 of 12).
 - **`ROADMAP.md`** — inserted Phase 4.7 (Remote-only NPZ inspection,
   Reader-generic API, v0.4.3) between Phase 4.5 and Phase 5. Updated
   status header `Next:` pointer (Phase 4.7 → Phase 5), added the new
