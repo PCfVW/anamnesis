@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated April 28, 2026)
-**Status:** Phases 1–4.5 complete (v0.4.2 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels (12 from Phase 4 + 10 IQ/TQ/MXFP4 from Phase 4.5), bit-exact against the `gguf` Python reference (mirrors `llama.cpp`'s `ggml-quants.c`). **Next:** Phase 5 (Lethe — BnB encode + round-trip validation harness, v0.5.0).
+**Date:** March 20, 2026 (updated April 30, 2026)
+**Status:** Phases 1–4.5 complete (v0.4.2 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels (12 from Phase 4 + 10 IQ/TQ/MXFP4 from Phase 4.5), bit-exact against the `gguf` Python reference (mirrors `llama.cpp`'s `ggml-quants.c`). **Next:** Phase 4.7 (remote-only NPZ inspection via reader-generic API, v0.4.3) → Phase 5 (Lethe — BnB encode + round-trip validation harness, v0.5.0).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -26,6 +26,7 @@
   - [Phase 4: GGUF Parsing & Dequantization](#phase-4-gguf-parsing--dequantization)
   - [Phase 4 patch: API polish + dogfooding (v0.4.1)](#phase-4-patch-api-polish--dogfooding-v041)
   - [Phase 4.5: GGUF Completeness](#phase-45-gguf-completeness)
+  - [Phase 4.7: Remote-only NPZ inspection (Reader-generic API)](#phase-47-remote-only-npz-inspection-reader-generic-api)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
   - [Phase 6.5: Benchmarking & Performance Validation](#phase-65-benchmarking--performance-validation)
@@ -344,6 +345,28 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 - **Big-endian GGUF v3 support** — the parser detects byte-swapped magic and returns `Unsupported`. A reader rewrite can reuse `parse::utils::byteswap_inplace` if demand ever materialises, but no mainstream model is distributed big-endian today. No committed target.
 - **CPU SIMD optimisation of pass 2** — cross-cutting optimisation that would benefit FP8, GPTQ, AWQ, and BnB equally, not just GGUF. See [Phase 9: CPU SIMD Pass](#phase-9-cpu-simd-pass).
+- **Remote-only NPZ inspection (HTTP-range probe)** — rehomed to its own scheduled milestone, [Phase 4.7](#phase-47-remote-only-npz-inspection-reader-generic-api), shipping in `v0.4.3` ahead of Phase 5.
+
+### Phase 4.7: Remote-only NPZ inspection (Reader-generic API)
+
+**Goal:** Eliminate the bandwidth cliff candle-mi v0.1.10 dogfooding (GemmaScope `open()` flow, 2026-04-30) hit when a 288 MiB layer-0 NPZ download was wasted just to read 16 bytes of `W_enc` shape metadata. Add a reader-generic `inspect_npz_from_reader<R: Read + Seek>` so callers can plug in any positional source — including an HTTP-range-backed adapter — without anamnesis itself taking on a network or TLS dependency. Cuts candle-mi's GemmaScope `open()` cold-start from ~30 s on a 100 Mbps link to <1 s. Call site reference: `candle-mi/src/clt/mod.rs::open_gemmascope` (TODO comment marks the spot).
+
+**Approach:** Lift the file-opening boilerplate out of the existing `inspect_npz(path)` and re-express it as a thin wrapper over a new `inspect_npz_from_reader<R: Read + Seek>(reader: R) -> Result<NpzInspectInfo>`. ZIP places its central directory at the end of the file and `zip::ZipArchive::new` already accepts any `R: Read + Seek`; the existing per-entry `parse_npy_header` flow translates verbatim — only the I/O substrate changes. Anamnesis stays HTTP-free; remote inspection is composed at the call site by feeding an HTTP-range-backed `Read + Seek` adapter (which `hf-fm` already implements for safetensors and can extend to NPZ). Architectural fit: this is the same "parse from reader" doctrine the rest of the crate already follows (`parse_npy_header(&mut impl Read)`, the safetensors header parser, the GGUF mmap reader) — the public API surface just hadn't been pushed up to the inspect layer yet.
+
+- [ ] **`inspect_npz_from_reader<R: Read + Seek>` public function** (`src/parse/npz.rs`) — accepts any `Read + Seek` source, returns `NpzInspectInfo` exactly as today. Refactor existing `inspect_npz(path)` into a 2-line wrapper that opens the file and delegates. No change to `NpzInspectInfo` / `NpzTensorInfo` / `NpzDtype` (already public from v0.3.0). ~30 LOC of refactor + the new public entry-point. Re-export from `lib.rs` alongside existing `inspect_npz` — **commit**
+- [ ] **In-memory cursor coverage test** (`src/parse/npz.rs`, `tests/`) — verify `inspect_npz_from_reader(Cursor::new(&npz_bytes))` matches `inspect_npz(path)` byte-for-byte on the existing Gemma Scope SAE fixture. Locks the contract that the path-based and reader-based APIs return identical `NpzInspectInfo` regardless of substrate — **commit**
+- [ ] **Range-read access pattern documentation** (`src/parse/npz.rs` rustdoc) — document the seek pattern an HTTP-range adapter should be able to satisfy efficiently: end-of-file scan for EOCD (~64 KiB), one read for the central directory (~few KiB for typical ML NPZ), one read per entry for the local file header + NPY header (~512 B each). Spells out for downstream adapter authors what shape of caching layer makes the implementation efficient (e.g., a single CD prefetch on first seek). No code, just rustdoc — **commit** — **PUSH + tag `v0.4.3`**
+
+**Deliverable:** `anamnesis` v0.4.3 — reader-generic NPZ inspection. candle-mi (and any other downstream consumer) can now inspect a remote NPZ archive without materialising the data segment by composing `inspect_npz_from_reader` with an HTTP-range-backed `Read + Seek` adapter. Backward compatible: the existing `inspect_npz(path)` entry-point is unchanged (now implemented as a 2-line wrapper). No new dependencies, no feature gate — the whole change is a public-API extension on the already-shipping `npz` feature. — **PUSH + tag `v0.4.3`**
+
+**New dependencies:** None. Reuses the existing `npz` feature gate, the existing `zip` v2 dep, and the existing `NpzInspectInfo` types.
+
+**Why reader-generic, not built-in HTTP:** A `npz-remote` feature with an embedded HTTP/TLS transport (e.g., `ureq` + rustls) was considered and rejected. Reasons: (a) anamnesis's dep tree is consciously lean — adding TLS would expand the audit surface and re-trigger the full publish dry-run gauntlet for a single download-orchestration concern; (b) HTTP belongs in `hf-fm`, which already range-reads safetensors and is the natural home for a `Read + Seek` HTTP adapter; (c) the reader-generic API has the additional payoff of in-memory `Cursor<&[u8]>` inspection, mirroring the in-memory path the v0.4.1 candle-mi dogfooding round opened on the `.pth` side. The HTTP convenience layer can land later in a dedicated crate or as an opt-in feature if multiple downstream users request it.
+
+**Explicitly out of scope:**
+
+- **Built-in HTTP transport** — see "Why reader-generic, not built-in HTTP" above. The HTTP-range-backed `Read + Seek` adapter lives in `hf-fm` (or any other downstream caller), not in anamnesis.
+- **Remote `parse_npz` (data-fetching variant)** — only `inspect_npz_from_reader` (metadata-only) is in scope. A reader-generic `parse_npz_from_reader` is a natural follow-up if a concrete downstream need arises, but the current dogfooding signal is exclusively about inspection (16 bytes of shape metadata), not data extraction.
 
 ### Phase 5: Quantization (Lethe)
 

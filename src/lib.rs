@@ -58,6 +58,11 @@
 //!   and write a standard `.safetensors` file
 //! - `parse_npz()` — read an `.npz` archive into a `HashMap<String, NpzTensor>`
 //!   (requires `npz` feature)
+//! - `inspect_npz()` / `inspect_npz_from_reader()` — header-only `NPZ`
+//!   inspection. The reader-generic variant accepts any `Read + Seek`
+//!   substrate (in-memory `Cursor`, HTTP-range-backed adapter, …) so callers
+//!   can extract tensor metadata without materialising the data segment
+//!   (requires `npz` feature)
 //! - `parse_pth()` — parse a `PyTorch` `.pth` file into a `ParsedPth`
 //!   with zero-copy `tensors()` (requires `pth` feature)
 //! - `pth_to_safetensors()` — lossless `.pth` → `.safetensors` conversion
@@ -88,7 +93,10 @@ pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "npz")]
-pub use parse::{inspect_npz, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo};
+pub use parse::{
+    inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor,
+    NpzTensorInfo,
+};
 #[cfg(feature = "gguf")]
 pub use parse::{
     parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo,

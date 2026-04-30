@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`inspect_npz_from_reader<R: Read + Seek>`** — reader-generic `NPZ`
+  inspection. Accepts any `Read + Seek` substrate (in-memory `Cursor`,
+  HTTP-range-backed adapter, custom transport) and returns the same
+  `NpzInspectInfo` as the existing path-based `inspect_npz`. The legacy
+  `inspect_npz(path)` entry point is now a two-line wrapper that opens a
+  `std::fs::File` and delegates here — fully backward-compatible. Unblocks
+  remote `NPZ` inspection without materialising the data segment: a
+  downstream HTTP-range adapter (e.g., `hf-fm`'s safetensors range-reader
+  extended to `NPZ`) can satisfy this function in ~7 small range requests
+  totalling well under 100 KiB on a typical Gemma Scope `params.npz` —
+  cutting candle-mi's GemmaScope `open()` cold-start from ~30 s on a
+  100 Mbps link to <1 s. Anamnesis itself takes on no network or TLS
+  dependency. Phase 4.7 (v0.4.3); see [`ROADMAP.md`](ROADMAP.md).
+- **3 new `NPZ` unit tests** covering the reader-generic path:
+  `inspect_from_reader_matches_path` (substrate-equivalence on a
+  multi-array in-memory archive), `inspect_from_reader_empty_archive`,
+  and `inspect_from_reader_rejects_fortran_order` — confirming the
+  refactor preserves every guard. Plus a new `cross_validation_npz`
+  integration test (`inspect_path_and_reader_agree_on_gemma_scope_fixture`)
+  asserting field-for-field parity between `inspect_npz` and
+  `inspect_npz_from_reader` on the real Gemma Scope SAE fixture.
+
 ### Changed
 
+- **`ROADMAP.md`** — inserted Phase 4.7 (Remote-only NPZ inspection,
+  Reader-generic API, v0.4.3) between Phase 4.5 and Phase 5. Updated
+  status header `Next:` pointer (Phase 4.7 → Phase 5), added the new
+  section to the TOC, and rehomed the "Remote-only NPZ inspection
+  (HTTP-range probe)" out-of-scope bullet from Phase 4.5 to a one-line
+  pointer at its now-scheduled milestone.
 - **`ROADMAP.md`** — added Phase 7.5 (Lethe Encode Completion, v0.7.5) and applied a consistency pass: refreshed header status (Phases 1–4.5 / v0.4.2 / next Phase 5), added Phase 7.5 + Phase 10 to the TOC, populated the `lethe/` module box, scoped Phase 6 / Phase 7 claims to actual v0.6.0 / v0.7.0 reality (BnB-only encode at v0.6.0, full encode matrix at v0.7.5), corrected the "v0.4.0 BnB decode kernels" reference in Phase 5 step 1, removed the v0.4.2 "awaiting user review" note now that the tag has shipped, and added a Phase 9 follow-up note covering Phase 5/7.5 encode-side pass-2 loops.
 
 ## [0.4.2] - 2026-04-25

@@ -25,7 +25,10 @@ pub use gguf::{
     GgufType, ParsedGguf,
 };
 #[cfg(feature = "npz")]
-pub use npz::{inspect_npz, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo};
+pub use npz::{
+    inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor,
+    NpzTensorInfo,
+};
 #[cfg(feature = "pth")]
 pub use pth::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
 pub use safetensors::{

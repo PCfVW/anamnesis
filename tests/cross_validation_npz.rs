@@ -21,7 +21,7 @@
 
 use std::time::Instant;
 
-use anamnesis::{parse_npz, NpzDtype};
+use anamnesis::{inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype};
 
 // ---------------------------------------------------------------------------
 // Reference fixture parsing
@@ -206,6 +206,56 @@ fn cross_validate_gemma_scope_sae() {
             tensor.shape,
             tensor.dtype,
             tensor.data.len()
+        );
+    }
+}
+
+/// Phase 4.7 substrate-equivalence: `inspect_npz_from_reader` over the same
+/// archive bytes loaded into memory must return an `NpzInspectInfo` that is
+/// field-for-field identical to `inspect_npz` over the file on disk. This is
+/// the behavioural contract HTTP-range adapters depend on — the substrate
+/// (file vs. cursor vs. range-backed adapter) must not change the metadata.
+#[test]
+fn inspect_path_and_reader_agree_on_gemma_scope_fixture() {
+    let fixture_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/npz_reference/gemma_scope_small.npz"
+    );
+
+    let path_info = inspect_npz(fixture_path).expect("inspect_npz failed");
+
+    let bytes = std::fs::read(fixture_path).expect("read fixture failed");
+    let reader_info = inspect_npz_from_reader(std::io::Cursor::new(&bytes))
+        .expect("inspect_npz_from_reader failed");
+
+    eprintln!(
+        "Gemma Scope SAE inspect parity: {} arrays, {} bytes total",
+        reader_info.tensors.len(),
+        reader_info.total_bytes
+    );
+
+    assert_eq!(
+        path_info.tensors.len(),
+        reader_info.tensors.len(),
+        "tensor count mismatch between path-based and reader-based inspect"
+    );
+    assert_eq!(
+        path_info.total_bytes, reader_info.total_bytes,
+        "total_bytes mismatch between path-based and reader-based inspect"
+    );
+    assert_eq!(
+        path_info.dtypes, reader_info.dtypes,
+        "dtypes vec mismatch between path-based and reader-based inspect"
+    );
+
+    for (a, b) in path_info.tensors.iter().zip(reader_info.tensors.iter()) {
+        assert_eq!(a.name, b.name, "tensor name mismatch");
+        assert_eq!(a.shape, b.shape, "shape mismatch for tensor '{}'", a.name);
+        assert_eq!(a.dtype, b.dtype, "dtype mismatch for tensor '{}'", a.name);
+        assert_eq!(
+            a.byte_len, b.byte_len,
+            "byte_len mismatch for tensor '{}'",
+            a.name
         );
     }
 }

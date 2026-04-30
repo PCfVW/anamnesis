@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
@@ -526,12 +526,18 @@ impl fmt::Display for NpzInspectInfo {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Inspects an `NPZ` archive, returning metadata for all arrays without
-/// reading tensor data.
+/// Inspects an `NPZ` archive on disk, returning metadata for all arrays
+/// without reading tensor data.
 ///
 /// Reads only `NPY` headers (~128 bytes per array) — no bulk data
 /// extraction. For a 300 MB file this uses kilobytes of memory instead
 /// of 300 MB.
+///
+/// This is a thin convenience wrapper that opens `path` as a [`std::fs::File`]
+/// and delegates to [`inspect_npz_from_reader`]. Callers that need to inspect
+/// an `NPZ` from any other `Read + Seek` substrate (in-memory `Cursor`,
+/// HTTP-range-backed adapter, custom transport) should call
+/// [`inspect_npz_from_reader`] directly.
 ///
 /// # Errors
 ///
@@ -555,7 +561,75 @@ impl fmt::Display for NpzInspectInfo {
 /// extraction, while `parse_npz` must validate before allocating buffers.
 pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
     let file = std::fs::File::open(path.as_ref())?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    inspect_npz_from_reader(file)
+}
+
+/// Inspects an `NPZ` archive from any `Read + Seek` source, returning
+/// metadata for all arrays without reading tensor data.
+///
+/// This is the reader-generic core of [`inspect_npz`]: the path-based
+/// variant is a two-line wrapper that opens a file and delegates here. By
+/// accepting any `Read + Seek` substrate, callers can supply alternative
+/// I/O backings — in-memory cursors (`std::io::Cursor`), shared-buffer
+/// adapters, or HTTP-range-backed transports that lazily fetch only the
+/// bytes they need.
+///
+/// # Range-read access pattern
+///
+/// `NPZ` is a `ZIP` archive whose central directory lives at the *end* of
+/// the file. An HTTP-range-backed adapter typically only needs three
+/// logical fetches to satisfy this function:
+///
+/// 1. **End-of-file scan for the EOCD record** (~64 KiB worst case) — the
+///    `zip` crate seeks to the file's end and scans backwards for the
+///    end-of-central-directory signature.
+/// 2. **One read for the central directory** (a few KiB for typical ML
+///    `NPZ` archives, since each `STORE`d entry produces one fixed-size
+///    record plus its UTF-8 name) — the `zip` crate seeks to the offset
+///    recorded in the EOCD and reads the full directory.
+/// 3. **One read per entry for the local file header + `NPY` header**
+///    (~512 B per `.npy` entry) — for each entry, the `zip` crate seeks
+///    to the local file header offset, then this function reads the
+///    `NPY` preamble + dict header (~128 B in practice).
+///
+/// A naive adapter that issues one HTTP range request per `read`/`seek`
+/// call will still work but may be inefficient. Adapters that prefetch
+/// and cache the EOCD region and the central directory on first access
+/// amortise the round trips effectively to two HTTP requests plus one
+/// per entry. For a typical 5-array Gemma Scope `params.npz`, that is
+/// ~7 small range requests covering well under 100 KiB instead of the
+/// full ~300 MiB download.
+///
+/// Anamnesis does not ship an HTTP transport itself — the network layer
+/// belongs in downstream crates (e.g., `hf-fm`'s safetensors range-reader
+/// extended to `NPZ`). This function defines the I/O contract such an
+/// adapter must satisfy.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
+/// reader fails.
+///
+/// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed or
+/// an `NPY` header is invalid.
+///
+/// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
+/// or an unsupported dtype.
+///
+/// # Memory
+///
+/// Allocates only per-tensor metadata (name, shape, dtype). No tensor
+/// data is read or allocated. Peak memory is proportional to the number
+/// of entries (a few hundred bytes per tensor plus the transient `NPY`
+/// header buffer during parsing), independent of the archive's
+/// data-segment size.
+///
+/// **Saturation note:** if a shape's element count overflows `usize`,
+/// `byte_len` saturates to `usize::MAX` and `total_bytes` saturates to
+/// `u64::MAX`. Behaviour matches [`inspect_npz`] and differs from
+/// `parse_npz`, which returns `Err` on the same overflow.
+pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzInspectInfo> {
+    let mut archive = zip::ZipArchive::new(reader)?;
 
     let mut tensors = Vec::with_capacity(archive.len());
     let mut total_bytes: u64 = 0;
@@ -1100,5 +1174,121 @@ mod tests {
         // Element count overflows → unwrap_or(usize::MAX) → saturating_mul
         // The byte_len should be usize::MAX (saturated)
         assert_eq!(info.tensors[0].byte_len, usize::MAX);
+    }
+
+    // -- Phase 4.7: reader-generic inspection --------------------------------
+
+    /// Build a minimal in-memory NPZ archive containing a single STORED .npy
+    /// entry with the given header and (zero-filled) data bytes. Returns the
+    /// raw archive bytes — callers can wrap them in a Cursor to test the
+    /// reader-generic API.
+    fn make_in_memory_npz(arr_name: &str, header_str: &str, data: &[u8]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let entry_name = format!("{arr_name}.npy");
+            zip.start_file(&entry_name, options).unwrap();
+            let npy = make_npy_v1(header_str, data);
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// `inspect_npz_from_reader` over an in-memory `Cursor` returns the same
+    /// `NpzInspectInfo` as `inspect_npz` over the same archive on disk.
+    /// Locks the contract that the reader-generic and path-based APIs are
+    /// substrate-equivalent — the substrate (file vs. cursor) cannot change
+    /// the metadata. This is what downstream HTTP-range adapters rely on.
+    #[test]
+    fn inspect_from_reader_matches_path() {
+        // Build a multi-array NPZ in memory: one F32 [2, 3] and one I64 [4].
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            // Array 1: F32 [2, 3] = 24 bytes
+            zip.start_file("weights.npy", options).unwrap();
+            let npy1 = make_npy_v1(
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }",
+                &[0u8; 24],
+            );
+            zip.write_all(&npy1).unwrap();
+
+            // Array 2: I64 [4] = 32 bytes
+            zip.start_file("indices.npy", options).unwrap();
+            let npy2 = make_npy_v1(
+                "{'descr': '<i8', 'fortran_order': False, 'shape': (4,), }",
+                &[0u8; 32],
+            );
+            zip.write_all(&npy2).unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        // Write the same bytes to a temp file for the path-based comparison.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &buf).unwrap();
+
+        let path_info = inspect_npz(tmp.path()).unwrap();
+        let reader_info = inspect_npz_from_reader(std::io::Cursor::new(&buf)).unwrap();
+
+        // Substrate-equivalence: every field of NpzInspectInfo matches.
+        assert_eq!(path_info.tensors.len(), reader_info.tensors.len());
+        assert_eq!(path_info.total_bytes, reader_info.total_bytes);
+        assert_eq!(path_info.dtypes, reader_info.dtypes);
+        for (a, b) in path_info.tensors.iter().zip(reader_info.tensors.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.shape, b.shape);
+            assert_eq!(a.dtype, b.dtype);
+            assert_eq!(a.byte_len, b.byte_len);
+        }
+
+        // And spot-check the actual values to make sure we are not just
+        // comparing two equal-but-wrong outputs.
+        assert_eq!(reader_info.tensors.len(), 2);
+        assert_eq!(reader_info.total_bytes, 24 + 32);
+    }
+
+    /// `inspect_npz_from_reader` returns `Ok` with no entries when handed a
+    /// well-formed empty ZIP archive (i.e., the archive parses but contains
+    /// no `.npy` payloads). Mirrors the existing `empty_npz_archive` test
+    /// for the path-based variant.
+    #[test]
+    fn inspect_from_reader_empty_archive() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let zip = zip::ZipWriter::new(cursor);
+            zip.finish().unwrap();
+        }
+        let info = inspect_npz_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        assert!(info.tensors.is_empty());
+        assert_eq!(info.total_bytes, 0);
+        assert!(info.dtypes.is_empty());
+    }
+
+    /// `inspect_npz_from_reader` propagates Fortran-order rejection through
+    /// the same code path as `inspect_npz`. Confirms the refactor did not
+    /// silently lose the unsupported-format guard.
+    #[test]
+    fn inspect_from_reader_rejects_fortran_order() {
+        let buf = make_in_memory_npz(
+            "arr",
+            "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 2), }",
+            &[0u8; 16],
+        );
+        let err = inspect_npz_from_reader(std::io::Cursor::new(&buf)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Fortran-order") || msg.contains("fortran"),
+            "expected Fortran-order error, got: {msg}"
+        );
     }
 }

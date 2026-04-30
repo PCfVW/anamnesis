@@ -166,6 +166,8 @@ Feature-gated behind `npz`. Custom NPY header parser with bulk `read_exact` — 
 
 BF16 support via JAX `V2` void-dtype convention. Big-endian NPY files handled with in-place byte-swap.
 
+Header-only inspection ships in two forms: `inspect_npz(path)` for files on disk and `inspect_npz_from_reader<R: Read + Seek>(reader)` for any other substrate (in-memory `Cursor`, HTTP-range-backed adapter, custom transport). Anamnesis itself takes on no network or TLS dependency — downstream crates plug in their own `Read + Seek` adapter when remote inspection is needed. See the rustdoc on `inspect_npz_from_reader` for the access pattern an HTTP-range adapter must satisfy.
+
 ### PyTorch `.pth` Parsing
 
 Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with security allowlist. Memory-mapped I/O with zero-copy tensor access (`Cow::Borrowed` from mmap). Cross-validated byte-exact against PyTorch `torch.load()` on 3 [AlgZoo](https://github.com/alignment-research-center/alg-zoo) models (MIT-0 license).
