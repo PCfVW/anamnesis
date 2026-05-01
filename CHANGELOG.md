@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`TensorEntry::num_elements` overflow saturation** — replaced the
+  unguarded `shape.iter().product()` with `try_fold(checked_mul)`
+  saturating to `usize::MAX`, matching the contract `inspect_npz`
+  already documents. On a malformed or adversarial header that
+  declares a shape whose element count overflows `usize` (e.g.,
+  `[u32::MAX, 2]` on a 32-bit target), the previous implementation
+  would silently wrap to a small value, after which downstream
+  validation could accept a tiny data slice as if it described the
+  full tensor. Public-API contract is unchanged: still
+  `pub fn num_elements(&self) -> usize`. **3 new unit tests** cover
+  the saturation, the exact path on normal shapes, and the empty-shape
+  scalar case (product is 1, not 0). Identified by the v0.4.x
+  algorithmic-weakness audit (finding #12 of 12).
+- **GGUF CLI `remember` `n_elements` overflow guard** — the
+  `tensor.shape.iter().product()` in `src/bin/main.rs` now uses
+  `try_fold(checked_mul)` returning `AnamnesisError::Parse` on
+  overflow, naming the offending tensor and shape. Previously a
+  malformed GGUF tensor entry could silently wrap `n_elements` to a
+  small value and dequantize a fraction of the data with no error.
+  No public-API surface (CLI binary only).
+
 ### Added
 
 - **`inspect_npz_from_reader<R: Read + Seek>`** — reader-generic `NPZ`

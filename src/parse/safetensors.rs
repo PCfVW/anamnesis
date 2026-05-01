@@ -506,9 +506,18 @@ pub struct TensorEntry {
 
 impl TensorEntry {
     /// Returns the total number of elements in the tensor.
+    ///
+    /// Saturates to `usize::MAX` if the shape's element count overflows
+    /// `usize` (e.g., a malformed or adversarial header that declares
+    /// `[u32::MAX, 2]` on a 32-bit target). Matches the saturating
+    /// behaviour of `inspect_npz` and prevents the silent wraparound
+    /// that an unguarded `shape.iter().product()` would produce.
     #[must_use]
     pub fn num_elements(&self) -> usize {
-        self.shape.iter().product()
+        self.shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .unwrap_or(usize::MAX)
     }
 
     /// Returns the byte length of the tensor's data (`end - start` offset).
@@ -1090,6 +1099,56 @@ mod tests {
             data_offsets: (0, byte_len),
             role,
         }
+    }
+
+    /// `TensorEntry::num_elements` saturates to `usize::MAX` rather than
+    /// silently wrapping when a malformed or adversarial header declares
+    /// a shape whose element count overflows `usize`. Mirrors the
+    /// saturating contract `inspect_npz` already provides.
+    #[test]
+    fn num_elements_saturates_on_overflow() {
+        // Shape that overflows on every supported target:
+        //   on 64-bit usize, [usize::MAX, 2] overflows on the first multiply
+        //   on 32-bit usize, the same shape overflows even faster
+        let entry = TensorEntry {
+            name: "huge".to_owned(),
+            dtype: Dtype::F32,
+            shape: vec![usize::MAX, 2],
+            data_offsets: (0, 0),
+            role: TensorRole::Passthrough,
+        };
+        assert_eq!(entry.num_elements(), usize::MAX);
+    }
+
+    /// `num_elements` on a normal shape returns the exact product, not
+    /// the saturated value. Guards against an over-eager fix that would
+    /// have saturated even on legitimate shapes.
+    #[test]
+    fn num_elements_exact_on_normal_shape() {
+        let entry = TensorEntry {
+            name: "normal".to_owned(),
+            dtype: Dtype::F32,
+            shape: vec![16, 4096, 2048],
+            data_offsets: (0, 0),
+            role: TensorRole::Passthrough,
+        };
+        assert_eq!(entry.num_elements(), 16 * 4096 * 2048);
+    }
+
+    /// Empty shape → the empty product, which is `1` (single scalar).
+    /// This matches the `shape.iter().product()` contract on the empty
+    /// iterator and prevents the saturating fix from inadvertently
+    /// returning `0` for scalars.
+    #[test]
+    fn num_elements_empty_shape_is_one() {
+        let entry = TensorEntry {
+            name: "scalar".to_owned(),
+            dtype: Dtype::F32,
+            shape: vec![],
+            data_offsets: (0, 0),
+            role: TensorRole::Passthrough,
+        };
+        assert_eq!(entry.num_elements(), 1);
     }
 
     #[test]

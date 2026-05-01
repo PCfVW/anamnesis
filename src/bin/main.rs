@@ -636,7 +636,16 @@ fn run_remember_gguf(
         shape.reverse();
 
         if tensor.dtype.is_quantized() {
-            let n_elements: usize = tensor.shape.iter().product();
+            let n_elements: usize = tensor
+                .shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| anamnesis::AnamnesisError::Parse {
+                    reason: format!(
+                        "GGUF tensor `{}` shape {:?} element count overflows usize",
+                        tensor.name, tensor.shape
+                    ),
+                })?;
             let bf16_data =
                 anamnesis::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
             tensor_data.push((
