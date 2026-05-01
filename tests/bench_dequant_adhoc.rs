@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Ad-hoc benchmarks for the dequantization kernels.
+//!
+//! Not part of CI — gated `#[ignore]`. Run with:
+//!
+//! ```text
+//! cargo test --release --features gguf --test bench_dequant_adhoc \
+//!     -- --nocapture --ignored
+//! ```
+//!
+//! The synthetic fixtures use byte patterns that exercise the dequant
+//! pipelines at realistic layer sizes; actual byte values do not affect
+//! timing because the kernels have no data-dependent branches.
+//!
+//! ## What the GGUF benches measure
+//!
+//! `bench_gguf_q8_0` and `bench_gguf_q4_0` run the same kernel logic two
+//! ways and compare:
+//!
+//! - **NEW** (current `dequantize_gguf_to_bf16`) — `Vec::with_capacity` +
+//!   per-block `extend_from_slice`, the v0.4.0 refactor pattern.
+//! - **OLD** (`dequantize_via_indexed_sink`) — bench-local replay of the
+//!   pre-refactor pattern: pre-allocate `vec![0u8; out_byte_len]`, drive
+//!   the public streaming API `dequantize_gguf_blocks_to_bf16` with a
+//!   sink that tracks an offset and writes via indexed slice.
+//!
+//! Both call the SAME underlying scalar kernels via the same public
+//! streaming API; only the output-buffer strategy differs. This is the
+//! cleanest possible side-by-side test of the v0.4.0 CHANGELOG claim
+//! that `Vec::with_capacity` + `extend_from_slice` saves ~10–15 % over
+//! `vec![0u8; n]`.
+
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing
+)]
+
+use std::time::Instant;
+
+use anamnesis::dequantize_per_tensor_fp8_to_bf16;
+#[cfg(feature = "gguf")]
+use anamnesis::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16, GgufType};
+
+/// Median + range of an ascending-sorted `&[f64]`, formatted for stderr.
+fn fmt_stats(samples: &[f64]) -> String {
+    let median = samples[samples.len() / 2];
+    let min = samples[0];
+    let max = samples[samples.len() - 1];
+    format!("median {median:.2} ms (min {min:.2}, max {max:.2})")
+}
+
+/// Best-of-5 timing helper. Calls `f()` 5 times after a 2-iteration
+/// warmup, returning the sorted millisecond samples. The closure
+/// returns a "live" byte to defeat dead-code elimination in the
+/// optimiser.
+fn time_best_of_5<F>(mut f: F) -> Vec<f64>
+where
+    F: FnMut() -> u8,
+{
+    // Warmup
+    let _ = f();
+    let _ = f();
+
+    let mut samples: Vec<f64> = Vec::with_capacity(5);
+    let mut anti_dce: u64 = 0;
+    for _ in 0..5 {
+        let start = Instant::now();
+        anti_dce = anti_dce.wrapping_add(u64::from(f()));
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        samples.push(ms);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    eprintln!("(anti-DCE accumulator: {anti_dce})");
+    samples
+}
+
+// ---------------------------------------------------------------------------
+// FP8 per-tensor (always-on)
+// ---------------------------------------------------------------------------
+
+/// Best-of-5 release-mode median for `dequantize_per_tensor_fp8_to_bf16`
+/// on a 4096 × 11008 layer (~45M FP8 elements, ~90 MB FP8 input,
+/// ~180 MB BF16 output). Sized like a real Llama-class FFN layer.
+#[test]
+#[ignore = "ad-hoc benchmark; run with --release --ignored --nocapture"]
+fn bench_fp8_per_tensor() {
+    const ROWS: usize = 4096;
+    const COLS: usize = 11008;
+    const N: usize = ROWS * COLS;
+    let weight: Vec<u8> = (0..N)
+        .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+        .collect();
+    let scale: f32 = 0.5;
+
+    eprintln!(
+        "\n=== bench_fp8_per_tensor ({ROWS} × {COLS} = {} elements, {} MB → {} MB BF16) ===",
+        N,
+        N / 1_000_000,
+        (N * 2) / 1_000_000,
+    );
+
+    let samples = time_best_of_5(|| {
+        let out = dequantize_per_tensor_fp8_to_bf16(&weight, scale).unwrap();
+        out[out.len() - 1]
+    });
+
+    eprintln!("samples (ms): {samples:?}");
+    eprintln!("{}", fmt_stats(&samples));
+    eprintln!(
+        "throughput: {:.0} MB/s (BF16 output)",
+        ((N * 2) as f64 / 1_000_000.0) / (samples[2] / 1000.0)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GGUF: NEW (Vec::with_capacity + extend_from_slice) vs OLD
+// (vec![0u8; n] + sink-with-offset)
+// ---------------------------------------------------------------------------
+
+/// Bench-local replay of the pre-v0.4.0-refactor pattern: pre-allocate a
+/// zero-initialised `Vec<u8>` of the exact output size and have the
+/// streaming API write into it via indexed `copy_from_slice` with an
+/// offset cursor. Same kernel logic as `dequantize_gguf_to_bf16`, only
+/// the output-buffer strategy differs.
+#[cfg(feature = "gguf")]
+fn dequantize_via_indexed_sink(
+    data: &[u8],
+    dtype: GgufType,
+    n_elements: usize,
+) -> anamnesis::Result<Vec<u8>> {
+    let out_byte_len = n_elements
+        .checked_mul(2)
+        .expect("output size overflow in bench fixture");
+    let mut out = vec![0u8; out_byte_len];
+    let mut offset = 0usize;
+    dequantize_gguf_blocks_to_bf16(data, dtype, n_elements, |block_out| {
+        out[offset..offset + block_out.len()].copy_from_slice(block_out);
+        offset += block_out.len();
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Synthesizes `n_blocks` of `Q8_0`-formatted bytes (34 bytes per
+/// 32-element block: `f16 d` + `i8 qs[32]`). Byte values are arbitrary
+/// — the kernel has no data-dependent branches, so timing is identical
+/// to a real model's bytes. Using a non-zero `d` ensures the runtime
+/// `d × qs[j]` multiplications are not optimised away.
+#[cfg(feature = "gguf")]
+fn build_q8_0_buffer(n_blocks: usize) -> Vec<u8> {
+    const BLOCK_BYTES: usize = 34;
+    let mut buf = vec![0u8; n_blocks * BLOCK_BYTES];
+    // Set d = f16(1.0) = 0x3C00 in every block (stored LE in bytes 0..2).
+    // Keep qs[32] = 0..0 (irrelevant for timing).
+    for block in buf.chunks_exact_mut(BLOCK_BYTES) {
+        block[0] = 0x00;
+        block[1] = 0x3C;
+    }
+    buf
+}
+
+/// Synthesizes `n_blocks` of `Q4_0`-formatted bytes (18 bytes per
+/// 32-element block: `f16 d` + 16 bytes of packed nibbles).
+#[cfg(feature = "gguf")]
+fn build_q4_0_buffer(n_blocks: usize) -> Vec<u8> {
+    const BLOCK_BYTES: usize = 18;
+    let mut buf = vec![0u8; n_blocks * BLOCK_BYTES];
+    for block in buf.chunks_exact_mut(BLOCK_BYTES) {
+        block[0] = 0x00;
+        block[1] = 0x3C;
+    }
+    buf
+}
+
+/// Runs the NEW vs OLD comparison for a single `(dtype, n_elements)`
+/// configuration and prints a one-line result row. Returns the signed
+/// percent delta of NEW vs OLD median.
+#[cfg(feature = "gguf")]
+fn run_gguf_one(label: &str, data: &[u8], dtype: GgufType, n_elements: usize) -> f64 {
+    let samples_new = time_best_of_5(|| {
+        let out = dequantize_gguf_to_bf16(data, dtype, n_elements).unwrap();
+        out[out.len() - 1]
+    });
+    let samples_old = time_best_of_5(|| {
+        let out = dequantize_via_indexed_sink(data, dtype, n_elements).unwrap();
+        out[out.len() - 1]
+    });
+
+    let median_new = samples_new[2];
+    let median_old = samples_old[2];
+    let delta_pct = (median_new - median_old) / median_old * 100.0;
+    eprintln!(
+        "{label:<20}  NEW {median_new:>7.2} ms (range {:.2}-{:.2})  \
+         OLD {median_old:>7.2} ms (range {:.2}-{:.2})  Δ {delta_pct:+.1}%",
+        samples_new[0], samples_new[4], samples_old[0], samples_old[4],
+    );
+    delta_pct
+}
+
+/// Sweeps `dequantize_gguf_to_bf16` (NEW) vs the `vec![0u8; n]`
+/// indexed-sink alternative (OLD) across four output sizes spanning the
+/// L3-resident → deeply-DRAM-bound regime, on both `Q8_0` and `Q4_0`.
+///
+/// Sizes (output BF16 bytes):
+/// - **2 MB** (1M elements) — output fits comfortably in L3 on most CPUs.
+/// - **16 MB** (8M elements) — output spills to DRAM on smaller L3 caches.
+/// - **90 MB** (45M elements) — original single-size measurement (Llama FFN scale).
+/// - **200 MB** (100M elements) — solidly DRAM-bound, tests memory-pressure regime.
+///
+/// If the directional finding (`Q8_0` NEW slower / `Q4_0` NEW faster) is
+/// real, it should hold across all four sizes. If it flips at some
+/// size, the bottleneck is cache-resident vs DRAM-bound and the
+/// measurement at any single size was misleading.
+#[cfg(feature = "gguf")]
+#[test]
+#[ignore = "ad-hoc benchmark; run with --release --features gguf --ignored --nocapture"]
+fn bench_gguf_size_sweep() {
+    // (label, n_elements). Each must be a multiple of 32 (Q4_0/Q8_0 block size).
+    const SIZES: &[(&str, usize)] = &[
+        ("1M (2 MB BF16)", 1_048_576),
+        ("8M (16 MB BF16)", 8 * 1_048_576),
+        ("45M (90 MB BF16)", 4096 * 11008),
+        ("100M (200 MB BF16)", 100 * 1_048_576),
+    ];
+
+    eprintln!(
+        "\n=== bench_gguf_size_sweep — NEW (current Vec::with_capacity + extend_from_slice) \
+         vs OLD (vec![0u8; n] + indexed sink) ===\n"
+    );
+
+    eprintln!("--- Q8_0 ---");
+    let mut q8_deltas: Vec<f64> = Vec::with_capacity(SIZES.len());
+    for &(label, n) in SIZES {
+        let data = build_q8_0_buffer(n / 32);
+        let delta = run_gguf_one(label, &data, GgufType::Q8_0, n);
+        q8_deltas.push(delta);
+    }
+
+    eprintln!("\n--- Q4_0 ---");
+    let mut q4_deltas: Vec<f64> = Vec::with_capacity(SIZES.len());
+    for &(label, n) in SIZES {
+        let data = build_q4_0_buffer(n / 32);
+        let delta = run_gguf_one(label, &data, GgufType::Q4_0, n);
+        q4_deltas.push(delta);
+    }
+
+    eprintln!(
+        "\n--- Summary: NEW vs OLD median deltas across sizes ---\n\
+         Q8_0 deltas: {q8_deltas:+.1?}\n\
+         Q4_0 deltas: {q4_deltas:+.1?}"
+    );
+    eprintln!(
+        "\nDirectional finding holds if all Q8_0 deltas have the same \
+         sign and all Q4_0 deltas have the same (opposite) sign."
+    );
+}

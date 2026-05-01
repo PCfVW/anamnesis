@@ -25,6 +25,8 @@ If a commit claims a perf win (faster, less memory, fewer allocations, fewer bra
 
 This rule applies to perf-claim commits only. Correctness fixes, refactors, doc changes, and feature additions do not need a measurement to ship.
 
+Before proposing a perf-claim change, **read [`docs/perf-experiments.md`](docs/perf-experiments.md)** — it catalogs hypotheses already tested and their measured outcomes (some confirmed, some rejected, some contradicting their original CHANGELOG claims). This avoids re-litigating the same ideas. When an experiment is shipped or attempted, add a row to that file's index plus a section with method + numbers, even if the result is "no change" or a regression.
+
 ## Release Checklist
 
 Before tagging a release (`v*`), complete these steps in order:
