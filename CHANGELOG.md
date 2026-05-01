@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-05-01
+
+### Added
+
+- **`inspect_npz_from_reader<R: Read + Seek>`** — reader-generic `NPZ`
+  inspection. Accepts any `Read + Seek` substrate (in-memory `Cursor`,
+  HTTP-range-backed adapter, custom transport) and returns the same
+  `NpzInspectInfo` as the existing path-based `inspect_npz`. The legacy
+  `inspect_npz(path)` entry point is now a two-line wrapper that opens a
+  `std::fs::File` and delegates here — fully backward-compatible. Unblocks
+  remote `NPZ` inspection without materialising the data segment: a
+  downstream HTTP-range adapter (e.g., `hf-fm`'s safetensors range-reader
+  extended to `NPZ`) can satisfy this function in ~7 small range requests
+  totalling well under 100 KiB on a typical Gemma Scope `params.npz` —
+  cutting candle-mi's GemmaScope `open()` cold-start from ~30 s on a
+  100 Mbps link to <1 s. Anamnesis itself takes on no network or TLS
+  dependency. Phase 4.7; see [`ROADMAP.md`](ROADMAP.md).
+- **3 new `NPZ` unit tests** covering the reader-generic path:
+  `inspect_from_reader_matches_path` (substrate-equivalence on a
+  multi-array in-memory archive), `inspect_from_reader_empty_archive`,
+  and `inspect_from_reader_rejects_fortran_order` — confirming the
+  refactor preserves every guard. Plus a new `cross_validation_npz`
+  integration test (`inspect_path_and_reader_agree_on_gemma_scope_fixture`)
+  asserting field-for-field parity between `inspect_npz` and
+  `inspect_npz_from_reader` on the real Gemma Scope SAE fixture.
+
 ### Changed
 
 - **`parse()` now memory-maps the safetensors file** instead of reading
@@ -35,6 +61,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pth` and `gguf`). The `pth` and `gguf` features no longer reference
   `memmap2` in their feature lists. The `pth` feature now activates
   only `dep:zip`; `gguf` activates nothing extra.
+- **Rustdoc refresh post-mmap** — module-level docs and `ParsedModel`
+  / `parse()` / `tensor_data` / `remember()` rustdoc updated to
+  reflect the mmap-based parse path. The `remember()` `# Memory`
+  section now correctly states peak heap is
+  `O(total_dequantised_output_size)` ≈ `2 × n_parameters` bytes (the
+  input file is mmap-backed and does not contribute to heap), matching
+  the README's framing.
+- **`ROADMAP.md`** — inserted Phase 4.7 (Remote-only NPZ inspection,
+  Reader-generic API) between Phase 4.5 and Phase 5; status header
+  `Next:` pointer updated; the "Remote-only NPZ inspection
+  (HTTP-range probe)" out-of-scope bullet from Phase 4.5 rehomed as a
+  one-line pointer to its now-scheduled milestone. Phase 4.7's three
+  implementation steps marked complete with commit hash citation.
+- **`ROADMAP.md`** — added Phase 7.5 (Lethe Encode Completion, v0.7.5)
+  and applied a consistency pass: refreshed header status, added
+  Phase 7.5 + Phase 10 to the TOC, populated the `lethe/` module box,
+  scoped Phase 6 / Phase 7 claims to actual v0.6.0 / v0.7.0 reality
+  (BnB-only encode at v0.6.0, full encode matrix at v0.7.5), corrected
+  the "v0.4.0 BnB decode kernels" reference in Phase 5 step 1, removed
+  the v0.4.2 "awaiting user review" note now that the tag has shipped,
+  and added a Phase 9 follow-up note covering Phase 5/7.5 encode-side
+  pass-2 loops.
+- **Performance-discipline infrastructure** — new `Performance Changes`
+  section in [`CLAUDE.md`](CLAUDE.md) requires any perf-claim commit to
+  ship a measurement (best-of-5 release-mode median on a real fixture,
+  before/after numbers in the commit message). New
+  [`docs/perf-experiments.md`](docs/perf-experiments.md) catalogues
+  hypotheses tested — the v0.4.3 cycle's revert experiences (NPZ memset
+  elimination measured −33 % regression; FP8 per-tensor chunked extend
+  measured −23 % regression; v0.4.0 GGUF refactor re-validation
+  surfacing a Q4_0 ~8 % win and a Q8_0 ~6 % regression that the
+  original CHANGELOG had described as a uniform 10–15 % win). New
+  ad-hoc bench harnesses
+  [`tests/bench_dequant_adhoc.rs`](tests/bench_dequant_adhoc.rs) and
+  [`tests/bench_parse_adhoc.rs`](tests/bench_parse_adhoc.rs)
+  (both `#[ignore]`-gated) provide the measurement substrate.
 
 ### Fixed
 
@@ -58,40 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed GGUF tensor entry could silently wrap `n_elements` to a
   small value and dequantize a fraction of the data with no error.
   No public-API surface (CLI binary only).
-
-### Added
-
-- **`inspect_npz_from_reader<R: Read + Seek>`** — reader-generic `NPZ`
-  inspection. Accepts any `Read + Seek` substrate (in-memory `Cursor`,
-  HTTP-range-backed adapter, custom transport) and returns the same
-  `NpzInspectInfo` as the existing path-based `inspect_npz`. The legacy
-  `inspect_npz(path)` entry point is now a two-line wrapper that opens a
-  `std::fs::File` and delegates here — fully backward-compatible. Unblocks
-  remote `NPZ` inspection without materialising the data segment: a
-  downstream HTTP-range adapter (e.g., `hf-fm`'s safetensors range-reader
-  extended to `NPZ`) can satisfy this function in ~7 small range requests
-  totalling well under 100 KiB on a typical Gemma Scope `params.npz` —
-  cutting candle-mi's GemmaScope `open()` cold-start from ~30 s on a
-  100 Mbps link to <1 s. Anamnesis itself takes on no network or TLS
-  dependency. Phase 4.7 (v0.4.3); see [`ROADMAP.md`](ROADMAP.md).
-- **3 new `NPZ` unit tests** covering the reader-generic path:
-  `inspect_from_reader_matches_path` (substrate-equivalence on a
-  multi-array in-memory archive), `inspect_from_reader_empty_archive`,
-  and `inspect_from_reader_rejects_fortran_order` — confirming the
-  refactor preserves every guard. Plus a new `cross_validation_npz`
-  integration test (`inspect_path_and_reader_agree_on_gemma_scope_fixture`)
-  asserting field-for-field parity between `inspect_npz` and
-  `inspect_npz_from_reader` on the real Gemma Scope SAE fixture.
-
-### Changed
-
-- **`ROADMAP.md`** — inserted Phase 4.7 (Remote-only NPZ inspection,
-  Reader-generic API, v0.4.3) between Phase 4.5 and Phase 5. Updated
-  status header `Next:` pointer (Phase 4.7 → Phase 5), added the new
-  section to the TOC, and rehomed the "Remote-only NPZ inspection
-  (HTTP-range probe)" out-of-scope bullet from Phase 4.5 to a one-line
-  pointer at its now-scheduled milestone.
-- **`ROADMAP.md`** — added Phase 7.5 (Lethe Encode Completion, v0.7.5) and applied a consistency pass: refreshed header status (Phases 1–4.5 / v0.4.2 / next Phase 5), added Phase 7.5 + Phase 10 to the TOC, populated the `lethe/` module box, scoped Phase 6 / Phase 7 claims to actual v0.6.0 / v0.7.0 reality (BnB-only encode at v0.6.0, full encode matrix at v0.7.5), corrected the "v0.4.0 BnB decode kernels" reference in Phase 5 step 1, removed the v0.4.2 "awaiting user review" note now that the tag has shipped, and added a Phase 9 follow-up note covering Phase 5/7.5 encode-side pass-2 loops.
 
 ## [0.4.2] - 2026-04-25
 
