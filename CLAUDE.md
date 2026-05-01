@@ -15,6 +15,16 @@ Before every commit, run and fix any issues from:
 4. `cargo test`
 4. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
 
+## Performance Changes
+
+If a commit claims a perf win (faster, less memory, fewer allocations, fewer branches), it must include a measurement, not just an analysis:
+
+1. **Best-of-5 release-mode median**, with `target-cpu=native`, on a real fixture the claim is about. Templates: `tests/bench_npz_adhoc.rs` and `tests/bench_pth_adhoc.rs` — each is gated `#[ignore]` and run with `cargo test --release --features <flag> --test <name> <test_fn> -- --nocapture --ignored`.
+2. **Record both before and after numbers in the commit message** — median + range (min/max), and the bench command used. This is what makes a regression reversible: the next reviewer (or the next person to read `git log`) can re-run the same bench against the parent commit and know the answer.
+3. **If the measurement does not show a win in the expected direction, do not commit.** Estimates and asymptotic arguments are hypotheses, not data — see `5f2632b` ("Revert NPZ memset elimination") for the cautionary case where a confidently estimated `~30 %` saving turned out to be a measured `~33 %` regression.
+
+This rule applies to perf-claim commits only. Correctness fixes, refactors, doc changes, and feature additions do not need a measurement to ship.
+
 ## Release Checklist
 
 Before tagging a release (`v*`), complete these steps in order:
