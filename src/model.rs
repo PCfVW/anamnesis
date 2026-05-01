@@ -71,23 +71,49 @@ impl FromStr for TargetDtype {
 pub struct ParsedModel {
     /// Parsed header metadata (tensor names, dtypes, shapes, roles, scheme).
     pub header: SafetensorsHeader,
-    /// Raw file bytes. Tensor data starts at offset `header_size + 8`.
-    buffer: Vec<u8>,
+    /// Memory-mapped file bytes. Tensor data starts at offset
+    /// `header_size + 8`. Backed by [`memmap2::Mmap`] rather than an
+    /// owned `Vec<u8>`: the OS pages bytes in lazily on access, so
+    /// `parse()` + `inspect()` on a multi-GB shard touches only the
+    /// header (~1 MiB) instead of materialising the whole file.
+    buffer: memmap2::Mmap,
 }
 
 /// Parses a `.safetensors` file, returning a [`ParsedModel`] holding both
-/// header metadata and raw tensor data.
+/// header metadata and the file bytes (memory-mapped).
 ///
-/// This is the entry point for all anamnesis operations. The file is read
-/// once; all subsequent operations ([`ParsedModel::inspect`],
-/// [`ParsedModel::remember`]) work from the in-memory representation.
+/// This is the entry point for all anamnesis operations. The file is
+/// memory-mapped once; all subsequent operations
+/// ([`ParsedModel::inspect`], [`ParsedModel::remember`]) work from the
+/// mmap, so tensor pages are paged in lazily on access.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Io`] if the file cannot be read.
-/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
+/// Returns [`AnamnesisError::Io`] if the file cannot be opened or
+/// mapped.
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is
+/// malformed.
+///
+/// # Memory
+///
+/// Uses `memmap2::Mmap` so the file's bytes do not occupy heap. The
+/// kernel pages bytes in on access and may drop them under memory
+/// pressure — which means a 70 GiB shard can be inspected on a 32 GiB
+/// machine without `OOM`ing the way a `Vec<u8>` allocation would.
+/// `parse()` + `inspect()` only touches the header (~1 MiB), so the
+/// resident-set growth on inspect-only workflows is bounded by the
+/// header size, not the file size.
+#[allow(unsafe_code)]
 pub fn parse(path: impl AsRef<Path>) -> crate::Result<ParsedModel> {
-    let buffer = std::fs::read(path.as_ref())?;
+    let file = std::fs::File::open(path.as_ref())?;
+    // SAFETY: `memmap2::Mmap` requires `unsafe` because the OS could
+    // modify the mapped region if another process writes to the
+    // underlying file concurrently. Tensor files are read-only artefacts
+    // in practice — the same assumption every other tensor parser in this
+    // crate (`parse_pth`, `parse_gguf`) and the upstream `safetensors`
+    // crate's mmap path rely on. The mapping is released when the
+    // returned `ParsedModel` is dropped.
+    let buffer = unsafe { memmap2::Mmap::map(&file) }.map_err(AnamnesisError::Io)?;
     let header = parse_safetensors_header(&buffer)?;
     Ok(ParsedModel { header, buffer })
 }

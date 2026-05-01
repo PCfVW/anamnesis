@@ -27,6 +27,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 1 | NPZ `read_array_data` memset elimination | **Regressed −33 %** | Committed as `67d6db0`, reverted in `5f2632b` |
 | 2 | FP8 per-tensor chunked extend | **Regressed −23 %** | Never committed (this session, branch is clean) |
 | 3 | v0.4.0 GGUF refactor re-validation | **Split: Q4_0 wins ~8 %, Q8_0 loses ~6 %** | Re-measurement only — current code unchanged |
+| 4 | `parse()`: `fs::read` → `memmap2::Mmap` | **~3000× faster on 11 GiB safetensors** | Shipped |
 
 ---
 
@@ -196,6 +197,72 @@ or regression. Future audit findings using this framing should be treated as
 hypotheses to disprove with measurement, not as actionable.
 
 ---
+
+## Experiment 4 — `parse()`: `fs::read` → `memmap2::Mmap`
+
+**Audit finding:** "[`src/model.rs:90`](../src/model.rs) calls `std::fs::read(path)`, materialising the entire safetensors file into a `Vec<u8>` before the header is even parsed. On a 70 GiB shard this peaks at 70 GiB even when the caller only intends to `inspect()`. Switching to `memmap2::Mmap::map(&file)` would let the kernel page bytes in lazily — `parse()` + `inspect()` would then only fault in the header (~1 MiB), and full `remember()` paths gain OOM-resilience because file-backed pages can be dropped by the kernel under memory pressure (whereas `Vec<u8>` pages cannot, they need swap)."
+
+**Method:** [`tests/bench_parse_adhoc.rs`](../tests/bench_parse_adhoc.rs)
+`bench_parse_safetensors_large`. Fixture: a locally-cached 11 560 MiB
+single-file safetensors model (`bigcode/starcoder2-3b/model.safetensors`).
+Best-of-5 release-mode median, 2-iteration warmup to populate the OS file
+cache. Compared `parse()` alone and `parse()` + `inspect()`.
+
+**Result:**
+
+| | BEFORE (`fs::read` + `Vec<u8>`) | AFTER (`memmap2::Mmap::map`) | Delta |
+|---|---|---|---|
+| `parse()` median | **2881.93 ms** (range 2787.82–2887.74, σ ≈ 40 ms) | **0.89 ms** (range 0.86–0.91, σ ≈ 0.02 ms) | **~3236× speedup** |
+| `parse()` + `inspect()` median | 2715.84 ms | 0.94 ms | ~2889× speedup |
+| `inspect()` overhead | (within noise) | 0.05 ms | ✓ as expected |
+
+The "before" parse() rate is ~4 GiB/s — consistent with `memcpy` from
+the warm OS file cache to a fresh `Vec<u8>`. The "after" rate is
+file-size-independent: `mmap` setup + parsing the ~1 MiB header.
+
+**Why the prediction was right (and the magnitude):**
+
+`std::fs::read` is `open + read_exact(n) + close` where `n` is the file
+size. The dominant cost on a warm cache is the `memcpy` from the FS
+cache to the freshly-allocated `Vec<u8>` — ~4 GiB/s on this hardware,
+linear in file size.
+
+`memmap2::Mmap::map` is `open + mmap + close` where `mmap` is a
+kernel call that establishes virtual address translations without
+copying anything — constant time, file-size-independent. Subsequent
+reads through the mapping fault in pages on demand. For
+`parse_safetensors_header`, only the first ~1 MiB is touched, so for
+the inspect-only path the resident-set growth is bounded by header
+size, not file size.
+
+The ~3000× speedup is the ratio of (file size / `memcpy` bandwidth)
+to (constant `mmap` setup + header parse). It scales with file size:
+on a 70 GiB shard the speedup would be larger still.
+
+**Disposition:** **Shipped**. Commit hash recorded in this entry's
+index row when the commit lands. All 320 unit tests + every
+cross-validation suite (FP8, GPTQ, AWQ, BnB, GGUF, NPZ, PTH) still
+pass — the refactor is semantically equivalent because the public
+API surface (`ParsedModel::inspect`, `ParsedModel::remember`,
+`tensor_data`) all consume the buffer through `&[u8]` slices, and
+`memmap2::Mmap` derefs to `[u8]` so callers see no change.
+
+**Trade-offs accepted:**
+
+- `memmap2` becomes a mandatory dependency (was optional, gated behind
+  `pth`/`gguf`). This adds ~one small crate to the dependency tree of
+  every build, including the safetensors-only minimal build. Justified
+  by the always-on speedup.
+- Concurrent file modification by another process is now undefined
+  behaviour — the same assumption every other tensor parser in this
+  crate (`parse_pth`, `parse_gguf`) and the upstream `safetensors`
+  crate's mmap path already rely on. Documented in the `// SAFETY:`
+  comment and the [CONVENTIONS.md](../CONVENTIONS.md) accepted-`unsafe`
+  table.
+
+**Re-attempting this requires:** N/A — this is the success case. If
+the change ever needs to be reverted, the `bench_parse_adhoc` harness
+is in place to detect a regression.
 
 ## How to add an entry
 

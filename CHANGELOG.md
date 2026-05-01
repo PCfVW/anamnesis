@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`parse()` now memory-maps the safetensors file** instead of reading
+  it into a `Vec<u8>` via `std::fs::read`. The semantic surface is
+  unchanged: `ParsedModel::inspect`, `ParsedModel::remember`, and the
+  internal `tensor_data` accessor all serve bytes through `&[u8]`
+  slices, and `memmap2::Mmap` derefs to `[u8]`. **Measured impact on a
+  locally-cached 11.6 GiB single-file safetensors shard
+  (`bigcode/starcoder2-3b/model.safetensors`):**
+  - `parse()` median: **2881.93 ms → 0.89 ms** (best-of-5 release mode,
+    warm FS cache, range 2787-2887 ms before vs 0.86-0.91 ms after).
+  - `parse()` + `inspect()` median: **2715.84 ms → 0.94 ms**.
+  - Bench command: `cargo test --release --test bench_parse_adhoc bench_parse_safetensors_large -- --nocapture --ignored`.
+  - Why: `fs::read` is `O(file_size)` `memcpy` from the OS file cache
+    to a freshly-allocated `Vec<u8>`. `mmap` is constant-time virtual
+    address setup; pages fault in on access. For inspect-only
+    workflows the resident-set growth is bounded by the header (~1 MiB),
+    not the file size. For full `remember()` workflows the kernel can
+    drop file-backed pages under memory pressure (whereas `Vec<u8>`
+    pages can't, they need swap), giving OOM-resilience to large-file
+    dequantisation on memory-constrained machines. Identified by the
+    v0.4.x algorithmic-weakness audit (finding #2 of 12). Full
+    measurement record and analysis in
+    [`docs/perf-experiments.md`](docs/perf-experiments.md) entry #4.
+- **`memmap2` is now a mandatory dependency** (was optional, gated by
+  `pth` and `gguf`). The `pth` and `gguf` features no longer reference
+  `memmap2` in their feature lists. The `pth` feature now activates
+  only `dep:zip`; `gguf` activates nothing extra.
+
 ### Fixed
 
 - **`TensorEntry::num_elements` overflow saturation** — replaced the

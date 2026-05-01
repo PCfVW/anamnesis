@@ -232,6 +232,7 @@ in practice. If `unsafe` becomes necessary, follow the candle-mi pattern:
 | Feature | Accepted `unsafe` scope |
 |---------|------------------------|
 | `simd`  | `#[target_feature]` functions for explicit SIMD in conversion loops |
+| *(always-on)* + `pth` + `gguf` | `memmap2::Mmap::map(&file)` for tensor file mmap. Used by `parse()` (safetensors, always-on), `parse_pth`, and `parse_gguf`. Same invariants as the upstream `safetensors` crate's mmap path: read-only artefact assumption — concurrent writes by another process are undefined behaviour. |
 
 Each accepted use must satisfy all of:
 1. The `unsafe` block is in a **single, dedicated module** (e.g., `src/remember/simd.rs`)
