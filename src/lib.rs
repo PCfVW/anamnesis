@@ -4,7 +4,7 @@
 //!
 //! `anamnesis` is a framework-agnostic Rust library for dequantizing
 //! quantized model weights and parsing tensor archives. It handles
-//! `.safetensors` (read once, classify, dequantize to `BF16`),
+//! `.safetensors` (memory-mapped, classify, dequantize to `BF16`),
 //! `.npz` (bulk extraction at near-I/O speed), and `PyTorch` `.pth`
 //! (zero-copy mmap with lossless safetensors conversion, 11–31× faster
 //! than `torch.load()`).
@@ -51,9 +51,12 @@
 //!
 //! # Architecture
 //!
-//! - [`parse()`] — read a `.safetensors` file into a [`ParsedModel`]
+//! - [`parse()`] — memory-map a `.safetensors` file into a
+//!   [`ParsedModel`]. Inspect-only workflows touch only the header
+//!   (~1 MiB) regardless of file size; full dequantisation pages
+//!   tensor bytes in lazily.
 //! - [`ParsedModel::inspect`] — derive format, tensor counts, and size
-//!   estimates from the header (zero I/O)
+//!   estimates from the parsed header (zero further I/O)
 //! - [`ParsedModel::remember`] — dequantize all quantized tensors to `BF16`
 //!   and write a standard `.safetensors` file
 //! - `parse_npz()` — read an `.npz` archive into a `HashMap<String, NpzTensor>`

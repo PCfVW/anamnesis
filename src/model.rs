@@ -2,10 +2,13 @@
 
 //! High-level parse-first API.
 //!
-//! [`parse`] reads a `.safetensors` file, returning a [`ParsedModel`] that
-//! holds both the header metadata and the raw byte data. All subsequent
-//! operations ([`ParsedModel::inspect`], [`ParsedModel::remember`]) work
-//! from this parsed representation — no file is re-read.
+//! [`parse`] memory-maps a `.safetensors` file, returning a
+//! [`ParsedModel`] that holds the parsed header metadata and a
+//! [`memmap2::Mmap`] view of the file's bytes. All subsequent operations
+//! ([`ParsedModel::inspect`], [`ParsedModel::remember`]) work from this
+//! parsed representation — no second open, no eager copy. The kernel
+//! pages bytes in lazily on access, so `inspect()` on a multi-GB shard
+//! only faults the header (~1 MiB).
 
 use std::fmt;
 use std::path::Path;
@@ -64,10 +67,15 @@ impl FromStr for TargetDtype {
     }
 }
 
-/// A parsed `.safetensors` model, holding both header metadata and raw tensor
-/// data in memory.
+/// A parsed `.safetensors` model, holding parsed header metadata and a
+/// memory-mapped view of the file's bytes.
 ///
-/// Created by [`parse`]. All operations work from this in-memory representation.
+/// Created by [`parse`]. The file's bytes are accessed through a
+/// [`memmap2::Mmap`] rather than an owned `Vec<u8>` — the kernel pages
+/// bytes in lazily on access, so `inspect()` on a multi-GB shard only
+/// faults in the header (~1 MiB). All public methods
+/// ([`ParsedModel::inspect`], [`ParsedModel::remember`]) consume the
+/// buffer through `&[u8]` slices, so the mmap is invisible to callers.
 pub struct ParsedModel {
     /// Parsed header metadata (tensor names, dtypes, shapes, roles, scheme).
     pub header: SafetensorsHeader,
@@ -127,7 +135,9 @@ impl ParsedModel {
         InspectInfo::from(&self.header)
     }
 
-    /// Returns the raw bytes for a tensor from the in-memory buffer.
+    /// Returns the raw bytes for a tensor from the memory-mapped file
+    /// buffer. The slice borrows from the mmap; pages are paged in by
+    /// the kernel on first access.
     ///
     /// # Errors
     ///
@@ -272,20 +282,18 @@ impl ParsedModel {
     ///
     /// # Memory
     ///
-    /// Peak heap is roughly `input_file_size + total_dequantized_output_size`
-    /// (~3× the `FP8` file size when dequantizing to `BF16`; up to ~4–8×
-    /// a packed `Q4_*` `GGUF` file size when dequantising to `BF16`). The
-    /// input buffer is held for the duration of the call (passthrough
-    /// tensors borrow from it). **Every dequantised tensor's `Vec<u8>`
-    /// is retained simultaneously** until the underlying
-    /// `safetensors::serialize_to_file` call returns — peak heap is the
-    /// sum of all dequantised tensor sizes, not one tensor at a time. The
-    /// safetensors crate's writer itself streams tensor bodies one at a
-    /// time, but the eager buffering happens in this method's caller-side
-    /// `Vec` collection. Comfortable for `≤ 7 B` models on a 32 GB
-    /// system; tight at 13 B; OOMs at 70 B+. A streaming output path
-    /// (planned ROADMAP Phase 10) will drop this to
-    /// `O(largest_tensor_BF16)`.
+    /// Peak heap is `O(total_dequantised_output_size)` ≈ `2 × n_parameters`
+    /// bytes (the output `BF16` tensors). The input file is memory-mapped
+    /// — pages are paged in by the kernel on access and may be dropped
+    /// under memory pressure — so the input side does not contribute to
+    /// the heap. **Every dequantised tensor's `Vec<u8>` is retained
+    /// simultaneously** until the underlying `safetensors::serialize_to_file`
+    /// call returns: the safetensors crate's writer itself streams tensor
+    /// bodies one at a time, but the eager buffering happens in this
+    /// method's caller-side `Vec` collection. Comfortable for `≤ 7 B`
+    /// models on a 32 GB system; tight at 13 B; `OOM`s at 70 B+.
+    /// A streaming output path (planned ROADMAP Phase 10) will drop this
+    /// to `O(largest_tensor_BF16)`.
     pub fn remember(
         &self,
         output_path: impl AsRef<Path>,
