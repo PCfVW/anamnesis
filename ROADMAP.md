@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated April 30, 2026)
-**Status:** Phases 1–4.5 complete (v0.4.2 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels (12 from Phase 4 + 10 IQ/TQ/MXFP4 from Phase 4.5), bit-exact against the `gguf` Python reference (mirrors `llama.cpp`'s `ggml-quants.c`). **Next:** Phase 4.7 (remote-only NPZ inspection via reader-generic API, v0.4.3) → Phase 5 (Lethe — BnB encode + round-trip validation harness, v0.5.0).
+**Date:** March 20, 2026 (updated May 1, 2026)
+**Status:** Phases 1–4.7 complete (v0.4.3 published). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels — plus reader-generic NPZ inspection (`inspect_npz_from_reader<R: Read + Seek>`) and an mmap-based always-on `parse()` (~3236× faster on a 11.6 GiB safetensors shard). **Next:** Phase 4.8 (reader-generic safetensors header parsing, v0.4.4) → Phase 4.9 (reader-generic GGUF inspection, v0.4.5) → Phase 4.10 (reader-generic PTH inspection, v0.4.6) → Phase 5 (Lethe — BnB encode + round-trip validation harness, v0.5.0).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -27,6 +27,9 @@
   - [Phase 4 patch: API polish + dogfooding (v0.4.1)](#phase-4-patch-api-polish--dogfooding-v041)
   - [Phase 4.5: GGUF Completeness](#phase-45-gguf-completeness)
   - [Phase 4.7: Remote-only NPZ inspection (Reader-generic API)](#phase-47-remote-only-npz-inspection-reader-generic-api)
+  - [Phase 4.8: Reader-generic safetensors header parsing](#phase-48-reader-generic-safetensors-header-parsing)
+  - [Phase 4.9: Reader-generic GGUF inspection](#phase-49-reader-generic-gguf-inspection)
+  - [Phase 4.10: Reader-generic PTH inspection](#phase-410-reader-generic-pth-inspection)
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
   - [Phase 6.5: Benchmarking & Performance Validation](#phase-65-benchmarking--performance-validation)
@@ -357,7 +360,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 - [x] **In-memory cursor coverage test** (`src/parse/npz.rs`, `tests/cross_validation_npz.rs`, commit `660850a`) — `inspect_path_and_reader_agree_on_gemma_scope_fixture` asserts field-for-field parity between `inspect_npz(path)` and `inspect_npz_from_reader(Cursor::new(&bytes))` on the real Gemma Scope SAE fixture. Plus three in-module unit tests: `inspect_from_reader_matches_path` (multi-array in-memory archive), `inspect_from_reader_empty_archive`, `inspect_from_reader_rejects_fortran_order`.
 - [x] **Range-read access pattern documentation** (`src/parse/npz.rs` rustdoc, commit `660850a`) — the rustdoc on `inspect_npz_from_reader` documents the three logical fetches an HTTP-range adapter must serve (EOCD scan ~64 KiB, central directory ~few KiB, per-entry local file header + NPY header ~512 B), and the prefetch-on-first-seek caching shape that amortises round trips to ~7 small range requests on a typical 5-array Gemma Scope `params.npz` (well under 100 KiB instead of the full ~300 MiB download).
 
-**Implementation complete; release pending.** The three implementation steps above shipped in commit `660850a`. The `v0.4.3` tag itself awaits the release ceremony (Cargo.toml `0.4.2` → `0.4.3`, CHANGELOG date-rename, dry-run gauntlet, push, tag) per the release checklist in [`CLAUDE.md`](CLAUDE.md). — **PUSH + tag `v0.4.3`**
+**Phase complete.** The three implementation steps above shipped in commit `660850a`; `v0.4.3` was tagged on 2026-05-01 (commit `9468d03`) and the publish workflow pushed it to crates.io (run `25206873389`, 54 s). — **PUSH + tag `v0.4.3`** ✓
 
 **Deliverable:** `anamnesis` v0.4.3 — reader-generic NPZ inspection. candle-mi (and any other downstream consumer) can now inspect a remote NPZ archive without materialising the data segment by composing `inspect_npz_from_reader` with an HTTP-range-backed `Read + Seek` adapter. Backward compatible: the existing `inspect_npz(path)` entry-point is unchanged (now implemented as a 2-line wrapper). No new dependencies, no feature gate — the whole change is a public-API extension on the already-shipping `npz` feature. — **PUSH + tag `v0.4.3`**
 
@@ -369,6 +372,60 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 - **Built-in HTTP transport** — see "Why reader-generic, not built-in HTTP" above. The HTTP-range-backed `Read + Seek` adapter lives in `hf-fm` (or any other downstream caller), not in anamnesis.
 - **Remote `parse_npz` (data-fetching variant)** — only `inspect_npz_from_reader` (metadata-only) is in scope. A reader-generic `parse_npz_from_reader` is a natural follow-up if a concrete downstream need arises, but the current dogfooding signal is exclusively about inspection (16 bytes of shape metadata), not data extraction.
+
+### Phase 4.8: Reader-generic safetensors header parsing
+
+**Goal:** Mirror Phase 4.7's reader-generic doctrine on the safetensors path. Add `parse_safetensors_header_from_reader<R: Read>` so any caller bringing a `Read` source can extract the header without materialising the full file. Unblocks `hf-fm` v0.11.1 (the planned retirement of `hf-fm`'s bespoke `fetch_header_bytes` parser) and removes the only remaining duplicated format-knowledge between the two crates.
+
+**Approach:** The safetensors header is sequential at the start of the file: 8-byte little-endian length prefix, then exactly that many bytes of `JSON`. **No `Seek` is needed** — a plain `Read` suffices. Lift the file-opening boilerplate out of the existing always-on mmap-based `parse()` and expose a reader-generic primitive that reads the prefix, reads the header bytes, and delegates to the existing `parse_safetensors_header(&[u8])`. The `ParsedModel` struct continues to be created exclusively by `parse(path)` (which still mmaps); the new entry-point returns just `SafetensorsHeader` for inspect-only flows. Backward compatible: `parse(path)` and `parse_safetensors_header(&[u8])` are unchanged.
+
+- [ ] **`parse_safetensors_header_from_reader<R: Read>` public function** (`src/parse/safetensors.rs`) — reads 8-byte LE length prefix, reads `len` bytes of `JSON` header, delegates to `parse_safetensors_header(&bytes)`. Returns `SafetensorsHeader`. ~30 LOC plus tests. Re-export from `lib.rs` alongside the existing path-based and slice-based entries — **commit**
+- [ ] **In-memory cursor coverage test** (`src/parse/safetensors.rs`, `tests/cross_validation.rs`) — verify `parse_safetensors_header_from_reader(Cursor::new(&bytes))` matches `parse_safetensors_header(&bytes)` byte-for-byte across the existing `FP8` / `GPTQ` / `AWQ` / `BnB` fixtures. Locks substrate-equivalence the way Phase 4.7 did for NPZ — **commit**
+- [ ] **Range-read access pattern documentation** (`src/parse/safetensors.rs` rustdoc) — document the two logical fetches an HTTP-range adapter must serve: 8 bytes at offset 0 (length prefix), then `length` bytes starting at offset 8 (`JSON` header). Total transfer ≈ header size (~1 MiB on a multi-GB shard, vs the full file). No EOCD trickery needed — safetensors's metadata is at the start, unlike NPZ's ZIP-tail layout — **commit** — **PUSH + tag `v0.4.4`**
+
+**Deliverable:** `anamnesis` v0.4.4 — reader-generic safetensors header parsing. Unblocks `hf-fm` v0.11.1 (remote safetensors via anamnesis), retiring the duplicated bespoke parser in `hf-fm/src/inspect.rs::fetch_header_bytes`. — **PUSH + tag `v0.4.4`**
+
+**New dependencies:** None.
+
+**Why no `Seek`:** the safetensors header lives at file offsets `[0, 8 + length)` — exactly the bytes a sequential `Read` produces in order. A `Read + Seek` constraint would force HTTP-range adapters to handle seek-back even though no parser code seeks backwards. Keeping the constraint at `Read` means the simplest possible HTTP-range implementation works (one connection, two contiguous range fetches, never seek-back).
+
+### Phase 4.9: Reader-generic GGUF inspection
+
+**Goal:** Add `inspect_gguf_from_reader<R: Read + Seek>` so any caller bringing a positional source can extract GGUF metadata (header, KV pairs, tensor info table) without materialising the data segment. Unblocks `hf-fm` v0.11.2 (remote GGUF inspection — the originally-promised v0.11.0 feature, now landing on the `HttpRangeReader` adapter `hf-fm` builds in v0.11.0).
+
+**Approach:** The current `parse_gguf` walks a `Cursor<&[u8]>` over a `memmap2::Mmap`. Generalise the cursor to `Read + Seek` so the same adversarial-input-guarded logic works against any positional source. The path-based `parse_gguf(path)` becomes a thin wrapper that mmaps the file and delegates. The existing public types (`ParsedGguf`, `GgufInspectInfo`, `GgufTensor`, `GgufTensorInfo`, `GgufType`, `GgufMetadataValue`, `GgufMetadataArray`) all carry over unchanged — only the I/O substrate is parameterised. Adversarial-input guards (caps on tensor count, KV count, string length, array length, nesting depth, dimension count, element product) are preserved verbatim.
+
+- [ ] **Refactor `parse_gguf` cursor pattern off `memmap2::Mmap`** (`src/parse/gguf.rs`) — generalise the existing `Cursor` over `&[u8]` to a `Read + Seek` cursor. Path-based `parse_gguf(path)` becomes a thin wrapper that mmaps the file and delegates. ~150 LOC of refactor; no behaviour change on the path-based entry — **commit**
+- [ ] **`inspect_gguf_from_reader<R: Read + Seek>` public function** — accepts any `Read + Seek` source, returns `GgufInspectInfo` exactly as today. Tensor data is *not* read — the metadata block is contiguous at the start, so a well-implemented `Read + Seek` adapter only fetches the bytes the parser actually touches. Re-export from `lib.rs` alongside the existing `parse_gguf` — **commit**
+- [ ] **In-memory cursor coverage + range-pattern docs** (`src/parse/gguf.rs`, `tests/cross_validation_gguf.rs`) — substrate-equivalence test against the existing `bartowski/SmolLM2-135M-Instruct` and other GGUF fixtures (assert `inspect_gguf_from_reader(Cursor::new(&bytes))` == `parse_gguf(path).inspect()` field-for-field). Plus rustdoc on the seek pattern: a single read of the front matter (header + KV + tensor info table; typically a few MiB on multi-GB GGUFs) — **commit** — **PUSH + tag `v0.4.5`**
+
+**Deliverable:** `anamnesis` v0.4.5 — reader-generic GGUF inspection. Unblocks `hf-fm` v0.11.2 (remote GGUF inspect). A 2 GiB quantised GGUF inspectable in a few range requests fetching the front-loaded metadata — no weight data downloaded. — **PUSH + tag `v0.4.5`**
+
+**New dependencies:** None. Reuses the existing `gguf` feature gate, `memmap2`, and the existing public types.
+
+**Why `Read + Seek` (and not just `Read`) for GGUF:** unlike safetensors's prefix-then-JSON layout, GGUF's parser reads back-and-forth across the front matter (e.g., it computes the absolute tensor-data offset by combining the relative offsets in the tensor-info table with the post-tensor-info `data_section_start`, then validates per-tensor alignment relative to that anchor). The simplest correct refactor preserves the existing positional access pattern via `Seek`. A pure-`Read` reformulation is possible but would require restructuring the parser into a strict forward pass — out of scope for this phase.
+
+### Phase 4.10: Reader-generic PTH inspection
+
+**Goal:** Add `inspect_pth_from_reader<R: Read + Seek>` so any caller bringing a positional source can extract `PyTorch` `.pth` tensor metadata (names, dtypes, shapes, sizes) without materialising the tensor data files inside the ZIP archive. Unblocks `hf-fm` v0.11.3 — closing the remote-inspect matrix across all four tensor formats anamnesis supports.
+
+**Approach:** Largest of the three Phase 4.8 / 4.9 / 4.10 lifts. PTH's metadata lives in `data.pkl` mid-archive; the existing pickle VM zero-copies `Cow::Borrowed` slices from `memmap2::Mmap`. The reader-based path: range-fetch the ZIP central directory, locate `data.pkl`'s entry, materialise its bytes (typically <100 KiB even on torchvision-class 300 MB models), then run the existing pickle interpreter on that owned buffer. The local-file `parse_pth(path)` zero-copy contract is preserved — the reader-based entry-point returns just metadata (`PthInspectInfo`), not the zero-copy `ParsedPth` (which requires the mmap to outlive the borrowed tensor data slices).
+
+- [ ] **`inspect_pth_from_reader<R: Read + Seek>` public function** (`src/parse/pth.rs`) — range-fetches the ZIP central directory via `zip::ZipArchive::new(reader)` (which already accepts any `R: Read + Seek`, same as Phase 4.7's NPZ path), locates `data.pkl`, materialises its bytes, runs the existing pickle interpreter on that owned `Vec<u8>`. Returns `PthInspectInfo` (metadata only — no tensor data). Re-export from `lib.rs` — **commit**
+- [ ] **Pickle VM contract preserved** — the local-file (`parse_pth`) zero-copy contract (`Cow::Borrowed` slices into the mmap) stays unchanged. The reader-based path lives alongside it; the pickle interpreter is shared (it already operates on `&[u8]` regardless of source). No regression on existing `.pth` → `.safetensors` round-trip benchmarks; no regression on the AlgZoo cross-validation suite — **commit**
+- [ ] **In-memory cursor coverage + range-pattern docs** (`src/parse/pth.rs`, `tests/cross_validation_pth.rs`) — substrate-equivalence test on the existing AlgZoo fixtures (`2nd_argmax_2_2`, `longest_cycle_2_3`, `one_layer_16_hidden`). Plus rustdoc on the seek pattern: EOCD scan (~64 KiB), central directory read, single materialised read of `data.pkl` (~tens of KiB on torchvision-class models). The tensor-data files inside the archive (`data/0`, `data/1`, …) are *not* fetched — only `data.pkl` is needed for inspection — **commit** — **PUSH + tag `v0.4.6`**
+
+**Deliverable:** `anamnesis` v0.4.6 — reader-generic `.pth` inspection. Unblocks `hf-fm` v0.11.3, closing the remote-inspect matrix (`safetensors` / `NPZ` / `GGUF` / `PTH` all remotely inspectable through the same `HttpRangeReader` substrate). — **PUSH + tag `v0.4.6`**
+
+**New dependencies:** None. Reuses the existing `pth` feature gate, `zip` v2, and `memmap2`. The reader-based path goes through `zip::ZipArchive::new(reader)` (already accepts any `R: Read + Seek`).
+
+**Why metadata-only (no `parse_pth_from_reader`):** the local-file `parse_pth(path)` returns a `ParsedPth` with `Cow::Borrowed` zero-copy slices into the mmap. A reader-based equivalent that preserved that contract would need the reader to outlive every borrowed slice — workable for some `Read + Seek` substrates but awkward for HTTP-range adapters where each tensor read is a fresh fetch. Constraining the reader-based entry-point to **inspect-only** (returns owned `PthInspectInfo`) sidesteps the borrowing complexity for the v0.11 use case (browsing tensor metadata before downloading), while leaving room for a future `parse_pth_from_reader` if a streaming-data use case develops.
+
+**Explicitly out of scope (across Phases 4.8 / 4.9 / 4.10):**
+
+- **HTTP transport in anamnesis** — same as Phase 4.7. anamnesis stays HTTP-free; the network layer lives in `hf-fm`'s `HttpRangeReader` adapter (or any other downstream consumer's equivalent).
+- **Reader-generic data-fetching variants** (`parse_pth_from_reader`, `parse_gguf_from_reader` returning full data) — only metadata-only inspect paths are in scope for this matrix-completion arc. Reader-generic full-data paths are natural follow-ups if concrete downstream needs arise (the current need is exclusively inspection).
+- **Reader-generic remember/dequant** — full dequantisation requires touching every byte of every quantised tensor; the structural advantage of reader-based access (only fetch what you touch) collapses. Out of scope unless a streaming-dequant story develops in parallel ([Phase 10: Streaming Output](#phase-10-streaming-output) territory).
 
 ### Phase 5: Quantization (Lethe)
 
