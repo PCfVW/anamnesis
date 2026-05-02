@@ -1,0 +1,63 @@
+{
+  "scheme": "bnb_nf4",
+  "header_size": 424,
+  "metadata": {},
+  "tensors": [
+    {
+      "name": "model.layers.0.weight",
+      "dtype": "U8",
+      "shape": [
+        32,
+        1
+      ],
+      "data_offsets": [
+        84,
+        116
+      ]
+    },
+    {
+      "name": "model.layers.0.weight.absmax",
+      "dtype": "F32",
+      "shape": [
+        1
+      ],
+      "data_offsets": [
+        0,
+        4
+      ]
+    },
+    {
+      "name": "model.layers.0.weight.quant_map",
+      "dtype": "F32",
+      "shape": [
+        16
+      ],
+      "data_offsets": [
+        4,
+        68
+      ]
+    },
+    {
+      "name": "model.layers.0.weight.quant_state.bitsandbytes__nf4",
+      "dtype": "U8",
+      "shape": [
+        121
+      ],
+      "data_offsets": [
+        116,
+        237
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "F16",
+      "shape": [
+        8
+      ],
+      "data_offsets": [
+        68,
+        84
+      ]
+    }
+  ]
+}

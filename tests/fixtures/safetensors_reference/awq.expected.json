@@ -1,0 +1,54 @@
+{
+  "scheme": "awq",
+  "header_size": 320,
+  "metadata": {},
+  "tensors": [
+    {
+      "name": "model.layers.0.qweight",
+      "dtype": "I32",
+      "shape": [
+        64,
+        4
+      ],
+      "data_offsets": [
+        0,
+        1024
+      ]
+    },
+    {
+      "name": "model.layers.0.qzeros",
+      "dtype": "I32",
+      "shape": [
+        2,
+        4
+      ],
+      "data_offsets": [
+        1024,
+        1056
+      ]
+    },
+    {
+      "name": "model.layers.0.scales",
+      "dtype": "F16",
+      "shape": [
+        2,
+        32
+      ],
+      "data_offsets": [
+        1056,
+        1184
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "F16",
+      "shape": [
+        32
+      ],
+      "data_offsets": [
+        1184,
+        1248
+      ]
+    }
+  ]
+}

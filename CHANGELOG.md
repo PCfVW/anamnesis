@@ -38,13 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`<8`-byte readers surface as `Io`), `parse_from_reader_rejects_oversized_header_length`
   (declared length above the 100 MiB cap surfaces as `Parse` without
   attempting allocation), and `parse_from_reader_rejects_truncated_json_tail`
-  (partial-fetch in the JSON tail surfaces as `Io`). Plus 2 new
-  `cross_validation` integration tests
-  (`parse_safetensors_path_and_reader_agree_on_synthetic_fixture` and
-  `parse_safetensors_path_and_reader_agree_on_disk_round_trip`) asserting
-  field-for-field parity between the slice-based and reader-based APIs on
-  an in-memory FP8 + scale + passthrough fixture and on a temp-file
-  round-trip.
+  (partial-fetch in the JSON tail surfaces as `Io`).
+- **`tests/fixtures/safetensors_reference/` cross-validation harness** —
+  4 small `.safetensors` fixtures (`fp8`, `gptq`, `awq`, `bnb_nf4`,
+  ~340 B–2 KiB each) plus a sibling `<scheme>.expected.json` reference
+  for each, recording exactly what the upstream HuggingFace
+  `safetensors` Python library reports about that file's header. The
+  references are produced by `generate.py`, which sources the metadata
+  two ways (raw 8-byte length prefix + `JSON` parse per spec, then
+  cross-checked against `safetensors.safe_open`) before serialising the
+  result. Five new integration tests in `tests/cross_validation_safetensors.rs`
+  (one per scheme + one on-disk `File` reader cover) assert that **both**
+  anamnesis entry points (slice-based `parse_safetensors_header` and
+  reader-based `parse_safetensors_header_from_reader`) reproduce the
+  Python-sourced reference field-for-field — true cross-validation
+  against an external oracle, not anamnesis-against-anamnesis. Total
+  fixture footprint ~5 KiB, all `include_bytes!`/`include_str!`-baked
+  into the test binary.
 
 ### Changed
 

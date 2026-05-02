@@ -1,0 +1,42 @@
+{
+  "scheme": "fp8",
+  "header_size": 240,
+  "metadata": {},
+  "tensors": [
+    {
+      "name": "model.layers.0.weight",
+      "dtype": "F8_E4M3",
+      "shape": [
+        8,
+        8
+      ],
+      "data_offsets": [
+        32,
+        96
+      ]
+    },
+    {
+      "name": "model.layers.0.weight_scale_inv",
+      "dtype": "F32",
+      "shape": [
+        2,
+        2
+      ],
+      "data_offsets": [
+        0,
+        16
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "BF16",
+      "shape": [
+        8
+      ],
+      "data_offsets": [
+        16,
+        32
+      ]
+    }
+  ]
+}

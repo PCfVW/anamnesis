@@ -1,0 +1,68 @@
+{
+  "scheme": "gptq",
+  "header_size": 456,
+  "metadata": {
+    "gptq_bits": "4",
+    "gptq_group_size": "32"
+  },
+  "tensors": [
+    {
+      "name": "model.layers.0.g_idx",
+      "dtype": "I32",
+      "shape": [
+        64
+      ],
+      "data_offsets": [
+        0,
+        256
+      ]
+    },
+    {
+      "name": "model.layers.0.qweight",
+      "dtype": "I32",
+      "shape": [
+        8,
+        32
+      ],
+      "data_offsets": [
+        256,
+        1280
+      ]
+    },
+    {
+      "name": "model.layers.0.qzeros",
+      "dtype": "I32",
+      "shape": [
+        2,
+        4
+      ],
+      "data_offsets": [
+        1280,
+        1312
+      ]
+    },
+    {
+      "name": "model.layers.0.scales",
+      "dtype": "F16",
+      "shape": [
+        2,
+        32
+      ],
+      "data_offsets": [
+        1312,
+        1440
+      ]
+    },
+    {
+      "name": "model.norm.weight",
+      "dtype": "F16",
+      "shape": [
+        32
+      ],
+      "data_offsets": [
+        1440,
+        1504
+      ]
+    }
+  ]
+}
