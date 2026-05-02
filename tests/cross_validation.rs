@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use anamnesis::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
-    Dtype,
+    parse_safetensors_header, parse_safetensors_header_from_reader, Dtype, QuantScheme,
 };
 
 // ---------------------------------------------------------------------------
@@ -277,4 +277,131 @@ fn cross_validate_llama_dynamic_per_channel() {
         include_bytes!("fixtures/fp8_reference/llama_dynamic_per_channel.bin"),
         1,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.8: reader-generic safetensors header parsing
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic `.safetensors` buffer that exercises `FineGrainedFp8`
+/// scheme detection — `FP8` weight + 2D `_scale_inv` companion + `BF16`
+/// passthrough norm. Mirrors the fixture diversity (`FP8` / `GPTQ` / `AWQ`
+/// / `BnB`) the existing `*_reference.bin` fixtures cover for
+/// dequantization, but produced in-memory because the binary fixtures are
+/// raw weight/scale blobs, not real safetensors files. The
+/// substrate-equivalence the test asserts is structural: any byte buffer
+/// that parses through the slice-based path must parse identically through
+/// the reader-based path.
+fn build_synthetic_safetensors_buffer() -> Vec<u8> {
+    let weight_data: Vec<u8> = vec![0; 16]; // 4 × 4 FP8 = 16 bytes
+    let scale_data: Vec<u8> = vec![0; 16]; // 2 × 2 F32 = 16 bytes (fine-grained)
+    let norm_data: Vec<u8> = vec![0; 4]; // 2 × BF16 = 4 bytes
+
+    let views = vec![
+        (
+            "layer.0.weight",
+            safetensors::tensor::TensorView::new(
+                safetensors::Dtype::F8_E4M3,
+                vec![4, 4],
+                &weight_data,
+            )
+            .unwrap(),
+        ),
+        (
+            "layer.0.weight_scale_inv",
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 2], &scale_data)
+                .unwrap(),
+        ),
+        (
+            "model.norm.weight",
+            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2], &norm_data)
+                .unwrap(),
+        ),
+    ];
+    safetensors::tensor::serialize(views, &None).unwrap()
+}
+
+/// Phase 4.8 substrate-equivalence: `parse_safetensors_header_from_reader`
+/// over an in-memory `Cursor` returns a `SafetensorsHeader` whose every
+/// field matches `parse_safetensors_header` over the same bytes. This is
+/// the behavioural contract HTTP-range adapters depend on — the substrate
+/// (slice vs. cursor vs. range-backed adapter) must not change the
+/// metadata.
+#[test]
+fn parse_safetensors_path_and_reader_agree_on_synthetic_fixture() {
+    let buffer = build_synthetic_safetensors_buffer();
+
+    let slice_header = parse_safetensors_header(&buffer).expect("slice parse failed");
+    let reader_header = parse_safetensors_header_from_reader(std::io::Cursor::new(&buffer))
+        .expect("reader parse failed");
+
+    eprintln!(
+        "Synthetic safetensors substrate parity: {} tensors, scheme={:?}",
+        reader_header.tensors.len(),
+        reader_header.scheme
+    );
+
+    assert_eq!(slice_header.scheme, QuantScheme::FineGrainedFp8);
+    assert_eq!(slice_header.scheme, reader_header.scheme);
+    assert_eq!(slice_header.header_size, reader_header.header_size);
+    assert_eq!(slice_header.metadata, reader_header.metadata);
+    assert_eq!(slice_header.gptq_config, reader_header.gptq_config);
+    assert_eq!(slice_header.awq_config, reader_header.awq_config);
+    assert_eq!(slice_header.bnb_config, reader_header.bnb_config);
+    assert_eq!(slice_header.tensors.len(), reader_header.tensors.len());
+
+    for (a, b) in slice_header
+        .tensors
+        .iter()
+        .zip(reader_header.tensors.iter())
+    {
+        assert_eq!(a.name, b.name, "tensor name mismatch");
+        assert_eq!(a.dtype, b.dtype, "dtype mismatch for `{}`", a.name);
+        assert_eq!(a.shape, b.shape, "shape mismatch for `{}`", a.name);
+        assert_eq!(
+            a.data_offsets, b.data_offsets,
+            "data_offsets mismatch for `{}`",
+            a.name
+        );
+        assert_eq!(a.role, b.role, "role mismatch for `{}`", a.name);
+    }
+}
+
+/// Phase 4.8 substrate-equivalence on the on-disk path: a real
+/// `std::fs::File` handed to `parse_safetensors_header_from_reader`
+/// produces the same metadata as `parse_safetensors_header` on the bytes
+/// loaded from the same file. Confirms the reader-generic API works on
+/// real file reads (not just in-memory `Cursor`s) — the path an
+/// `HTTP`-range adapter would resemble after the prefix + `JSON` bytes
+/// have been fetched and replayed sequentially.
+#[test]
+fn parse_safetensors_path_and_reader_agree_on_disk_round_trip() {
+    let buffer = build_synthetic_safetensors_buffer();
+
+    let tmp = std::env::temp_dir().join("anamnesis_phase48_disk_roundtrip.safetensors");
+    std::fs::write(&tmp, &buffer).expect("write temp safetensors failed");
+
+    let on_disk = std::fs::read(&tmp).expect("read temp safetensors failed");
+    let slice_header = parse_safetensors_header(&on_disk).expect("slice parse failed");
+
+    let file = std::fs::File::open(&tmp).expect("open temp safetensors failed");
+    let reader_header =
+        parse_safetensors_header_from_reader(file).expect("reader parse from file failed");
+
+    std::fs::remove_file(&tmp).ok();
+
+    assert_eq!(slice_header.tensors.len(), reader_header.tensors.len());
+    assert_eq!(slice_header.scheme, reader_header.scheme);
+    assert_eq!(slice_header.header_size, reader_header.header_size);
+    for (a, b) in slice_header
+        .tensors
+        .iter()
+        .zip(reader_header.tensors.iter())
+    {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.dtype, b.dtype);
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.data_offsets, b.data_offsets);
+        assert_eq!(a.role, b.role);
+    }
 }

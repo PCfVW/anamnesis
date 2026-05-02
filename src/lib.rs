@@ -59,6 +59,12 @@
 //!   estimates from the parsed header (zero further I/O)
 //! - [`ParsedModel::remember`] — dequantize all quantized tensors to `BF16`
 //!   and write a standard `.safetensors` file
+//! - [`parse_safetensors_header`] / [`parse_safetensors_header_from_reader`]
+//!   — header-only safetensors parsing. The reader-generic variant accepts
+//!   any `Read` substrate (in-memory `Cursor`, `HTTP`-range-backed adapter,
+//!   …) and reads only the 8-byte length prefix plus the `JSON` header,
+//!   so a multi-GB shard's metadata can be inspected with a single
+//!   ~1 MiB sequential fetch.
 //! - `parse_npz()` — read an `.npz` archive into a `HashMap<String, NpzTensor>`
 //!   (requires `npz` feature)
 //! - `inspect_npz()` / `inspect_npz_from_reader()` — header-only `NPZ`
@@ -108,8 +114,9 @@ pub use parse::{
 #[cfg(feature = "pth")]
 pub use parse::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
 pub use parse::{
-    AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
-    QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
+    parse_safetensors_header, parse_safetensors_header_from_reader, AwqCompanions, AwqConfig,
+    Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,
+    TensorEntry, TensorRole,
 };
 #[cfg(feature = "awq")]
 pub use remember::dequantize_awq_to_bf16;

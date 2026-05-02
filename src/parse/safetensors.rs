@@ -2,8 +2,19 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Read;
 
 use crate::error::AnamnesisError;
+
+/// Sanity cap on the safetensors header length declared by the 8-byte
+/// little-endian prefix.
+///
+/// The safetensors specification does not enforce a maximum, but a fixed
+/// upper bound prevents an adversarial reader from triggering an arbitrary
+/// allocation by claiming a huge header. 100 MiB is two orders of magnitude
+/// beyond any real header (a 100 k-tensor shard ships well under 1 MiB of
+/// `JSON`).
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Dtype
@@ -901,10 +912,16 @@ fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
 /// Extracts all tensor metadata (names, shapes, dtypes, byte offsets),
 /// classifies each tensor (quantized, scale, passthrough), and detects
 /// the quantization scheme (fine-grained `FP8`, per-tensor `FP8`, `GPTQ`,
-/// or unquantized).
+/// `AWQ`, `BnB`, or unquantized).
 ///
-/// The buffer must contain at least the 8-byte length prefix and the full
-/// JSON header. It may also contain the tensor data (the data is not read).
+/// The buffer must contain at least the 8-byte length prefix, the full
+/// `JSON` header, **and** the tensor data section (the upstream
+/// `safetensors` crate validates buffer length against the largest data
+/// offset declared by the header). Callers that have only the prefix +
+/// `JSON` available — for example, an `HTTP`-range adapter that wants to
+/// avoid downloading the data — should use
+/// [`parse_safetensors_header_from_reader`] instead, which is built on a
+/// `JSON`-only path that does not require the data section to be present.
 ///
 /// # Errors
 ///
@@ -919,7 +936,22 @@ fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
 pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeader> {
     let (header_size, metadata) =
         safetensors::SafeTensors::read_metadata(buffer).map_err(AnamnesisError::from)?;
+    build_header_from_metadata(header_size, &metadata)
+}
 
+/// Builds a [`SafetensorsHeader`] from a pre-parsed
+/// `safetensors::tensor::Metadata`.
+///
+/// Shared core of the slice-based [`parse_safetensors_header`] and the
+/// reader-based [`parse_safetensors_header_from_reader`]; the two entry
+/// points differ only in how they obtain the parsed `Metadata` (via
+/// `SafeTensors::read_metadata`, which requires the full buffer including
+/// the data section, vs. via `serde_json::from_slice` on just the `JSON`
+/// header bytes).
+fn build_header_from_metadata(
+    header_size: usize,
+    metadata: &safetensors::tensor::Metadata,
+) -> crate::Result<SafetensorsHeader> {
     let st_tensors = metadata.tensors();
     let mut entries = Vec::with_capacity(st_tensors.len());
 
@@ -927,7 +959,7 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
         let dtype = Dtype::try_from(info.dtype)?;
         let role = classify_tensor(name, dtype);
         entries.push(TensorEntry {
-            name: name.clone(),
+            name: (*name).clone(),
             dtype,
             shape: info.shape.clone(),
             data_offsets: info.data_offsets,
@@ -968,6 +1000,102 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
         awq_config,
         bnb_config,
     })
+}
+
+/// Parses a `.safetensors` header from any `Read` source.
+///
+/// This is the reader-generic core of the safetensors parsing API: callers
+/// supply any `Read` substrate (in-memory `Cursor`, an `HTTP`-range-backed
+/// adapter, a custom transport, …) and receive the same
+/// [`SafetensorsHeader`] as the slice-based [`parse_safetensors_header`].
+/// The slice-based variant remains available for callers that already have
+/// the prefix + `JSON` bytes materialised.
+///
+/// # Range-read access pattern
+///
+/// The safetensors header lives at file offsets `[0, 8 + length)` — exactly
+/// the bytes a sequential `Read` produces in order. Two contiguous logical
+/// fetches are sufficient:
+///
+/// 1. **8 bytes at offset 0** — the little-endian `u64` length prefix.
+/// 2. **`length` bytes starting at offset 8** — the `JSON` header itself
+///    (typically a few hundred KiB on a multi-GB shard).
+///
+/// No `Seek` is required: the header is purely prefix-then-`JSON`, so the
+/// simplest possible `HTTP`-range adapter (one connection, two contiguous
+/// range fetches, never seek-back) satisfies this function. This is the
+/// reason the trait bound is `R: Read` rather than `R: Read + Seek` — no
+/// parser code seeks backwards.
+///
+/// Anamnesis itself does not ship an `HTTP` transport; the network layer
+/// belongs in downstream crates (e.g., `hf-fm`'s safetensors range-reader).
+/// This function defines the I/O contract such an adapter must satisfy.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails to produce the
+/// requested bytes (8-byte length prefix or `length` bytes of `JSON`).
+///
+/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed or
+/// the declared length exceeds the 100 MiB sanity cap.
+///
+/// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognised
+/// dtype.
+///
+/// # Source context
+///
+/// Errors describe the **format-level problem**, not the source identity.
+/// The function is reader-agnostic — the source could be a file, an
+/// in-memory `Cursor`, or an `HTTP`-range adapter. Callers that have a
+/// source name (filename, URL, etc.) should wrap the returned error with
+/// that context. This matches anamnesis's existing convention
+/// ([`parse_safetensors_header`] and `inspect_npz_from_reader` already
+/// return source-agnostic errors).
+///
+/// # Memory
+///
+/// Allocates `8 + header_size` bytes for the prefix + `JSON` buffer plus a
+/// `Vec<TensorEntry>` proportional to the number of tensors in the header
+/// (typically hundreds). No tensor data is read. The declared header
+/// length is capped at 100 MiB to bound the worst-case allocation an
+/// adversarial source can trigger.
+pub fn parse_safetensors_header_from_reader<R: Read>(
+    mut reader: R,
+) -> crate::Result<SafetensorsHeader> {
+    // Read the 8-byte little-endian length prefix.
+    let mut prefix = [0u8; 8];
+    reader.read_exact(&mut prefix)?;
+    let header_len_u64 = u64::from_le_bytes(prefix);
+
+    if header_len_u64 > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "safetensors header length {header_len_u64} exceeds \
+                 {MAX_SAFETENSORS_HEADER_BYTES}-byte cap"
+            ),
+        });
+    }
+    let header_len = usize::try_from(header_len_u64).map_err(|_| AnamnesisError::Parse {
+        reason: format!("safetensors header length {header_len_u64} does not fit in usize"),
+    })?;
+
+    // Read just the `JSON` header bytes — no data section.
+    let mut json_bytes = vec![0u8; header_len];
+    reader.read_exact(&mut json_bytes)?;
+
+    // Bypass `safetensors::SafeTensors::read_metadata` (which would
+    // require the buffer to contain the data section as well) and
+    // deserialise the `JSON` header directly. The upstream `Metadata`
+    // type implements `serde::Deserialize`, so this is the same parsing
+    // step `read_metadata` performs internally — without the
+    // post-parsing buffer-length check that fails on a header-only
+    // buffer.
+    let metadata: safetensors::tensor::Metadata =
+        serde_json::from_slice(&json_bytes).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to parse safetensors header: {e}"),
+        })?;
+
+    build_header_from_metadata(header_len, &metadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,5 +1488,143 @@ mod tests {
             scale.map(|e| e.name.as_str()),
             Some("layer.weight_scale_inv")
         );
+    }
+
+    // -- Reader-generic header parsing (Phase 4.8) ---------------------------
+
+    /// `parse_safetensors_header_from_reader` over an in-memory `Cursor`
+    /// returns a `SafetensorsHeader` whose every field matches what the
+    /// slice-based `parse_safetensors_header` returns on the same bytes.
+    /// Locks the contract that the reader-generic and slice-based APIs are
+    /// substrate-equivalent — the substrate (slice vs. cursor vs. HTTP-range
+    /// adapter) cannot change the metadata.
+    #[test]
+    fn parse_from_reader_matches_slice_minimal() {
+        use safetensors::tensor::{serialize, TensorView};
+
+        // One BF16 tensor: 2 elements × 2 bytes = 4 bytes of data.
+        let data: Vec<u8> = vec![0; 4];
+        let tensors = vec![(
+            "test_tensor",
+            TensorView::new(safetensors::Dtype::BF16, vec![2], &data)
+                .unwrap_or_else(|e| panic!("TensorView: {e}")),
+        )];
+        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+
+        let slice_header =
+            parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("slice parse: {e}"));
+        let reader_header = parse_safetensors_header_from_reader(std::io::Cursor::new(&buffer))
+            .unwrap_or_else(|e| panic!("reader parse: {e}"));
+
+        assert_eq!(slice_header.tensors.len(), reader_header.tensors.len());
+        assert_eq!(slice_header.scheme, reader_header.scheme);
+        assert_eq!(slice_header.metadata, reader_header.metadata);
+        assert_eq!(slice_header.header_size, reader_header.header_size);
+        for (a, b) in slice_header
+            .tensors
+            .iter()
+            .zip(reader_header.tensors.iter())
+        {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.dtype, b.dtype);
+            assert_eq!(a.shape, b.shape);
+            assert_eq!(a.data_offsets, b.data_offsets);
+            assert_eq!(a.role, b.role);
+        }
+    }
+
+    /// Substrate-equivalence on a buffer that exercises the FP8 quantized
+    /// scheme detection path: weight + companion `_scale_inv` + passthrough
+    /// norm. Asserts both APIs detect `FineGrainedFp8` and report the same
+    /// per-tensor metadata.
+    #[test]
+    fn parse_from_reader_matches_slice_fp8_with_scale() {
+        use safetensors::tensor::{serialize, TensorView};
+
+        let weight_data: Vec<u8> = vec![0; 4];
+        let scale_data: Vec<u8> = vec![0; 8];
+
+        let tensors = vec![
+            (
+                "layer.weight",
+                TensorView::new(safetensors::Dtype::F8_E4M3, vec![2, 2], &weight_data)
+                    .unwrap_or_else(|e| panic!("weight TensorView: {e}")),
+            ),
+            (
+                "layer.weight_scale_inv",
+                TensorView::new(safetensors::Dtype::F32, vec![1, 2], &scale_data)
+                    .unwrap_or_else(|e| panic!("scale TensorView: {e}")),
+            ),
+        ];
+        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+
+        let slice_header =
+            parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("slice parse: {e}"));
+        let reader_header = parse_safetensors_header_from_reader(std::io::Cursor::new(&buffer))
+            .unwrap_or_else(|e| panic!("reader parse: {e}"));
+
+        assert_eq!(slice_header.scheme, QuantScheme::FineGrainedFp8);
+        assert_eq!(reader_header.scheme, QuantScheme::FineGrainedFp8);
+        assert_eq!(slice_header.tensors.len(), reader_header.tensors.len());
+        assert_eq!(
+            slice_header.quantized_count(),
+            reader_header.quantized_count()
+        );
+        assert_eq!(slice_header.scale_count(), reader_header.scale_count());
+        assert_eq!(slice_header.header_size, reader_header.header_size);
+    }
+
+    /// A reader that yields fewer than 8 bytes for the length prefix surfaces
+    /// as [`AnamnesisError::Io`] rather than [`AnamnesisError::Parse`]. This
+    /// preserves the documented contract — read failures and format failures
+    /// are distinct error variants — and matches the `# Source context`
+    /// rustdoc convention.
+    #[test]
+    fn parse_from_reader_rejects_truncated_prefix() {
+        let truncated: Vec<u8> = vec![0, 0, 0]; // < 8 bytes
+        match parse_safetensors_header_from_reader(std::io::Cursor::new(&truncated)) {
+            Err(AnamnesisError::Io(_)) => {}
+            Ok(_) => panic!("expected Err for truncated prefix, got Ok"),
+            Err(other) => panic!("expected AnamnesisError::Io, got {other:?}"),
+        }
+    }
+
+    /// A reader that declares a length larger than the 100 MiB sanity cap
+    /// surfaces as [`AnamnesisError::Parse`] without attempting the
+    /// allocation. Guards against an adversarial source that lies about the
+    /// header size to trigger an arbitrary memory request.
+    #[test]
+    fn parse_from_reader_rejects_oversized_header_length() {
+        // Declared length: cap + 1.
+        let bogus_len = MAX_SAFETENSORS_HEADER_BYTES + 1;
+        let prefix = bogus_len.to_le_bytes();
+        match parse_safetensors_header_from_reader(std::io::Cursor::new(&prefix[..])) {
+            Err(AnamnesisError::Parse { reason }) => {
+                assert!(
+                    reason.contains("exceeds") && reason.contains("cap"),
+                    "expected oversized-length error, got: {reason}"
+                );
+            }
+            Ok(_) => panic!("expected Err for oversized header, got Ok"),
+            Err(other) => panic!("expected AnamnesisError::Parse, got {other:?}"),
+        }
+    }
+
+    /// A reader whose declared length is honest but whose JSON tail is
+    /// truncated surfaces as [`AnamnesisError::Io`] (the read of the JSON
+    /// bytes fails part-way through). This is the partial-fetch failure mode
+    /// an HTTP-range adapter must distinguish from a malformed header.
+    #[test]
+    fn parse_from_reader_rejects_truncated_json_tail() {
+        // Honest 64-byte declared header, but only 8-byte prefix + 4 bytes
+        // of JSON delivered before the reader runs out.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        buf.extend_from_slice(b"{\"a\"");
+        match parse_safetensors_header_from_reader(std::io::Cursor::new(&buf)) {
+            Err(AnamnesisError::Io(_)) => {}
+            Ok(_) => panic!("expected Err for truncated JSON tail, got Ok"),
+            Err(other) => panic!("expected AnamnesisError::Io, got {other:?}"),
+        }
     }
 }

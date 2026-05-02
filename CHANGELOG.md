@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`parse_safetensors_header_from_reader<R: Read>`** — reader-generic
+  safetensors header parsing. Accepts any `Read` substrate (in-memory
+  `Cursor`, `HTTP`-range-backed adapter, custom transport) and returns the
+  same `SafetensorsHeader` as the existing slice-based
+  `parse_safetensors_header`. Reads only the 8-byte little-endian length
+  prefix plus the `JSON` header — total transfer ≈ header size (~1 MiB on
+  a multi-GB shard) instead of the full file. The trait bound is `R: Read`
+  rather than `R: Read + Seek` because the safetensors layout is purely
+  prefix-then-`JSON`: two contiguous reads in order, never seek-back —
+  keeping the simplest possible HTTP-range adapter (one connection, two
+  range fetches) viable. A 100 MiB sanity cap on the declared header
+  length bounds the worst-case allocation an adversarial source can
+  trigger. Unblocks `hf-fm` v0.11.1, retiring `hf-fm`'s bespoke
+  `fetch_header_bytes` parser and removing the only remaining duplicated
+  format-knowledge between the two crates. Anamnesis itself takes on no
+  network or TLS dependency. Phase 4.8; see [`ROADMAP.md`](ROADMAP.md).
+- **`parse_safetensors_header` and `parse_safetensors_header_from_reader`
+  re-exported from the crate root** — both functions are now reachable as
+  `anamnesis::parse_safetensors_header` and
+  `anamnesis::parse_safetensors_header_from_reader`, joining the existing
+  path-based `anamnesis::parse`. The slice-based variant was previously
+  only reachable via the longer `anamnesis::parse::safetensors::…` path.
+- **5 new safetensors unit tests** covering the reader-generic path:
+  `parse_from_reader_matches_slice_minimal` (substrate-equivalence on a
+  single-tensor `BF16` buffer), `parse_from_reader_matches_slice_fp8_with_scale`
+  (FP8 + `_scale_inv` scheme detection), `parse_from_reader_rejects_truncated_prefix`
+  (`<8`-byte readers surface as `Io`), `parse_from_reader_rejects_oversized_header_length`
+  (declared length above the 100 MiB cap surfaces as `Parse` without
+  attempting allocation), and `parse_from_reader_rejects_truncated_json_tail`
+  (partial-fetch in the JSON tail surfaces as `Io`). Plus 2 new
+  `cross_validation` integration tests
+  (`parse_safetensors_path_and_reader_agree_on_synthetic_fixture` and
+  `parse_safetensors_path_and_reader_agree_on_disk_round_trip`) asserting
+  field-for-field parity between the slice-based and reader-based APIs on
+  an in-memory FP8 + scale + passthrough fixture and on a temp-file
+  round-trip.
+
+### Changed
+
+- **Crate-level rustdoc and README** updated to surface the three forms
+  of header-only safetensors parsing (path-based, slice-based,
+  reader-generic) in a single place. New "Safetensors Header Inspection"
+  section in the README mirrors the existing NPZ entry; the table of
+  contents links to it.
+
 ## [0.4.3] - 2026-05-01
 
 ### Added

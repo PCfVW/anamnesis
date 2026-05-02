@@ -21,6 +21,7 @@
   - [AWQ Dequantization](#awq-dequantization)
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
   - [GGUF Block-Quant Dequantization](#gguf-block-quant-dequantization)
+- [Safetensors Header Inspection](#safetensors-header-inspection)
 - [NPZ/NPY Parsing](#npznpy-parsing)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [Used by](#used-by)
@@ -152,6 +153,12 @@ Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors
 > **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` and `IQ3_*` kernels land in the 2.8×–4.4× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. The `IQ1_*` kernels are notably faster (7.9×–15.0×) because their inner loop replaces the per-element sign branch with a single scalar `±delta` per 8-element group, and the codebook gather is a plain `[u64; 2048]` table lookup. The ternary `TQ*` kernels are the **fastest in the crate** (26×–36×) — no codebook lookup at all, just bit shifts (`TQ2_0`) or a base-3 multiplication trick (`TQ1_0`) decoding directly to `{-d, 0, +d}`. `MXFP4` lands at 30× — structurally identical to `IQ4_NL` (12.2×) but with a tighter 17 B/block layout (1 B `E8M0` exponent vs 2 B `f16`) and a smaller codebook (16 entries × 4-bit nibble lookup) that the auto-vectoriser handles cleanly. Phase 9 (CPU SIMD pass) will further address the IQ2/IQ3 case with hand-written AVX2 intrinsics.
 
 > **Limitations (peak heap):** Whole-model dequantisation via `ParsedModel::remember` or `amn remember model.gguf -o out.safetensors` retains every dequantised tensor in heap memory simultaneously until the underlying `safetensors::serialize_to_file` call returns. Peak heap is `O(total_BF16_output_size)` ≈ `2 × n_parameters` bytes — comfortable for **≤7 B** models on a 32 GB system, **tight at 13 B**, **OOMs at 70 B+**. The single-tensor kernel `dequantize_gguf_blocks_to_bf16` is already streaming (O(one block)); the orchestrator-level streaming output path is planned for Phase 10 — see [ROADMAP.md](ROADMAP.md). Phase 9 (SIMD) and Phase 10 (streaming) are independent; this perf table will be unaffected by Phase 10 because the per-tensor kernel timings stay the same.
+
+### Safetensors Header Inspection
+
+Header-only safetensors parsing ships in three forms. The path-based `parse(path)` memory-maps the file and returns a `ParsedModel` (header + mmap-backed buffer) ready for `inspect()` or `remember()`; the slice-based `parse_safetensors_header(&[u8])` operates on a buffer that already contains the prefix and JSON; and `parse_safetensors_header_from_reader<R: Read>(reader)` accepts any `Read` substrate (in-memory `Cursor`, HTTP-range-backed adapter, custom transport) and reads only the 8-byte length prefix plus the JSON header. Total transfer ≈ header size (~1 MiB on a multi-GB shard) instead of the full file.
+
+`Read` — not `Read + Seek` — is sufficient because the safetensors layout is purely prefix-then-JSON: two contiguous reads in order, never seek-back. This keeps the simplest possible HTTP-range adapter (one connection, two range fetches) viable. Anamnesis itself takes on no network or TLS dependency — downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `parse_safetensors_header_from_reader` for the access pattern.
 
 ### NPZ/NPY Parsing
 
