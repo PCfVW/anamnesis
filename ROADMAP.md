@@ -389,6 +389,29 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Why no `Seek`:** the safetensors header lives at file offsets `[0, 8 + length)` — exactly the bytes a sequential `Read` produces in order. A `Read + Seek` constraint would force HTTP-range adapters to handle seek-back even though no parser code seeks backwards. Keeping the constraint at `Read` means the simplest possible HTTP-range implementation works (one connection, two contiguous range fetches, never seek-back).
 
+**Source-context convention** *(applies across Phases 4.8 / 4.9 / 4.10)*: errors from the reader-generic primitives describe the **format-level problem** (e.g., *"safetensors header length read failed"*, *"GGUF tensor info malformed"*), **not** the source identity (filename, URL, repo id). The functions are reader-agnostic — the source could be a file, an in-memory `Cursor`, or an HTTP-range adapter. Callers that have a source name should wrap the returned error with that context (that is hf-fm's role in v0.11.1+). This matches anamnesis's existing convention (`parse_safetensors_header(&[u8])` and `inspect_npz_from_reader` already return source-agnostic errors). The recommended rustdoc shape for the new entry-point makes this explicit:
+
+```rust
+/// Parses a safetensors header from any `Read` source.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails to produce the
+/// requested bytes (8-byte length prefix or `length` bytes of JSON).
+/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed.
+///
+/// # Source context
+///
+/// Errors describe the **format-level problem**, not the source
+/// identity. The function is reader-agnostic — the source could be a
+/// file, an in-memory `Cursor`, or an HTTP-range adapter. Callers that
+/// have a source name (filename, URL, etc.) should wrap the returned
+/// error with that context. See the crate-level docs for the
+/// recommended pattern.
+```
+
+The same `# Source context` block (with format name swapped) should appear on `inspect_gguf_from_reader` and `inspect_pth_from_reader`, so all four reader-generic primitives (`inspect_npz_from_reader` already shipped + the three new ones) document the convention uniformly.
+
 ### Phase 4.9: Reader-generic GGUF inspection
 
 **Goal:** Add `inspect_gguf_from_reader<R: Read + Seek>` so any caller bringing a positional source can extract GGUF metadata (header, KV pairs, tensor info table) without materialising the data segment. Unblocks `hf-fm` v0.11.2 (remote GGUF inspection — the originally-promised v0.11.0 feature, now landing on the `HttpRangeReader` adapter `hf-fm` builds in v0.11.0).
