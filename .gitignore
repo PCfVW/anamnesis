@@ -18,3 +18,7 @@ docs/EXTERNAL AUDIT/
 
 # Investigation folders (large binary artifacts from format spelunking)
 docs/investigations/
+
+# Coordination-contract design memo (private working draft, not yet
+# published — will be either committed or published externally later)
+docs/coordination-contract.md

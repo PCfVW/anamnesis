@@ -24,7 +24,71 @@ the [Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/
 | Write a bulk conversion loop | [`// VECTORIZED:`](#vectorized-annotation), [SIMD-friendly loop rules](#when-writing-simd-friendly-loops) |
 | Write error strings | [Error message wording](#error-message-wording) |
 | Batch operations by key | [HashMap grouping idiom](#hashmap-grouping-idiom) |
+| Parse a header, archive, or stream from caller input | [Untrusted input invariants](#when-parsing-untrusted-input) |
 | Add `#[allow(clippy::...)]` for a newer lint | [MSRV lint guard](#msrv-lint-guard) |
+
+---
+
+## Annotation Grammar
+
+The `// CAST:`, `// INDEX:`, `// BITWISE:`, `// VECTORIZED:`, `// BORROW:`,
+`// TRAIT_OBJECT:`, `// SAFETY:`, `// EXPLICIT:`, and `// EXHAUSTIVE:`
+comments below pair with `#[allow(clippy::…)]` attributes that suppress the
+crate's [lint floor](#lint-floor). The comment explains *why*; the attribute
+is what makes the code build under `#![deny(warnings)]`.
+
+### Comment ↔ attribute pairing
+
+| Annotation | Companion attribute(s) |
+|---|---|
+| `// CAST:` | `#[allow(clippy::as_conversions)]` plus, as the cast requires, `cast_precision_loss`, `cast_possible_truncation`, `cast_possible_wrap` |
+| `// INDEX:` | `#[allow(clippy::indexing_slicing)]` |
+| `// EXHAUSTIVE:` | `#[allow(clippy::wildcard_enum_match_arm)]` or `#[allow(clippy::exhaustive_enums)]` |
+| `// SAFETY:` | `#[allow(unsafe_code)]` (at item or block scope) |
+| `// BITWISE:`, `// VECTORIZED:`, `// BORROW:`, `// TRAIT_OBJECT:`, `// EXPLICIT:` | none — these are documentation-only |
+
+### Per-site vs block-scope
+
+Single suppressed line: attribute immediately above.
+
+> ```rust
+> // CAST: u32 → f32, qz is at most 255, exact in f32
+> #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+> let val = qz as f32;
+> ```
+
+Tight loop where every iteration shares the same invariant: one block-scope
+`#[allow]` plus one comment for the whole loop. If different lines need
+different justifications, fall back to per-line.
+
+> ```rust
+> #[allow(clippy::indexing_slicing)]
+> for (j, qw_chunk) in qw_row.chunks_exact(4).enumerate() {
+>     // INDEX: chunks_exact(4) guarantees exactly 4 bytes; j < out_features
+>     // bounded by qw_row length validation above
+>     let packed = u32::from_le_bytes([qw_chunk[0], qw_chunk[1], qw_chunk[2], qw_chunk[3]]);
+> }
+> ```
+
+### Lint Floor
+
+The annotations exist because `Cargo.toml`'s `[lints.clippy]` block denies
+the underlying lints crate-wide. The relevant settings:
+
+| Lint | Level | How to satisfy |
+|---|---|---|
+| `unwrap_used`, `expect_used`, `panic` | `deny` | never use these in library code |
+| `indexing_slicing` | `deny` | `// INDEX:` + `#[allow(clippy::indexing_slicing)]` |
+| `wildcard_enum_match_arm` | `deny` | `// EXHAUSTIVE:` + `#[allow(clippy::wildcard_enum_match_arm)]` |
+| `as_conversions` | `warn` | `// CAST:` + `#[allow(clippy::as_conversions, …)]` |
+| `must_use_candidate` | `warn` | annotate the function with `#[must_use]` |
+| `missing_errors_doc` | `warn` | write a `# Errors` doc section |
+| `missing_panics_doc` | `warn` | panics are denied; if `#[allow(clippy::panic)]` is ever needed for a specific reason, write `# Panics` |
+| `explicit_iter_loop`, `manual_filter_map`, `manual_find_map`, `needless_range_loop` | `warn` | use iterator methods (`.iter()`, `.filter_map()`, `.find_map()`) instead of indexed loops |
+| `pedantic` (priority -1) | `warn` | per-lint allow with explanatory comment |
+
+`#![deny(warnings)]` promotes every `warn` to a hard error — the discipline
+is not optional. Keep the table in sync with `Cargo.toml`'s `[lints.clippy]`.
 
 ---
 
@@ -144,10 +208,9 @@ Follow these rules for function parameters:
 | Owned, consumed by callee | Pass by value (move semantics) |
 | `&mut T` not actually mutated in body | Change to `&T` |
 
-Never accept `&mut T` when the function body never writes through the
-reference; Clippy's `needless_pass_by_ref_mut` will flag it. Similarly,
-`trivially_copy_pass_by_ref` flags `&T` where `T: Copy` and is small
-enough to pass by value.
+Clippy enforces both directions: `needless_pass_by_ref_mut` flags `&mut T`
+that is never written through; `trivially_copy_pass_by_ref` flags `&T` for
+small `Copy` types.
 
 ---
 
@@ -165,8 +228,10 @@ enough to pass by value.
 
 ## When Writing Expressions
 
-These annotations are required **on or immediately before** the line where
-the pattern occurs. Apply them as you write the line, not in a review pass.
+These annotations are required at the smallest scope that captures the
+suppression — per-line for a single occurrence, block-scope for a tight
+loop with a shared invariant (see [Annotation Grammar](#annotation-grammar)).
+Apply them as you write the line, not in a review pass.
 
 ### CAST Annotation
 
@@ -179,12 +244,11 @@ the bit-level reinterpretation is the whole point (as in dequantization).
 
 ### INDEX Annotation
 
-`// INDEX: <reason>` — required on every direct slice index (`slice[i]`, `slice[a..b]`) that cannot
-be replaced by an iterator. Direct indexing panics on out-of-bounds; prefer
-`.get(i)` with `?` or explicit error handling. Use direct indexing only when
-the bound is provably valid and an iterator idiom would be significantly less
-readable. See also [reconciling bounds checking with vectorization](#reconciling-bounds-checking-with-vectorization)
-for how this rule interacts with the SIMD rules in hot loops.
+`// INDEX: <reason>` — required on every direct slice index (`slice[i]`,
+`slice[a..b]`). Direct indexing panics on out-of-bounds; prefer `.get(i)?`
+unless the bound is provably valid and indexing is significantly more
+readable than the iterator idiom. For SIMD hot loops see
+[reconciling bounds checking with vectorization](#reconciling-bounds-checking-with-vectorization).
 > Example: `// INDEX: offset is bounded by header.data_offsets checked above`
 > Example: `// INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk`
 
@@ -200,11 +264,13 @@ must be traceable through the annotations.
 
 ### VECTORIZED Annotation
 
-`// VECTORIZED: <verification>` — required on every bulk conversion loop that is expected to auto-vectorize.
-Document how vectorization was verified and on which target.
-> Example: `// VECTORIZED: confirmed AVX2 vmulps + vpermb in cargo-show-asm, x86-64, opt-level=3`
-> Example: `// VECTORIZED: confirmed AVX2 vsubps+vmulps (target-cpu=native) via --emit=asm`
+`// VECTORIZED: <state>` — required on every hot-path conversion loop. Three
+states (`confirmed`, `scalar fallback`, `pending`); see
+[Verify vectorization](#verify-vectorization) for the full policy and the
+evidence each state requires.
+> Example: `// VECTORIZED: confirmed AVX2 vsubps + vmulps in cargo-show-asm, x86-64 target-cpu=native, opt-level=3`
 > Example: `// VECTORIZED: scalar fallback — loop body contains branch that defeats auto-vectorization`
+> Example: `// VECTORIZED: pending cargo-show-asm verification`
 
 ### BORROW Annotation
 
@@ -224,23 +290,35 @@ Document how vectorization was verified and on which target.
 
 `// SAFETY: <invariants>` — required on every `unsafe` block or function (inline comment, not a doc comment).
 
-anamnesis is `#![forbid(unsafe_code)]` **by default**. The one anticipated
-exception is explicit SIMD intrinsics (e.g., `#[target_feature(enable = "avx2")]`),
-which require `unsafe` by language rules even though the operations are safe
-in practice. If `unsafe` becomes necessary, follow the candle-mi pattern:
+anamnesis is `#![deny(unsafe_code)]` at the crate root. `deny` (not `forbid`)
+lets feature-gated modules opt in via a local `#[allow(unsafe_code)]` +
+`// SAFETY:` comment. Current opt-ins are in the table below; SIMD intrinsics
+(`#[target_feature(enable = "avx2")]`) are an anticipated future opt-in,
+required by language rules even when the operations are safe in practice.
+New opt-ins follow the candle-mi pattern:
 
 | Feature | Accepted `unsafe` scope |
 |---------|------------------------|
-| `simd`  | `#[target_feature]` functions for explicit SIMD in conversion loops |
 | *(always-on)* + `pth` + `gguf` | `memmap2::Mmap::map(&file)` for tensor file mmap. Used by `parse()` (safetensors, always-on), `parse_pth`, and `parse_gguf`. Same invariants as the upstream `safetensors` crate's mmap path: read-only artefact assumption — concurrent writes by another process are undefined behaviour. |
 
 Each accepted use must satisfy all of:
-1. The `unsafe` block is in a **single, dedicated module** (e.g., `src/remember/simd.rs`)
-   — never scattered across the codebase.
+1. The `unsafe` is concentrated, never scattered — either a single, dedicated
+   module (e.g., a future `src/remember/simd.rs` for SIMD intrinsics) or a
+   single, tightly-scoped `unsafe { … }` call inside the parser module that
+   needs it (the current shape for `memmap2::Mmap::map(&file)` in the
+   safetensors, `pth`, and `gguf` parsers).
 2. Every `unsafe` block carries a `// SAFETY:` comment documenting the invariants.
-3. The module is gated behind `#[cfg(feature = "...")]` — users who don't
-   enable the feature get `forbid(unsafe_code)` with zero exceptions.
-4. A safe scalar fallback exists and is tested identically.
+3. **Feature-specific opt-ins** are gated behind `#[cfg(feature = "...")]` so
+   users who don't enable the feature compile no `unsafe` code at all (the
+   `#[allow(unsafe_code)]` sites are excluded from their build). Always-on
+   opt-ins (currently: safetensors mmap) are justified by the always-on-ness
+   of the operation — there is no feature for a caller to disable.
+4. **Non-`unsafe` parity where it exists.** SIMD-shaped opt-ins keep a scalar
+   fallback tested identically. mmap-based inspection paths expose a
+   reader-generic alternative (`parse_safetensors_header_from_reader`,
+   `inspect_npz_from_reader`, …) parity-tested against the mmap path. Full
+   mmap-based parsing has no non-`unsafe` equivalent and is exempt — see
+   `ROADMAP.md` for the scope rationale.
 
 Adding a new accepted use requires updating this table and the `cfg_attr` lines
 in `lib.rs`.
@@ -272,10 +350,9 @@ Use the most specific construct for the pattern at hand:
 | Two or more variants with different bodies | `match expr { … }` |
 | Exhaustive dispatch over an enum | `match expr { … }` (never `if let` chains) |
 
-Never use a `match` with a single non-`_` arm and a no-op `_ => {}` where
-`if let` or `matches!` would be clearer (Clippy: `single_match`,
-`match_like_matches_macro`). Conversely, never chain three or more
-`if let … else if let …` arms where a `match` would be exhaustive.
+Two anti-patterns Clippy flags: a `match` with one non-`_` arm and `_ => {}`
+(`single_match`, `match_like_matches_macro`); three-or-more `if let … else
+if let …` chains that should be a `match`.
 
 ### EXPLICIT Annotation
 
@@ -309,6 +386,95 @@ Rules:
 - Use lowercase, no trailing period.
 - Include the offending value and the valid range or constraint when applicable.
 - Wrap external errors with `: {e}`, not `.to_string()`.
+
+---
+
+## When Parsing Untrusted Input
+
+Tensor archives are attacker-controllable: a malicious `.safetensors`,
+`.npz`, `.pth`, or `.gguf` can claim arbitrary dimensions, point at
+arbitrary offsets, or (pickle) reference arbitrary Python globals. The
+following invariants hold at every parser entry point.
+
+### Checked arithmetic on header-derived sizes and offsets
+
+Every multiplication or addition that combines values read from the input
+(declared shape, element count, offset, length) must use `checked_*` and
+map an overflow to `AnamnesisError::Parse`. `usize` arithmetic on
+attacker-controlled inputs is a documented bug class — assume it can
+overflow on 32-bit targets even when 64-bit math would not.
+
+> ✅ Single-step pattern (e.g., adding a base offset):
+> ```rust
+> let abs_end = data_offset
+>     .checked_add(end)
+>     .ok_or_else(|| AnamnesisError::Parse {
+>         reason: "tensor data end offset overflow".into(),
+>     })?;
+> ```
+>
+> Chained multiplications use `.and_then`:
+> ```rust
+> let expected_qw_len = packed_rows
+>     .checked_mul(out_features)
+>     .and_then(|n| n.checked_mul(4))
+>     .ok_or_else(|| AnamnesisError::Parse {
+>         reason: "qweight byte length overflow".into(),
+>     })?;
+> ```
+
+`saturating_*` and `wrapping_*` are not substitutes — silent saturation or
+wrapping on a header-derived size is a parser bug, not a recovery strategy.
+Use `saturating_sub` only for non-security display computations (e.g., a
+byte count that can legitimately be zero).
+
+### Magic-byte plus minimum-size guard
+
+Format detection must read the magic bytes via `.get(..N)` (not direct
+indexing) so that a file shorter than `N` bytes produces a parser error,
+not a panic. Detect known-but-unsupported variants (legacy formats,
+byte-swapped headers) before falling through to a generic "not a valid X"
+error — the better diagnostic helps users distinguish a corrupt file from
+a wrong-format file.
+
+> ✅ Pattern from the `.pth` and `GGUF` parsers:
+> ```rust
+> let magic = raw.get(..4).ok_or_else(|| AnamnesisError::Parse {
+>     reason: "file too small to be a .pth archive".into(),
+> })?;
+> if magic.first() == Some(&0x80) && magic.get(1).is_some_and(|&b| b <= 0x05) {
+>     return Err(AnamnesisError::Unsupported {
+>         format: "pth".into(),
+>         detail: "legacy .pth format (pre-PyTorch 1.6) is not supported".into(),
+>     });
+> }
+> if magic != b"PK\x03\x04" {
+>     return Err(AnamnesisError::Parse {
+>         reason: "file is not a ZIP archive (missing PK\\x03\\x04 magic)".into(),
+>     });
+> }
+> ```
+
+### Allowlist, never denylist
+
+Decoders that interpret opcodes, type tags, or symbolic references
+(pickle VM, opcode handlers) accept an explicit allowlist; everything else
+returns `AnamnesisError::Unsupported`. Never write a denylist — the attacker
+chooses what to send, and the unknown set is unbounded.
+
+Canonical example: the pickle VM in the `.pth` parser allowlists `GLOBAL`
+references (`torch._utils.…`, `collections.OrderedDict`, …); all others
+return `Unsupported`. New parsers that interpret input symbols follow the
+same shape.
+
+### Pre-validate slices once, iterate branch-free inside
+
+The two-level rule from
+[Reconciling bounds checking with vectorization](#reconciling-bounds-checking-with-vectorization)
+also has a security justification: per-element `.get()? / .ok_or` inside a
+loop spreads the bounds proof across N return paths; pre-validating once
+concentrates it at one readable site. Applies in every parser hot path, not
+just dequant kernels.
 
 ---
 
@@ -439,12 +605,14 @@ passes.
 
 > ✅ Two passes — byte extraction then float arithmetic:
 > ```rust
-> // Pass 1: unpack bytes → f32 scratch buffer (partially vectorizes)
+> // VECTORIZED: scalar fallback — Pass-1 of fission; byte unpacking
+> // crosses byte/integer/float domains and is intentionally scalar
 > for (chunk, dst) in raw.chunks_exact(4).zip(scratch.iter_mut()) {
 >     let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
 >     *dst = ((packed >> shift) & mask) as f32;
 > }
-> // Pass 2: pure f32 arithmetic → BF16 output (fully vectorizes to AVX2)
+> // VECTORIZED: confirmed AVX2 vsubps + vmulps in cargo-show-asm,
+> // x86-64 target-cpu=native, opt-level=3
 > for ((&val, &zero, &scale), out) in scratch.iter()
 >     .zip(zeros.iter()).zip(scales.iter()).zip(output.chunks_exact_mut(2)) {
 >     let bf16 = f32_bits_to_bf16_bits(((val - zero) * scale).to_bits());
@@ -481,16 +649,38 @@ the compiler typically fuses the pipeline without fission.
 After writing a hot loop, **verify** that the compiler actually vectorized it.
 Do not assume — auto-vectorization is fragile and can silently regress.
 
-- Use `cargo-show-asm` or `RUSTFLAGS="-C target-cpu=native --emit=asm" cargo
-  build --release` to inspect the generated assembly.
-- Look for packed SIMD instructions: `vmulps`, `vsubps`, `vpsrld`, `vpaddd`,
-  `vpackusdw` (AVX2) or `fmul.4s`, `ushll` (NEON). Scalar variants
-  (`vmulss`, `vsubss`) indicate the loop did not vectorize.
-- If the loop did not vectorize, add a `// VECTORIZED: scalar fallback — <reason>`
-  annotation explaining why and what would need to change.
-- If it did vectorize, add `// VECTORIZED: confirmed <ISA> <key instruction>
-  in cargo-show-asm, <target>, opt-level=3`.
-- Re-verify after any change to the loop body or its dependencies.
+The `// VECTORIZED:` annotation has three states:
+
+- **`// VECTORIZED: confirmed <ISA> <key instruction> in cargo-show-asm,
+  <target>, opt-level=3`** — written when *both* of the following hold:
+  1. The disassembly contains packed SIMD instructions for the loop body
+     (e.g., AVX2: `vmulps`, `vsubps`, `vpsrld`, `vpaddd`, `vpackusdw`;
+     NEON: `fmul.4s`, `ushll`). Scalar variants (`vmulss`, `vsubss`)
+     indicate the loop did not vectorize. Inspect the assembly via
+     `cargo-show-asm` or `RUSTFLAGS="-C target-cpu=native --emit=asm"
+     cargo build --release`.
+  2. A release-mode measurement (best-of-5 median, `target-cpu=native`,
+     real fixture) shows the kernel is at least as fast as the previous
+     scalar baseline. See `CLAUDE.md` § Performance Changes for the
+     measurement protocol. Vectorization presence ≠ throughput
+     improvement — memory-bandwidth-bound kernels can vectorize without
+     speeding up.
+
+- **`// VECTORIZED: scalar fallback — <reason>`** — written when the loop
+  did not vectorize and won't (e.g., a Pass-1 byte-unpacking step in a
+  loop-fission pipeline; a control-flow shape the compiler cannot prove
+  branch-free). The `<reason>` must be specific enough that a reader can
+  tell whether the situation has changed. Pass-1 of every loop-fission
+  kernel carries this annotation; only Pass-2 is expected to vectorize.
+
+- **`// VECTORIZED: pending <what is missing>`** — temporary, written when
+  the kernel was just authored or modified and verification has not yet
+  been performed. **`pending` annotations must resolve to `confirmed` or
+  `scalar fallback` before the next `vX.Y.0` release tag.** A `pending`
+  annotation older than one release is a release blocker, not a TODO.
+
+Re-verify after any change to the loop body or its dependencies — the
+annotation goes back to `pending` and the verification cycle repeats.
 
 ### When auto-vectorization is not enough
 
