@@ -54,6 +54,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bartowski/Qwen2.5-{0.5,1.5}B-Instruct-IQ2_M`, and
   `TheBloke/TinyLlama-1.1B-chat-v1.0` (Q2_K, Q5_0).
 
+### Performance
+
+- **`inspect_gguf_from_reader` ~52× faster on `File` substrate (mmap parity)**.
+  The user-supplied reader is now wrapped internally in
+  `std::io::BufReader<R>` with a 64 KiB buffer, collapsing the parser's
+  many small `read_exact` calls (4–8 B per typed primitive, variable per
+  `gguf_string_t`) from one syscall each into one syscall per
+  buffer-fill. Per-file medians (best-of-5, release, `target-cpu=native`,
+  17 real GGUFs spanning Mistral-7B / Qwen2.5 / SmolLM2 / TinyLlama):
+  Mistral-7B-IQ3_XXS 213 ms → 2.8 ms (**75×**), SmolLM2-135M-Q4_K_M
+  399 ms → 7.6 ms (**53×**), Qwen2.5-1.5B-IQ2_M 1.23 s → 25.4 ms
+  (**48×**), TinyLlama-Q5_0 438 ms → 7.1 ms (**61×**). Aggregate
+  reader/mmap ratio collapsed from median 51.7× / mean 56.6× (slower)
+  to median 1.0× / mean 1.0× (parity, occasionally slightly **faster**
+  than mmap because BufReader does one syscall per 64 KiB while mmap
+  incurs one minor page fault per 4 KiB page touched on the front
+  matter). API unchanged; `R: Read + Seek` is still the bound.
+  Substrate-equivalence on 17/17 real GGUFs preserved. New
+  `tests/bench_gguf_inspect_adhoc.rs` ad-hoc benchmark
+  (`#[ignore]`-gated) lands the regression-detection harness. See
+  [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 5
+  for the full method, fixture list, per-file numbers, and trade-off
+  rationale.
+
 ### Changed
 
 - **GGUF parser cursor generalised to `Read + Seek`** — the slice-based

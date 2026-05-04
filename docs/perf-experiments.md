@@ -28,6 +28,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 2 | FP8 per-tensor chunked extend | **Regressed −23 %** | Never committed (this session, branch is clean) |
 | 3 | v0.4.0 GGUF refactor re-validation | **Split: Q4_0 wins ~8 %, Q8_0 loses ~6 %** | Re-measurement only — current code unchanged |
 | 4 | `parse()`: `fs::read` → `memmap2::Mmap` | **~3000× faster on 11 GiB safetensors** | Shipped |
+| 5 | `inspect_gguf_from_reader`: internal `BufReader<R>` | **~52× faster on `File` substrate, mmap parity** | Shipped |
 
 ---
 
@@ -263,6 +264,128 @@ API surface (`ParsedModel::inspect`, `ParsedModel::remember`,
 **Re-attempting this requires:** N/A — this is the success case. If
 the change ever needs to be reverted, the `bench_parse_adhoc` harness
 is in place to detect a regression.
+
+## Experiment 5 — `inspect_gguf_from_reader`: internal `BufReader<R>` (Tier 1)
+
+**Audit finding:** The Phase 4.9 substrate-equivalence test surfaced
+that `inspect_gguf_from_reader(File::open(path)?)` was 30–100× slower
+than `parse_gguf(path).inspect()` on the same file (e.g., 213 ms vs.
+3.0 ms on a 2.7 GiB Mistral-7B-IQ3_XXS). Diagnosis: the parser issues
+many small `read_exact` calls (4–8 B per typed primitive, variable per
+`gguf_string_t`), and on a `File` substrate every one is a syscall.
+Hypothesis: wrapping the user's reader in a `std::io::BufReader<R>`
+(64 KiB buffer) inside `inspect_gguf_from_reader` collapses those into
+one underlying read per buffer-fill, with no API change and no
+correctness risk (the only `Seek` calls happen at `GgufReader::new`
+*before* any reads, so the buffer is empty when seek is issued — no
+invalidation cost).
+
+**Method:** [`tests/bench_gguf_inspect_adhoc.rs`](../tests/bench_gguf_inspect_adhoc.rs)
+(`bench_gguf_inspect_paths`), best-of-5 release-mode median per file
+with min/max range, target-cpu=native (`$env:RUSTFLAGS = "-C target-cpu=native"`),
+1 warm-up iteration before timing. Compared baseline (no `BufReader`)
+vs. post-Tier-1 (`BufReader::with_capacity(64 * 1024, reader)`) by
+running the bench, applying the patch, running again. 17 real `GGUF`
+files from `tests/fixtures/gguf_reference/models/` spanning 4
+architectures × 11 distinct dtypes × 84 MiB to 2.7 GiB:
+
+- `bartowski/SmolLM2-135M-Instruct` (8 quants: `Q2_K`, `Q3_K_M`, `Q4_0`,
+  `Q4_K_M`, `Q5_K_M`, `Q6_K`, `Q8_0`, `IQ4_XS`)
+- `bartowski/Mistral-7B-Instruct-v0.3` (5 quants: `IQ1_S`, `IQ1_M`,
+  `IQ2_XXS`, `IQ2_XS`, `IQ3_XXS`)
+- `bartowski/Qwen2.5-{0.5,1.5}B-Instruct-IQ2_M`
+- `TheBloke/TinyLlama-1.1B-chat-v1.0` (`Q2_K`, `Q5_0`)
+
+**Result:**
+
+| Aggregate | Baseline reader/mmap ratio | Post-Tier-1 reader/mmap ratio |
+|---|---|---|
+| Min | 46.6× slower | 0.9× (slightly **faster** than mmap) |
+| Median | 51.7× slower | 1.0× (parity) |
+| Mean | 56.6× slower | 1.0× (parity) |
+| Max | 71.4× slower | 1.0× (parity) |
+
+Per-file reader medians (μs), best-of-5:
+
+| File | Baseline | Tier 1 | Reader speedup |
+|---|---:|---:|---:|
+| Mistral-7B-Instruct-v0.3-IQ1_M | 209,452 | 2,845 | **73.6×** |
+| Mistral-7B-Instruct-v0.3-IQ1_S | 213,157 | 2,856 | **74.6×** |
+| Mistral-7B-Instruct-v0.3-IQ2_XS | 214,694 | 2,826 | **76.0×** |
+| Mistral-7B-Instruct-v0.3-IQ2_XXS | 214,768 | 2,881 | **74.5×** |
+| Mistral-7B-Instruct-v0.3-IQ3_XXS | 213,215 | 2,829 | **75.4×** |
+| Qwen2.5-0.5B-Instruct-IQ2_M | 1,228,412 | 25,712 | **47.8×** |
+| Qwen2.5-1.5B-Instruct-IQ2_M | 1,229,113 | 25,424 | **48.3×** |
+| SmolLM2-135M-Instruct-IQ4_XS | 399,473 | 7,538 | **53.0×** |
+| SmolLM2-135M-Instruct-Q2_K | 397,048 | 8,338 | **47.6×** |
+| SmolLM2-135M-Instruct-Q3_K_M | 400,154 | 7,753 | **51.6×** |
+| SmolLM2-135M-Instruct-Q4_0 | 400,510 | 8,054 | **49.7×** |
+| SmolLM2-135M-Instruct-Q4_K_M | 399,283 | 7,578 | **52.7×** |
+| SmolLM2-135M-Instruct-Q5_K_M | 397,638 | 7,558 | **52.6×** |
+| SmolLM2-135M-Instruct-Q6_K | 398,046 | 7,641 | **52.1×** |
+| SmolLM2-135M-Instruct-Q8_0 | 430,908 | 7,560 | **57.0×** |
+| TinyLlama-1.1B-chat-v1.0.Q2_K | 440,615 | 6,961 | **63.3×** |
+| TinyLlama-1.1B-chat-v1.0.Q5_0 | 437,530 | 7,132 | **61.4×** |
+
+The `parse_gguf(path).inspect()` (mmap-backed) numbers are unchanged
+across the two runs — Tier 1 only touches the reader-generic entry
+point, by design. Median mmap times: ~3.0 ms for Mistral-7B,
+~26.4 ms for Qwen2.5, ~8.0 ms for SmolLM2, ~7.9 ms for TinyLlama.
+
+**Why the prediction was right and the headline result was bigger
+than expected:** On a `File` substrate with cold-then-warm fs cache,
+the post-Tier-1 reader path occasionally measures *faster than mmap*
+(0.9× ratio). The likely explanation: BufReader does one syscall per
+64 KiB of metadata, while mmap incurs one minor page fault per 4 KiB
+page touched (the front matter is ~few MiB on these fixtures, so
+dozens of syscalls vs. a few hundred page faults). Both backends
+ultimately read the same OS-cached pages — but BufReader's larger
+batch granularity wins on this access pattern.
+
+The 30–100× baseline ratio was an underestimate of the syscall cost
+on Windows; the 47–76× per-file speedups are the empirical answer.
+The Qwen2.5 fixtures are the slowest in absolute terms (1.23 s
+baseline) because their `tokenizer.ggml.tokens` arrays are larger
+than the SmolLM2/TinyLlama equivalents (Qwen has a 152K-entry
+vocabulary vs. SmolLM2's 49K), giving more per-element reads to
+amortise.
+
+**Disposition:** **Shipped.** All 28 GGUF parser unit tests + the
+real-fixture substrate-equivalence test (17/17) still pass — every
+field of `GgufInspectInfo` is identical pre- and post-Tier-1 because
+the bytes read are identical, only the syscall granularity changed.
+The `# Performance` rustdoc on `inspect_gguf_from_reader` was updated
+to reflect the new numbers and to remove the now-stale "use mmap for
+local files" guidance.
+
+**Trade-offs accepted:**
+
+- **+~64 KiB heap per call** for the BufReader's internal buffer.
+  Negligible vs. the parsed metadata `HashMap` (often hundreds of KiB
+  to a few MiB for the tokenizer arrays).
+- **Caller can no longer pass a non-buffered `Read + Seek` and rely
+  on its own buffering decisions** — but the type signature is
+  unchanged (`R: Read + Seek` in, `Result<GgufInspectInfo>` out), so
+  this is a strictly internal optimisation. Callers that want to
+  control buffering can pass any `Read + Seek`; the internal
+  `BufReader` will wrap it (mostly redundantly for an in-memory
+  `Cursor`, but the per-call memcpy cost is dwarfed by the parsing
+  work).
+
+**Tier 2 not pursued:** The original analysis identified a "bulk-read
+typed arrays in `read_typed_array`" optimisation (collapse the
+per-element `Vec::push` loop into one `read_into` + `chunks_exact`
+convert) as a Tier 2 follow-up. With Tier 1 closing the gap to mmap
+parity, Tier 2's added complexity (security guard for "fail-before-
+allocate" on adversarial array-length headers) is no longer
+justified. The geometric-growth `Vec::push` pattern stays.
+
+**Re-attempting this requires:** N/A — this is the success case.
+[`tests/bench_gguf_inspect_adhoc.rs`](../tests/bench_gguf_inspect_adhoc.rs)
+is in place to detect any regression. If a future change to
+`GgufReader` reintroduces per-element reads on top of `BufReader`
+(e.g., dropping `read_into` for some other pattern), the bench will
+catch it.
 
 ## How to add an entry
 

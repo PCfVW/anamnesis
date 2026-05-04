@@ -41,7 +41,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
@@ -103,6 +103,20 @@ const MAX_TENSOR_NAME_LEN: u64 = 65_535;
 /// embedding matrix tops out around 5·10⁹). One trillion elements is
 /// comfortably beyond anything real while rejecting absurd inputs.
 const MAX_TENSOR_ELEMENTS: u64 = 1_000_000_000_000;
+
+/// Buffer capacity for the internal `BufReader<R>` that wraps any
+/// caller-supplied reader inside [`inspect_gguf_from_reader`].
+///
+/// `GGUF`'s parser issues many small `read_exact` calls (4 B per `u32`,
+/// 8 B per `u64`, 1 B per `bool`, …). On a `std::fs::File` substrate every
+/// one is a syscall. The default `std::io::BufReader` capacity is 8 KiB;
+/// 64 KiB is large enough that a typical `bartowski/SmolLM2-135M-Instruct`
+/// front matter (~256 KiB tokenizer arrays) refills the buffer 4× instead
+/// of 32×, and large enough to amortise the per-read overhead of an
+/// `HTTP`-range adapter that prefetches at this granularity, but still
+/// negligible heap pressure for a header-only inspect (~64 KiB on top of
+/// the parsed metadata `HashMap`).
+const READER_BUF_SIZE: usize = 64 * 1024;
 
 /// Soft cap on `Vec` / `HashMap` pre-allocation for file-declared counts.
 ///
@@ -1903,26 +1917,30 @@ struct GgufFrontMatter {
 ///
 /// # Performance
 ///
-/// The reader-generic path issues many small reads (4–8 bytes per typed
-/// numeric primitive, variable per `gguf_string_t`) and is bandwidth-bound
-/// by the underlying substrate's per-call cost. A bare `std::fs::File`
-/// works correctly but is significantly slower than [`parse_gguf`] (which
-/// memory-maps the file and pre-faults pages); on a 2.7 GiB
-/// `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf`, a `File`-backed
-/// `inspect_gguf_from_reader` measures ~210 ms vs. ~3.5 ms for
-/// [`parse_gguf`]`.inspect()` on the same file.
+/// The parser issues many small `read_exact` calls (4–8 B per typed
+/// primitive, variable per `gguf_string_t`). To keep that pattern from
+/// degrading to one syscall per primitive on a `std::fs::File` substrate,
+/// the user-supplied reader is wrapped internally in
+/// `std::io::BufReader<R>` with a 64 KiB buffer. Per-file timings
+/// (best-of-5 release-mode median, `target-cpu=native`,
+/// [`tests/bench_gguf_inspect_adhoc.rs`](../tests/bench_gguf_inspect_adhoc.rs))
+/// show the reader path is **at parity with the mmap-backed
+/// [`parse_gguf`]`.inspect()`**, occasionally slightly faster
+/// (`BufReader` does one syscall per 64 KiB while mmap incurs one minor
+/// page fault per 4 KiB page touched):
 ///
-/// **Use [`parse_gguf`] for files on local disk; use
-/// `inspect_gguf_from_reader` for any non-local substrate** — in-memory
-/// `Cursor` (cheap per-call cost), or an `HTTP`-range adapter that
-/// prefetches and caches the front-matter region (collapses the
-/// per-element reads into 2–3 small range requests covering well under
-/// 1 % of a multi-GB quantised model). The `File` substrate works as a
-/// correctness baseline (it is the substrate the substrate-equivalence
-/// integration test uses against 17 real `bartowski/SmolLM2`,
-/// `bartowski/Mistral-7B-Instruct-v0.3`, `bartowski/Qwen2.5-Instruct`,
-/// and `TheBloke/TinyLlama-1.1B` `GGUF`s on disk) but is not the intended
-/// production target.
+/// | Fixture | mmap median | reader median (`File`) | ratio |
+/// |---|---:|---:|---:|
+/// | `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf` (2.7 GiB) | 3.0 ms | 2.8 ms | 0.9× |
+/// | `SmolLM2-135M-Instruct-Q4_K_M.gguf` (101 MiB)     | 7.9 ms | 7.6 ms | 1.0× |
+/// | `Qwen2.5-1.5B-Instruct-IQ2_M.gguf` (573 MiB)      | 26.4 ms | 25.4 ms | 1.0× |
+///
+/// In-memory `Cursor<&[u8]>` callers pay one extra memcpy through the
+/// internal `BufReader` — negligible vs. the parsing work.
+/// `HTTP`-range adapters that prefetch the front matter (~few MiB on
+/// multi-GB quantised models) see the same syscall-batching win at the
+/// network layer, plus the locality benefit of one larger range request
+/// per buffer-fill instead of dozens of small ones.
 ///
 /// # Errors
 ///
@@ -1961,7 +1979,18 @@ struct GgufFrontMatter {
 /// size — the same big-O footprint as the path-based [`parse_gguf`] minus
 /// the mmap.
 pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<GgufInspectInfo> {
-    let front = parse_gguf_from_reader(reader)?;
+    // The parser issues many small `read_exact` calls; on a `std::fs::File`
+    // each is a syscall. Wrapping in a `BufReader` collapses those into one
+    // `read` per `READER_BUF_SIZE` bytes. `BufReader<R: Read + Seek>: Seek`,
+    // and the only seeks happen inside `GgufReader::new` *before* any
+    // buffered reads, so the buffer is always empty when a seek is issued —
+    // no invalidation cost.
+    //
+    // The path-based `parse_gguf` does **not** wrap (it passes a
+    // `Cursor<&[u8]>` over the mmap, which is already zero-syscall). Adding
+    // a `BufReader` there would only add a memcpy.
+    let buffered = BufReader::with_capacity(READER_BUF_SIZE, reader);
+    let front = parse_gguf_from_reader(buffered)?;
     Ok(build_inspect_info(
         front.version,
         front.alignment,
