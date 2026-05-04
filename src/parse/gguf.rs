@@ -2734,4 +2734,170 @@ mod tests {
         assert_eq!(GgufType::IQ4_XS.to_string(), "IQ4_XS");
         assert_eq!(GgufType::BF16.to_string(), "BF16");
     }
+
+    // -----------------------------------------------------------------
+    // Reader-generic API — substrate-equivalence tests (Phase 4.9)
+    // -----------------------------------------------------------------
+
+    /// Asserts every field of two `GgufInspectInfo` values is equal.
+    /// Substrate equivalence means the path-based and reader-generic
+    /// entry points must be indistinguishable in their output.
+    fn assert_inspect_eq(path_info: &GgufInspectInfo, reader_info: &GgufInspectInfo) {
+        assert_eq!(path_info.version, reader_info.version);
+        assert_eq!(path_info.architecture, reader_info.architecture);
+        assert_eq!(path_info.tensor_count, reader_info.tensor_count);
+        assert_eq!(path_info.total_bytes, reader_info.total_bytes);
+        assert_eq!(
+            path_info.unknown_size_tensors,
+            reader_info.unknown_size_tensors
+        );
+        assert_eq!(path_info.dtypes, reader_info.dtypes);
+        assert_eq!(path_info.alignment, reader_info.alignment);
+    }
+
+    /// `inspect_gguf_from_reader` over an in-memory `Cursor` returns the
+    /// same `GgufInspectInfo` as `parse_gguf(path).inspect()` over the same
+    /// archive on disk. Locks the contract that the reader-generic and
+    /// path-based APIs are substrate-equivalent — the substrate (file vs.
+    /// cursor) cannot change the metadata. This is what downstream
+    /// HTTP-range adapters rely on.
+    #[test]
+    fn inspect_from_reader_matches_path_minimal() {
+        let bytes = build_minimal_gguf();
+        let tmp = write_temp_gguf(&bytes);
+
+        let path_info = parse_gguf(tmp.path()).unwrap().inspect();
+        let reader_info = inspect_gguf_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_inspect_eq(&path_info, &reader_info);
+
+        // And spot-check that the actual values are the ones the fixture
+        // claims, so that we are not just comparing two equal-but-wrong
+        // outputs.
+        assert_eq!(reader_info.version, 3);
+        assert_eq!(reader_info.architecture.as_deref(), Some("test"));
+        assert_eq!(reader_info.tensor_count, 2);
+        assert_eq!(reader_info.total_bytes, 24 + 36);
+        assert_eq!(reader_info.dtypes, vec![GgufType::F32, GgufType::Q4_0]);
+        assert_eq!(reader_info.alignment, 32);
+    }
+
+    /// `inspect_gguf_from_reader` accepts a header-only file (no tensors,
+    /// no data section) — same as the path-based parser. Confirms the
+    /// reader-generic path doesn't accidentally require the tensor-data
+    /// section to be present.
+    #[test]
+    fn inspect_from_reader_accepts_header_only_file() {
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3);
+        b.push_u64(0);
+        b.push_u64(0);
+        let bytes = b.finish();
+        assert_eq!(bytes.len(), 24);
+
+        let info = inspect_gguf_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(info.version, 3);
+        assert_eq!(info.tensor_count, 0);
+        assert_eq!(info.total_bytes, 0);
+        assert!(info.dtypes.is_empty());
+        assert_eq!(info.alignment, 32);
+    }
+
+    /// `inspect_gguf_from_reader` propagates the same parse errors as the
+    /// path-based variant. Each rejection branch is already covered by a
+    /// dedicated path-based test above; this one asserts the reader-generic
+    /// path does not accidentally swallow or re-classify them.
+    #[test]
+    fn inspect_from_reader_propagates_parse_errors() {
+        // Truncated file (no magic).
+        let err = inspect_gguf_from_reader(std::io::Cursor::new(b"GGU".as_slice())).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+
+        // Wrong magic.
+        let err =
+            inspect_gguf_from_reader(std::io::Cursor::new(b"XXXX\x00\x00\x00\x00".as_slice()))
+                .unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+
+        // Legacy GGML magic — surfaces as Unsupported through the same code
+        // path as the file-backed parser.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(b"GGML");
+        legacy.extend_from_slice(&[0u8; 100]);
+        let err = inspect_gguf_from_reader(std::io::Cursor::new(&legacy)).unwrap_err();
+        match err {
+            AnamnesisError::Unsupported { format, detail } => {
+                assert_eq!(format, "GGUF");
+                assert!(detail.contains("GGML"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Substrate-equivalence on a multi-tensor file with mixed dtypes and a
+    /// nested-array metadata value — the most adversarial-shape fixture in
+    /// this module's test set. Exercises the `Read + Seek` substrate over
+    /// the seek-back-and-forth pattern that distinguishes `GGUF` from the
+    /// pure-`Read` safetensors path: the parser reads the front matter
+    /// linearly, but the underlying `read_exact` machinery may issue
+    /// internal seeks to satisfy partial reads. A `Cursor` answers them
+    /// trivially; an HTTP-range adapter that prefetches the front-matter
+    /// region would do the same.
+    #[test]
+    fn inspect_from_reader_matches_path_mixed_dtypes() {
+        // Two F32 tensors and one Q4_0 tensor, plus a metadata array of
+        // strings. The Q4_0 tensor lives at relative offset 32 (well
+        // beyond the first F32 at offset 0), so the reader-generic path
+        // exercises the same alignment-and-bounds arithmetic as the
+        // mmap-backed path.
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3);
+        b.push_u64(3);
+        b.push_u64(3);
+        b.push_kv_string("general.architecture", "llama");
+        b.push_kv_uint32("general.alignment", 32);
+        // `tokenizer.ggml.tokens` is the canonical large-array key in real
+        // GGUFs; here we keep it tiny but exercise the same code path.
+        b.push_string("tokenizer.ggml.tokens");
+        b.push_u32(9); // ARRAY
+        b.push_u32(8); // STRING
+        b.push_u64(2); // length
+        b.push_string("<bos>");
+        b.push_string("<eos>");
+        // tensor 0 — F32 [4, 4] = 64 bytes at relative offset 0
+        b.push_tensor_info("a", &[4, 4], 0, 0);
+        // tensor 1 — F32 [2] = 8 bytes at relative offset 64
+        b.push_tensor_info("b", &[2], 0, 64);
+        // tensor 2 — Q4_0 [64] = 36 bytes at relative offset 96
+        // (64 + 8 = 72, padded up to 96 for 32-byte alignment)
+        b.push_tensor_info("c", &[64], 2, 96);
+
+        b.pad_to_alignment(32);
+        // tensor.a data — 64 bytes
+        b.push_bytes(&[0u8; 64]);
+        // tensor.b data — 8 bytes (no padding needed; 64 + 8 = 72)
+        b.push_bytes(&[0u8; 8]);
+        // pad to next 32-byte boundary (72 → 96)
+        b.pad_to_alignment(32);
+        // tensor.c data — 36 bytes
+        b.push_bytes(&[0u8; 36]);
+
+        let bytes = b.finish();
+        let tmp = write_temp_gguf(&bytes);
+
+        let path_info = parse_gguf(tmp.path()).unwrap().inspect();
+        let reader_info = inspect_gguf_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_inspect_eq(&path_info, &reader_info);
+
+        // Ground-truth values to lock the test to known-correct output.
+        assert_eq!(reader_info.tensor_count, 3);
+        // tensor.a: 64 B + tensor.b: 8 B + tensor.c: 36 B = 108 B
+        assert_eq!(reader_info.total_bytes, 64 + 8 + 36);
+        // First-occurrence dtype order: F32 (twice), then Q4_0.
+        assert_eq!(reader_info.dtypes, vec![GgufType::F32, GgufType::Q4_0]);
+        assert_eq!(reader_info.architecture.as_deref(), Some("llama"));
+    }
 }

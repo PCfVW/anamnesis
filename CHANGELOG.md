@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`inspect_gguf_from_reader<R: Read + Seek>`** — reader-generic `GGUF`
+  inspection. Accepts any `Read + Seek` substrate (in-memory `Cursor`,
+  HTTP-range-backed adapter, custom transport) and returns the same
+  `GgufInspectInfo` (version, architecture, tensor count, total bytes,
+  dtypes, alignment) as the existing path-based `parse_gguf(path).inspect()`,
+  without materialising the data segment. The path-based `parse_gguf`
+  remains available for callers that need the full `ParsedGguf` with
+  zero-copy tensor views via `memmap2::Mmap`. A 2 GiB quantised `GGUF`'s
+  metadata is inspectable in two or three small range requests covering a
+  few MiB of front-loaded header — no weight data downloaded. Unblocks
+  `hf-fm` v0.11.2 (remote `GGUF` inspect) on top of v0.11.0's
+  `HttpRangeReader` adapter. Anamnesis itself takes on no network or TLS
+  dependency. Phase 4.9; see [`ROADMAP.md`](ROADMAP.md).
+- **`parse_gguf` and `inspect_gguf_from_reader` re-exported from the crate
+  root** — both functions are now reachable as `anamnesis::parse_gguf` and
+  `anamnesis::inspect_gguf_from_reader` (the former was already re-exported;
+  the latter is new). Joins the existing reader-generic family
+  (`parse_safetensors_header_from_reader`, `inspect_npz_from_reader`).
+- **4 new GGUF unit tests** covering the reader-generic path:
+  `inspect_from_reader_matches_path_minimal` (substrate-equivalence on the
+  two-tensor F32+Q4_0 fixture), `inspect_from_reader_matches_path_mixed_dtypes`
+  (three tensors with F32 and Q4_0 plus a nested-array metadata value
+  exercising the seek-back-and-forth substrate), `inspect_from_reader_accepts_header_only_file`
+  (24-byte header-only file: tensor-data section absent), and
+  `inspect_from_reader_propagates_parse_errors` (truncated file, wrong
+  magic, legacy `GGML` magic — all surface through the same code path as
+  the file-backed parser).
+
+### Changed
+
+- **GGUF parser cursor generalised to `Read + Seek`** — the slice-based
+  internal cursor (`Cursor<'a>` over `memmap2::Mmap`) is replaced by a
+  `GgufReader<R: Read + Seek>` that runs over any positional substrate.
+  The path-based `parse_gguf` becomes a thin wrapper that mmaps the file
+  and delegates to a new `parse_gguf_from_reader` core via `std::io::Cursor`.
+  The `ParsedGguf` zero-copy tensor-data contract and every adversarial-
+  input guard (caps on tensor count, KV count, string length, array length,
+  nesting depth, dimension count, element product, per-tensor alignment,
+  end-of-data bounds) are preserved verbatim. Behaviour-preserving refactor
+  on the path-based entry point.
+- **Crate-level rustdoc and README** updated to surface the path-based and
+  reader-generic forms of `GGUF` inspection in a single place. New "GGUF
+  Inspection" section in the README mirrors the existing "Safetensors
+  Header Inspection" and "NPZ/NPY Parsing" entries; the table of contents
+  links to it.
+
 ## [0.4.4] - 2026-05-02
 
 ### Added

@@ -23,6 +23,7 @@
   - [GGUF Block-Quant Dequantization](#gguf-block-quant-dequantization)
 - [Safetensors Header Inspection](#safetensors-header-inspection)
 - [NPZ/NPY Parsing](#npznpy-parsing)
+- [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [Used by](#used-by)
 - [License](#license)
@@ -174,6 +175,12 @@ Feature-gated behind `npz`. Custom NPY header parser with bulk `read_exact` — 
 BF16 support via JAX `V2` void-dtype convention. Big-endian NPY files handled with in-place byte-swap.
 
 Header-only inspection ships in two forms: `inspect_npz(path)` for files on disk and `inspect_npz_from_reader<R: Read + Seek>(reader)` for any other substrate (in-memory `Cursor`, HTTP-range-backed adapter, custom transport). Anamnesis itself takes on no network or TLS dependency — downstream crates plug in their own `Read + Seek` adapter when remote inspection is needed. See the rustdoc on `inspect_npz_from_reader` for the access pattern an HTTP-range adapter must satisfy.
+
+### GGUF Inspection
+
+Feature-gated behind `gguf`. The path-based `parse_gguf(path)` memory-maps the file and returns a `ParsedGguf` with zero-copy `Cow::Borrowed` tensor views into the mapping; the reader-generic `inspect_gguf_from_reader<R: Read + Seek>(reader)` accepts any positional substrate (in-memory `Cursor`, HTTP-range-backed adapter, custom transport) and returns just the `GgufInspectInfo` summary (version, architecture, tensor count, total size, dtypes, alignment) without materialising the data segment.
+
+`Read + Seek` — not just `Read` — is required because `GGUF`'s parser computes the absolute tensor-data offset by combining the relative offsets in the tensor-info table with the post-tensor-info `data_section_start` anchor, then validates each offset against the captured stream length. The simplest correct refactor preserves this positional access pattern via `Seek`. A pure-`Read` reformulation would require restructuring the parser into a strict forward pass and is out of scope. A 2 GiB quantised `GGUF` is inspectable in two or three small range requests covering a few MiB of front-loaded metadata — no weight data downloaded. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_gguf_from_reader` for the access pattern.
 
 ### PyTorch `.pth` Parsing
 
