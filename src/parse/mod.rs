@@ -21,8 +21,8 @@ pub(crate) mod utils;
 
 #[cfg(feature = "gguf")]
 pub use gguf::{
-    parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo,
-    GgufType, ParsedGguf,
+    inspect_gguf_from_reader, parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue,
+    GgufTensor, GgufTensorInfo, GgufType, ParsedGguf,
 };
 #[cfg(feature = "npz")]
 pub use npz::{

@@ -1091,47 +1091,12 @@ impl ParsedGguf {
 
     /// Returns inspection info derived from the parsed metadata. No I/O.
     pub fn inspect(&self) -> GgufInspectInfo {
-        let mut total_bytes: u64 = 0;
-        let mut unknown_size_tensors: usize = 0;
-        // O(1) per-tensor dtype dedup via a fixed-size bitmap keyed on the
-        // dense `GgufType::inspect_index` — drops the hot loop from
-        // O(n × d) to O(n). `dtypes` still records first-occurrence order.
-        let mut seen = [false; GGUF_TYPE_COUNT];
-        let mut dtypes: Vec<GgufType> = Vec::new();
-        for info in &self.tensor_infos {
-            if let Some(byte_len) = info.byte_len {
-                total_bytes = total_bytes.saturating_add(byte_len);
-            } else {
-                unknown_size_tensors = unknown_size_tensors.saturating_add(1);
-            }
-            let idx = info.dtype.inspect_index();
-            // INDEX: `inspect_index` is defined to return a value in
-            // `0..GGUF_TYPE_COUNT`, matching the bitmap's length exactly
-            #[allow(clippy::indexing_slicing)]
-            if !seen[idx] {
-                #[allow(clippy::indexing_slicing)]
-                {
-                    seen[idx] = true;
-                }
-                dtypes.push(info.dtype);
-            }
-        }
-        let architecture = self
-            .metadata
-            .get("general.architecture")
-            .and_then(GgufMetadataValue::as_string)
-            // BORROW: `.to_owned()` converts `&str` to an owned `String`
-            // that outlives the `&self` borrow of the metadata map.
-            .map(str::to_owned);
-        GgufInspectInfo {
-            version: self.version,
-            architecture,
-            tensor_count: self.tensor_infos.len(),
-            total_bytes,
-            unknown_size_tensors,
-            dtypes,
-            alignment: self.alignment,
-        }
+        build_inspect_info(
+            self.version,
+            self.alignment,
+            &self.metadata,
+            &self.tensor_infos,
+        )
     }
 
     /// Dequantises a single tensor from the memory-mapped file to `BF16`
@@ -1876,6 +1841,165 @@ struct GgufFrontMatter {
     alignment: u32,
     metadata: HashMap<String, GgufMetadataValue>,
     tensor_infos: Vec<GgufTensorInfo>,
+}
+
+/// Inspects a `GGUF` file from any `Read + Seek` source, returning header,
+/// metadata, and tensor-info summary statistics without touching the
+/// tensor-data segment.
+///
+/// This is the reader-generic core of `GGUF` inspection: callers supply any
+/// positional substrate (in-memory `Cursor`, an `HTTP`-range-backed adapter,
+/// a custom transport, …) and receive the same [`GgufInspectInfo`] as
+/// [`ParsedGguf::inspect`]. The path-based [`parse_gguf`] remains the right
+/// entry point for callers that need the full [`ParsedGguf`] (with zero-copy
+/// tensor data via `memmap2::Mmap`); `inspect_gguf_from_reader` exists for
+/// the inspect-only case where materialising the data segment is wasteful.
+///
+/// # Range-read access pattern
+///
+/// `GGUF` is a front-loaded format: magic + version + counts (24 B), the
+/// metadata key-value table (typically a few hundred KiB to a few MiB,
+/// dominated by tokenizer vocabulary arrays), and the tensor-info table
+/// (~80–120 B per tensor) all live before the tensor-data section. The
+/// parser reads this front matter in a single linear scan, then performs
+/// arithmetic on the captured stream length to validate per-tensor offsets
+/// against the alignment boundary that anchors the data section. **No
+/// tensor-data bytes are read.**
+///
+/// A well-implemented `R: Read + Seek` adapter only needs to satisfy three
+/// access patterns:
+///
+/// 1. **`seek(SeekFrom::End(0))` once at construction** — captures the
+///    total content length for the bounds-check arithmetic. An
+///    `HTTP`-range adapter that already knows the `Content-Length` of the
+///    artefact answers this without a fetch.
+/// 2. **One contiguous forward read of the front matter** — magic (4 B)
+///    through the end of the tensor-info table (~few MiB on multi-GB
+///    quantised models). On a 2 GiB `Q4_K_M` `GGUF` this is well under
+///    1 % of the file.
+/// 3. **A handful of small `seek` calls back to offset 0 and to internal
+///    offsets** that the `Read` machinery may issue (e.g., `read_exact`
+///    retries) — these typically resolve from the same prefix region the
+///    forward scan already touches.
+///
+/// Adapters that prefetch and cache the front-matter region on first
+/// access amortise away the round trips, so a 2 GiB quantised `GGUF` is
+/// inspectable in two or three small `HTTP`-range requests covering a few
+/// MiB instead of a 2 GiB download.
+///
+/// Why `Read + Seek` (and not just `Read`): unlike safetensors's prefix-
+/// then-`JSON` layout, `GGUF`'s parser computes the absolute tensor-data
+/// offset by combining the relative offsets in the tensor-info table with
+/// the post-tensor-info `data_section_start` anchor, then validates each
+/// offset's alignment relative to that anchor. The simplest correct
+/// refactor preserves this positional access pattern via `Seek`. A
+/// pure-`Read` reformulation would require restructuring the parser into a
+/// strict forward pass and is out of scope for this entry point.
+///
+/// Anamnesis itself does not ship an `HTTP` transport; the network layer
+/// belongs in downstream crates (e.g., `hf-fm`'s `HttpRangeReader`
+/// adapter). This function defines the I/O contract such an adapter must
+/// satisfy.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
+/// reader fails.
+///
+/// Returns [`AnamnesisError::Parse`] if the magic bytes are missing, the
+/// header fields are truncated or out of range, the metadata table contains
+/// an invalid value type, a tensor info entry is malformed, or a tensor's
+/// resolved byte range falls outside the stream's total length (captured
+/// via `seek(SeekFrom::End(0))` at construction).
+///
+/// Returns [`AnamnesisError::Unsupported`] for `GGUF` v1 files (which use
+/// `u32` string lengths instead of `u64`), big-endian `GGUF` files (v3+
+/// feature, not yet implemented), legacy pre-`GGUF` formats (`GGML`, `GGJT`,
+/// `GGMF`), and tensor dtypes whose `ggml_type` discriminant is not
+/// recognised.
+///
+/// # Source context
+///
+/// Errors describe the **format-level problem**, not the source identity.
+/// The function is reader-agnostic — the source could be a file, an
+/// in-memory `Cursor`, or an `HTTP`-range adapter. Callers that have a
+/// source name (filename, URL, etc.) should wrap the returned error with
+/// that context. This matches anamnesis's existing convention
+/// (`parse_safetensors_header_from_reader` and `inspect_npz_from_reader`
+/// already return source-agnostic errors).
+///
+/// # Memory
+///
+/// Allocates only metadata structures: the metadata `HashMap` (one entry
+/// per `KV` pair, value sizes dominated by typed-array inner storage like
+/// tokenizer vocabularies) and the per-tensor `Vec<GgufTensorInfo>` (~120
+/// B per tensor). No tensor data is read. Peak heap is
+/// `O(n_tensors + n_metadata_kv)`, independent of the file's data-segment
+/// size — the same big-O footprint as the path-based [`parse_gguf`] minus
+/// the mmap.
+pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<GgufInspectInfo> {
+    let front = parse_gguf_from_reader(reader)?;
+    Ok(build_inspect_info(
+        front.version,
+        front.alignment,
+        &front.metadata,
+        &front.tensor_infos,
+    ))
+}
+
+/// Builds a [`GgufInspectInfo`] from the parsed front matter.
+///
+/// Shared by [`ParsedGguf::inspect`] (mmap-backed path) and
+/// [`inspect_gguf_from_reader`] (reader-generic path) so the two entry
+/// points are guaranteed substrate-equivalent — every field of the
+/// resulting `GgufInspectInfo` is computed by the same code regardless of
+/// which entry point produced the front matter.
+fn build_inspect_info(
+    version: u32,
+    alignment: u32,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    tensor_infos: &[GgufTensorInfo],
+) -> GgufInspectInfo {
+    let mut total_bytes: u64 = 0;
+    let mut unknown_size_tensors: usize = 0;
+    // O(1) per-tensor dtype dedup via a fixed-size bitmap keyed on the
+    // dense `GgufType::inspect_index` — drops the hot loop from
+    // O(n × d) to O(n). `dtypes` still records first-occurrence order.
+    let mut seen = [false; GGUF_TYPE_COUNT];
+    let mut dtypes: Vec<GgufType> = Vec::new();
+    for info in tensor_infos {
+        if let Some(byte_len) = info.byte_len {
+            total_bytes = total_bytes.saturating_add(byte_len);
+        } else {
+            unknown_size_tensors = unknown_size_tensors.saturating_add(1);
+        }
+        let idx = info.dtype.inspect_index();
+        // INDEX: `inspect_index` is defined to return a value in
+        // `0..GGUF_TYPE_COUNT`, matching the bitmap's length exactly
+        #[allow(clippy::indexing_slicing)]
+        if !seen[idx] {
+            #[allow(clippy::indexing_slicing)]
+            {
+                seen[idx] = true;
+            }
+            dtypes.push(info.dtype);
+        }
+    }
+    let architecture = metadata
+        .get("general.architecture")
+        .and_then(GgufMetadataValue::as_string)
+        // BORROW: `.to_owned()` converts `&str` to an owned `String`
+        // that outlives the borrow of the metadata map.
+        .map(str::to_owned);
+    GgufInspectInfo {
+        version,
+        architecture,
+        tensor_count: tensor_infos.len(),
+        total_bytes,
+        unknown_size_tensors,
+        dtypes,
+        alignment,
+    }
 }
 
 /// Reads one `gguf_tensor_info_t` from the cursor and returns a
