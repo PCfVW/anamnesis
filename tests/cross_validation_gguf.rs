@@ -35,7 +35,7 @@
 
 use std::time::Instant;
 
-use anamnesis::{dequantize_gguf_to_bf16, GgufType};
+use anamnesis::{dequantize_gguf_to_bf16, inspect_gguf_from_reader, parse_gguf, GgufType};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
@@ -477,5 +477,130 @@ fn cross_validate_synthetic_mxfp4() {
         include_bytes!("fixtures/gguf_reference/synthetic_mxfp4.bin"),
         GgufType::MXFP4,
         0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reader-generic API — substrate equivalence on real GGUF files (Phase 4.9)
+// ---------------------------------------------------------------------------
+//
+// Walks `tests/fixtures/gguf_reference/models/*.gguf` (gitignored, downloaded
+// via `generate_gguf.py`) and asserts that
+// `inspect_gguf_from_reader(File::open(path)?)` returns the same
+// `GgufInspectInfo` field-for-field as `parse_gguf(path).inspect()` on every
+// file. Marked `#[ignore]` because the model directory is local-only — the
+// test cannot run in CI. Run on demand with:
+//
+//     cargo test --release --features gguf --test cross_validation_gguf \
+//         substrate_equivalence_real_gguf_models -- --nocapture --ignored
+
+#[test]
+#[ignore = "needs locally-downloaded GGUF models under tests/fixtures/gguf_reference/models/"]
+fn substrate_equivalence_real_gguf_models() {
+    let models_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gguf_reference")
+        .join("models");
+
+    if !models_dir.exists() {
+        eprintln!(
+            "skip: {} does not exist (download via generate_gguf.py)",
+            models_dir.display()
+        );
+        return;
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(&models_dir)
+        .expect("read models dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gguf"))
+        .collect();
+    entries.sort();
+
+    assert!(
+        !entries.is_empty(),
+        "no .gguf files in {}",
+        models_dir.display()
+    );
+
+    eprintln!(
+        "\nsubstrate-equivalence on {} real GGUF files\n{}",
+        entries.len(),
+        "=".repeat(72)
+    );
+
+    let mut total_ok = 0usize;
+    for path in &entries {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+        let file_size = std::fs::metadata(path).ok().map_or(0, |m| m.len());
+
+        // Path-based: full mmap + parse, then `.inspect()`.
+        let t0 = Instant::now();
+        let path_info = parse_gguf(path)
+            .unwrap_or_else(|e| panic!("parse_gguf({name}) failed: {e}"))
+            .inspect();
+        let path_elapsed = t0.elapsed();
+
+        // Reader-generic: a `std::fs::File` is `Read + Seek`, so this is
+        // exactly the substrate an HTTP-range adapter or in-memory cursor
+        // would present.
+        let t1 = Instant::now();
+        let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open({name}) failed: {e}"));
+        let reader_info = inspect_gguf_from_reader(file)
+            .unwrap_or_else(|e| panic!("inspect_gguf_from_reader({name}) failed: {e}"));
+        let reader_elapsed = t1.elapsed();
+
+        // Field-for-field equivalence — every `GgufInspectInfo` field.
+        assert_eq!(path_info.version, reader_info.version, "{name}: version");
+        assert_eq!(
+            path_info.architecture, reader_info.architecture,
+            "{name}: architecture"
+        );
+        assert_eq!(
+            path_info.tensor_count, reader_info.tensor_count,
+            "{name}: tensor_count"
+        );
+        assert_eq!(
+            path_info.total_bytes, reader_info.total_bytes,
+            "{name}: total_bytes"
+        );
+        assert_eq!(
+            path_info.unknown_size_tensors, reader_info.unknown_size_tensors,
+            "{name}: unknown_size_tensors"
+        );
+        assert_eq!(path_info.dtypes, reader_info.dtypes, "{name}: dtypes");
+        assert_eq!(
+            path_info.alignment, reader_info.alignment,
+            "{name}: alignment"
+        );
+
+        // CAST: u64 → f64, byte counts lose precision above 2^52 ≈ 4 PiB —
+        // safely above any GGUF model on disk (~max ~700 GiB)
+        #[allow(clippy::cast_precision_loss)]
+        let file_mib = file_size as f64 / (1024.0 * 1024.0);
+        // CAST: u64 → f64, same rationale as `file_mib`
+        #[allow(clippy::cast_precision_loss)]
+        let tot_gib = path_info.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        eprintln!(
+            "OK  {name:<60}  {file_mib:>7.1} MiB  v{ver}  arch={arch:<10}  \
+             tensors={t:>5}  total={tot_gib:>5.2} GiB  dtypes={n_dtypes}  \
+             path={path_us:>7.1} \u{b5}s  reader={reader_us:>7.1} \u{b5}s",
+            ver = path_info.version,
+            arch = path_info.architecture.as_deref().unwrap_or("?"),
+            t = path_info.tensor_count,
+            n_dtypes = path_info.dtypes.len(),
+            path_us = path_elapsed.as_secs_f64() * 1e6,
+            reader_us = reader_elapsed.as_secs_f64() * 1e6,
+        );
+        total_ok += 1;
+    }
+
+    eprintln!(
+        "{}\n{} / {} files: substrate-equivalent (every GgufInspectInfo field matches)",
+        "=".repeat(72),
+        total_ok,
+        entries.len()
     );
 }

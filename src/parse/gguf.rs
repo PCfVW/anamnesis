@@ -1901,6 +1901,29 @@ struct GgufFrontMatter {
 /// adapter). This function defines the I/O contract such an adapter must
 /// satisfy.
 ///
+/// # Performance
+///
+/// The reader-generic path issues many small reads (4–8 bytes per typed
+/// numeric primitive, variable per `gguf_string_t`) and is bandwidth-bound
+/// by the underlying substrate's per-call cost. A bare `std::fs::File`
+/// works correctly but is significantly slower than [`parse_gguf`] (which
+/// memory-maps the file and pre-faults pages); on a 2.7 GiB
+/// `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf`, a `File`-backed
+/// `inspect_gguf_from_reader` measures ~210 ms vs. ~3.5 ms for
+/// [`parse_gguf`]`.inspect()` on the same file.
+///
+/// **Use [`parse_gguf`] for files on local disk; use
+/// `inspect_gguf_from_reader` for any non-local substrate** — in-memory
+/// `Cursor` (cheap per-call cost), or an `HTTP`-range adapter that
+/// prefetches and caches the front-matter region (collapses the
+/// per-element reads into 2–3 small range requests covering well under
+/// 1 % of a multi-GB quantised model). The `File` substrate works as a
+/// correctness baseline (it is the substrate the substrate-equivalence
+/// integration test uses against 17 real `bartowski/SmolLM2`,
+/// `bartowski/Mistral-7B-Instruct-v0.3`, `bartowski/Qwen2.5-Instruct`,
+/// and `TheBloke/TinyLlama-1.1B` `GGUF`s on disk) but is not the intended
+/// production target.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied

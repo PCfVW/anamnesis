@@ -36,6 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inspect_from_reader_propagates_parse_errors` (truncated file, wrong
   magic, legacy `GGML` magic — all surface through the same code path as
   the file-backed parser).
+- **Substrate-equivalence integration test on real GGUF files**
+  (`tests/cross_validation_gguf.rs::substrate_equivalence_real_gguf_models`,
+  `#[ignore]`-gated because the model directory is local-only). Walks
+  every `*.gguf` under `tests/fixtures/gguf_reference/models/` (downloaded
+  via `generate_gguf.py`) and asserts that
+  `inspect_gguf_from_reader(File::open(path)?)` returns the same
+  `GgufInspectInfo` as `parse_gguf(path).inspect()` field-for-field. Run
+  on demand with `cargo test --release --features gguf --test
+  cross_validation_gguf substrate_equivalence_real_gguf_models --
+  --nocapture --ignored`. Locally-confirmed substrate-equivalent on **17
+  of 17 files** spanning 4 architectures (`llama`, `qwen2`) × 11 distinct
+  dtypes (`F32`, `F16`, `Q2_K`–`Q8_0`, `Q4_K`–`Q6_K`, `IQ1_S`, `IQ1_M`,
+  `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ4_XS`) × 87 MiB to 2.7 GiB
+  file sizes, including `bartowski/SmolLM2-135M-Instruct` (8 quants),
+  `bartowski/Mistral-7B-Instruct-v0.3` (5 quants),
+  `bartowski/Qwen2.5-{0.5,1.5}B-Instruct-IQ2_M`, and
+  `TheBloke/TinyLlama-1.1B-chat-v1.0` (Q2_K, Q5_0).
 
 ### Changed
 
