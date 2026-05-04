@@ -41,6 +41,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
@@ -1207,48 +1208,98 @@ impl ParsedGguf {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor — minimal little-endian reader over a byte slice
+// GgufReader — generic little-endian reader over any `Read + Seek` source
 // ---------------------------------------------------------------------------
 
-/// Minimal forward-only cursor over a byte slice, with bounds-checked
-/// little-endian primitive readers.
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// Generic forward-tracking reader over any `Read + Seek` substrate, with
+/// bounds-checked little-endian primitive readers.
+///
+/// The parser was historically slice-based (`Cursor<&[u8]>` over a
+/// `memmap2::Mmap`). Generalising to `Read + Seek` keeps the path-based
+/// `parse_gguf` unchanged (it wraps the mmap in a `std::io::Cursor`) while
+/// letting the inspect-only entry point [`inspect_gguf_from_reader`] accept
+/// any positional source — in-memory cursors, HTTP-range adapters, custom
+/// transports — without re-deriving the parser logic.
+///
+/// `pos` is tracked redundantly with the underlying reader's stream position
+/// so that error messages can report the byte offset and so that the
+/// post-tensor-info `tensor_info_end` is a `u64` available without an extra
+/// `seek(SeekFrom::Current(0))` round-trip.
+///
+/// `file_len` is captured once at construction by seeking to the end of the
+/// stream, then the reader is repositioned at offset 0. An HTTP-range
+/// adapter that knows the total content length can answer this without a
+/// data-section fetch.
+struct GgufReader<R: Read + Seek> {
+    reader: R,
+    pos: u64,
+    file_len: u64,
 }
 
-impl<'a> Cursor<'a> {
-    const fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+impl<R: Read + Seek> GgufReader<R> {
+    /// Constructs a reader anchored at offset 0, capturing `file_len` for
+    /// the bounds-check error messages and the post-tensor-info data-section
+    /// arithmetic.
+    fn new(mut reader: R) -> crate::Result<Self> {
+        let file_len = reader.seek(SeekFrom::End(0)).map_err(AnamnesisError::Io)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(AnamnesisError::Io)?;
+        Ok(Self {
+            reader,
+            pos: 0,
+            file_len,
+        })
     }
 
-    /// Reads exactly `n` bytes, advancing the cursor.
-    fn read_bytes(&mut self, n: usize) -> crate::Result<&'a [u8]> {
+    /// Reads exactly `buf.len()` bytes into `buf`, advancing the cursor.
+    ///
+    /// Pre-validates the request against `file_len` so an adversarial header
+    /// that claims a length past EOF produces a deterministic
+    /// `AnamnesisError::Parse` (matching the slice-based cursor's behaviour)
+    /// rather than relying on the underlying reader's `UnexpectedEof`
+    /// kind-mapping.
+    fn read_into(&mut self, buf: &mut [u8]) -> crate::Result<()> {
+        // CAST: usize → u64, length of a borrowed buffer always fits in u64
+        // on every supported target (64-bit and 32-bit).
+        #[allow(clippy::as_conversions)]
+        let n_u64 = buf.len() as u64;
         let end = self
             .pos
-            .checked_add(n)
+            .checked_add(n_u64)
             .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("GGUF: cursor overflow at pos {} + {n}", self.pos),
+                reason: format!("GGUF: cursor overflow at pos {} + {n_u64}", self.pos),
             })?;
-        let slice = self
-            .buf
-            .get(self.pos..end)
-            .ok_or_else(|| AnamnesisError::Parse {
+        if end > self.file_len {
+            return Err(AnamnesisError::Parse {
                 reason: format!(
-                    "GGUF: unexpected EOF at pos {} (wanted {n} bytes, have {})",
+                    "GGUF: unexpected EOF at pos {} (wanted {n_u64} bytes, have {})",
                     self.pos,
-                    self.buf.len().saturating_sub(self.pos)
+                    self.file_len.saturating_sub(self.pos)
                 ),
-            })?;
+            });
+        }
+        self.reader.read_exact(buf).map_err(AnamnesisError::Io)?;
         self.pos = end;
-        Ok(slice)
+        Ok(())
+    }
+
+    /// Reads exactly `n` bytes, returning an owned `Vec<u8>`.
+    ///
+    /// Used for variable-length payloads (e.g. `gguf_string_t`). Fixed-size
+    /// primitives use [`read_into`](Self::read_into) with a stack array.
+    fn read_bytes(&mut self, n: usize) -> crate::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        self.read_into(&mut buf)?;
+        Ok(buf)
     }
 
     fn read_u8(&mut self) -> crate::Result<u8> {
-        let bytes = self.read_bytes(1)?;
-        // INDEX: read_bytes(1) returned a slice of length exactly 1
+        let mut arr = [0u8; 1];
+        self.read_into(&mut arr)?;
+        // INDEX: stack array of length exactly 1 — `arr[0]` cannot be OOB
         #[allow(clippy::indexing_slicing)]
-        Ok(bytes[0])
+        Ok(arr[0])
     }
 
     fn read_i8(&mut self) -> crate::Result<i8> {
@@ -1258,58 +1309,50 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_u16_le(&mut self) -> crate::Result<u16> {
-        let bytes = self.read_bytes(2)?;
         let mut arr = [0u8; 2];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(u16::from_le_bytes(arr))
     }
 
     fn read_i16_le(&mut self) -> crate::Result<i16> {
-        let bytes = self.read_bytes(2)?;
         let mut arr = [0u8; 2];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(i16::from_le_bytes(arr))
     }
 
     fn read_u32_le(&mut self) -> crate::Result<u32> {
-        let bytes = self.read_bytes(4)?;
         let mut arr = [0u8; 4];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(u32::from_le_bytes(arr))
     }
 
     fn read_i32_le(&mut self) -> crate::Result<i32> {
-        let bytes = self.read_bytes(4)?;
         let mut arr = [0u8; 4];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(i32::from_le_bytes(arr))
     }
 
     fn read_u64_le(&mut self) -> crate::Result<u64> {
-        let bytes = self.read_bytes(8)?;
         let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(u64::from_le_bytes(arr))
     }
 
     fn read_i64_le(&mut self) -> crate::Result<i64> {
-        let bytes = self.read_bytes(8)?;
         let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(i64::from_le_bytes(arr))
     }
 
     fn read_f32_le(&mut self) -> crate::Result<f32> {
-        let bytes = self.read_bytes(4)?;
         let mut arr = [0u8; 4];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(f32::from_le_bytes(arr))
     }
 
     fn read_f64_le(&mut self) -> crate::Result<f64> {
-        let bytes = self.read_bytes(8)?;
         let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
+        self.read_into(&mut arr)?;
         Ok(f64::from_le_bytes(arr))
     }
 
@@ -1327,9 +1370,12 @@ impl<'a> Cursor<'a> {
     /// Reads a `gguf_string_t` (`u64` length prefix + raw bytes, interpreted
     /// as UTF-8).
     ///
-    /// Validation runs on the borrowed mmap slice **before** any allocation,
-    /// so a rejected non-UTF-8 string of up to `max_len` bytes costs zero
-    /// heap allocation on the error path.
+    /// The cap check runs against the declared length **before** allocating,
+    /// so a rejected oversize header costs zero heap. UTF-8 validation
+    /// consumes the temporary `Vec<u8>` via `String::from_utf8`, which
+    /// either re-uses the buffer in place (success) or hands its bytes back
+    /// to the caller via `FromUtf8Error::into_bytes` (error) — no double
+    /// allocation in either branch.
     fn read_string(&mut self, max_len: u64) -> crate::Result<String> {
         let len = self.read_u64_le()?;
         if len > max_len {
@@ -1341,12 +1387,12 @@ impl<'a> Cursor<'a> {
             reason: format!("GGUF: string length {len} overflows usize"),
         })?;
         let bytes = self.read_bytes(len_usz)?;
-        let valid = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
+        // `String::from_utf8` consumes `bytes` and re-uses its buffer on
+        // success, so the validated bytes never get copied into a second
+        // allocation.
+        String::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
             reason: format!("GGUF: string is not valid UTF-8: {e}"),
-        })?;
-        // BORROW: `.to_owned()` copies the validated borrowed slice into an
-        // owned `String`; the allocation only happens on the success path.
-        Ok(valid.to_owned())
+        })
     }
 }
 
@@ -1359,8 +1405,8 @@ impl<'a> Cursor<'a> {
 /// For `ARRAY` (`value_type` 9), dispatches into [`read_typed_array`]
 /// which builds a natively-typed `Vec<T>` instead of the old 8×-bloated
 /// `Vec<GgufMetadataValue>`.
-fn read_metadata_value(
-    cursor: &mut Cursor<'_>,
+fn read_metadata_value<R: Read + Seek>(
+    cursor: &mut GgufReader<R>,
     value_type: u32,
 ) -> crate::Result<GgufMetadataValue> {
     match value_type {
@@ -1398,7 +1444,7 @@ fn read_metadata_value(
 /// Reads and validates a `GGUF` array length prefix (`u64` from the file).
 ///
 /// Enforces `MAX_ARRAY_LEN` and converts to `usize`.
-fn read_array_len(cursor: &mut Cursor<'_>) -> crate::Result<usize> {
+fn read_array_len<R: Read + Seek>(cursor: &mut GgufReader<R>) -> crate::Result<usize> {
     let len = cursor.read_u64_le()?;
     if len > MAX_ARRAY_LEN {
         return Err(AnamnesisError::Parse {
@@ -1424,8 +1470,8 @@ fn read_array_len(cursor: &mut Cursor<'_>) -> crate::Result<usize> {
 /// `PREALLOC_SOFT_CAP` so an adversarial 20-byte array header claiming
 /// `MAX_ARRAY_LEN` elements cannot force ~488 MB of eager allocation;
 /// the vector grows geometrically from there.
-fn read_typed_array(
-    cursor: &mut Cursor<'_>,
+fn read_typed_array<R: Read + Seek>(
+    cursor: &mut GgufReader<R>,
     inner_type: u32,
     len: usize,
     depth: u32,
@@ -1582,22 +1628,57 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
     let raw =
         unsafe { memmap2::MmapOptions::new().populate().map(&file) }.map_err(AnamnesisError::Io)?;
 
+    // Wrap the mmap in a `std::io::Cursor` so the parser core can run over
+    // it via the same `Read + Seek` substrate the reader-generic
+    // `inspect_gguf_from_reader` uses. The mmap stays alive for the whole
+    // `ParsedGguf` lifetime so that `ParsedGguf::tensors` can hand out
+    // zero-copy `Cow::Borrowed` slices into it after parsing.
+    let parsed = parse_gguf_from_reader(std::io::Cursor::new(&raw[..]))?;
+
+    Ok(ParsedGguf {
+        mmap: raw,
+        version: parsed.version,
+        alignment: parsed.alignment,
+        metadata: parsed.metadata,
+        tensor_infos: parsed.tensor_infos,
+    })
+}
+
+/// Reader-generic core extracted from [`parse_gguf`].
+///
+/// Returns the parsed front matter — version, effective alignment, metadata
+/// `HashMap`, and per-tensor info records (with absolute offsets) — without
+/// depending on a memory-mapped substrate. The path-based [`parse_gguf`]
+/// delegates to this function over a `std::io::Cursor` wrapping its mmap;
+/// [`inspect_gguf_from_reader`] delegates over the caller-supplied reader.
+///
+/// All adversarial-input guards from the original mmap-only parser are
+/// preserved verbatim: caps on `tensor_count`, `metadata_kv_count`, string
+/// length, array length, nesting depth, dimension count, and element
+/// product, plus per-tensor alignment and end-of-data bounds checks against
+/// the stream's total length (captured via `seek(SeekFrom::End(0))` once at
+/// reader construction).
+fn parse_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<GgufFrontMatter> {
+    let mut cursor = GgufReader::new(reader)?;
+
     // Magic check. Detect legacy GGML/GGJT/GGMF formats and byte-swapped
     // big-endian GGUF files for clearer error messages.
-    let magic_bytes = raw.get(..4).ok_or_else(|| AnamnesisError::Parse {
-        reason: "GGUF: file shorter than 4 bytes (no magic)".into(),
-    })?;
-    if magic_bytes != GGUF_MAGIC {
-        let mut arr = [0u8; 4];
-        arr.copy_from_slice(magic_bytes);
-        let as_le = u32::from_le_bytes(arr);
+    if cursor.file_len < 4 {
+        return Err(AnamnesisError::Parse {
+            reason: "GGUF: file shorter than 4 bytes (no magic)".into(),
+        });
+    }
+    let mut magic_bytes = [0u8; 4];
+    cursor.read_into(&mut magic_bytes)?;
+    if &magic_bytes != GGUF_MAGIC {
+        let as_le = u32::from_le_bytes(magic_bytes);
         if as_le == GGUF_MAGIC_BE_U32 {
             return Err(AnamnesisError::Unsupported {
                 format: "GGUF".into(),
                 detail: "big-endian GGUF files are not yet supported".into(),
             });
         }
-        let legacy_name: Option<&'static str> = match magic_bytes {
+        let legacy_name: Option<&'static str> = match &magic_bytes {
             b"GGML" => Some("GGML"),
             b"GGJT" => Some("GGJT"),
             b"GGMF" => Some("GGMF"),
@@ -1618,9 +1699,6 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
         });
     }
 
-    // Read the fixed-size header. Cursor starts after the magic.
-    let mut cursor = Cursor::new(&raw);
-    cursor.pos = 4;
     let version = cursor.read_u32_le()?;
     if version == 1 {
         return Err(AnamnesisError::Unsupported {
@@ -1704,13 +1782,8 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
         tensor_infos.push(read_tensor_info_relative(&mut cursor)?);
     }
 
-    // CAST: usize → u64, `cursor.pos` is bounded by `raw.len()`, which
-    // always fits in `u64` on every supported target (64-bit and 32-bit).
-    #[allow(clippy::as_conversions)]
-    let tensor_info_end = cursor.pos as u64;
-    // CAST: usize → u64, same rationale as `tensor_info_end`
-    #[allow(clippy::as_conversions)]
-    let file_len_u64 = raw.len() as u64;
+    let tensor_info_end = cursor.pos;
+    let file_len_u64 = cursor.file_len;
 
     // The tensor_data section begins at the next alignment boundary after
     // the tensor-info table. A file with zero tensors has no data section at
@@ -1787,13 +1860,22 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
         info.data_offset = absolute;
     }
 
-    Ok(ParsedGguf {
-        mmap: raw,
+    Ok(GgufFrontMatter {
         version,
         alignment,
         metadata,
         tensor_infos,
     })
+}
+
+/// Reader-generic core output: everything [`parse_gguf`] needs except the
+/// owning `memmap2::Mmap`. Internal-only type — both [`parse_gguf`] and
+/// [`inspect_gguf_from_reader`] consume it but neither exposes it.
+struct GgufFrontMatter {
+    version: u32,
+    alignment: u32,
+    metadata: HashMap<String, GgufMetadataValue>,
+    tensor_infos: Vec<GgufTensorInfo>,
 }
 
 /// Reads one `gguf_tensor_info_t` from the cursor and returns a
@@ -1806,7 +1888,9 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
 /// conversion) happens here so that the patch sweep only needs to do offset
 /// arithmetic and the two bounds checks that depend on the data section
 /// start.
-fn read_tensor_info_relative(cursor: &mut Cursor<'_>) -> crate::Result<GgufTensorInfo> {
+fn read_tensor_info_relative<R: Read + Seek>(
+    cursor: &mut GgufReader<R>,
+) -> crate::Result<GgufTensorInfo> {
     // GGUF tensor names: the spec caps them at 64 bytes, but some encoders
     // produce longer names in practice. Accept up to `MAX_TENSOR_NAME_LEN`.
     let name = cursor.read_string(MAX_TENSOR_NAME_LEN)?;
