@@ -29,7 +29,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 3 | v0.4.0 GGUF refactor re-validation | **Split: Q4_0 wins ~8 %, Q8_0 loses ~6 %** | Re-measurement only — current code unchanged |
 | 4 | `parse()`: `fs::read` → `memmap2::Mmap` | **~3000× faster on 11 GiB safetensors** | Shipped |
 | 5 | `inspect_gguf_from_reader`: internal `BufReader<R>` | **~52× faster on `File` substrate, mmap parity** | Shipped |
-| 6 | `inspect_pth_from_reader` vs `parse_pth(path).inspect()` vs `torch.load` | **Reader ≤1.6× mmap on KiB fixtures; both 2.4–3.6× faster than `torch.load`** | Shipped |
+| 6 | `inspect_pth_from_reader` vs `parse_pth(path).inspect()` vs `torch.load` | **Reader 1.36× mmap median across 6 960 AlgZoo files; mmap 4.07× / reader 2.99× faster than `torch.load`** | Shipped |
 
 ---
 
@@ -475,16 +475,20 @@ speedups already documented in the project README for the mmap path.
 internal `BufReader` because:
 
 - The parity gap on KiB fixtures (1.14–1.64× of mmap) is small in absolute
-  terms (~50–90 µs) and would not benefit meaningfully from buffering —
-  the `zip` crate already does its own buffering on the central-directory
-  scan, and our two payload reads are bulk `read_to_end` calls.
+  terms (~20–90 µs across the 3 in-tree fixtures; ~45 µs at the corpus
+  median, see Follow-up below) and would not benefit meaningfully from
+  buffering — the `zip` crate already does its own buffering on the
+  central-directory scan, and our two payload reads are bulk
+  `read_to_end` calls.
 - Adding `BufReader<R>` would introduce one extra memcpy per buffer-fill
   on every substrate (including `Cursor`), with no syscall reduction (the
   fixed-cost path is dominated by `seek + EOCD scan + central-directory
   parse`, not per-element reads).
-- The 3.5× absolute speedup vs `torch.load` is already comfortable; the
-  remaining ~80 µs gap to the mmap path is a fixed cost of the ZIP-archive
-  abstraction, not a syscall pattern that buffering would amortise.
+- The 3.5× speedup vs `torch.load` is already comfortable; the remaining
+  ~80 µs gap to the mmap path on the 3-fixture median (~45 µs on the
+  6 960-file corpus median — see Follow-up) is a fixed cost of the
+  ZIP-archive abstraction, not a syscall pattern that buffering would
+  amortise.
 
 The Phase 4.9 GGUF rationale for adding `BufReader<R>` (collapsing many
 4–8 B `read_exact` calls on a `File` substrate into one syscall per buffer
@@ -522,8 +526,9 @@ algorithmic-task families:
 
 **Method:** same as above (best-of-5 release-mode median per file,
 `target-cpu=native`, warmed FS cache, one warm-up iteration), but with
-22 320 timed measurements per substrate instead of 9. Rust wall-clock
-13.5 s (516 files/s); Python wall-clock 24.4 s (286 files/s) — both
+34 800 timed measurements per substrate (6 960 files × 5 iterations)
+instead of 15 (3 fixtures × 5 iterations). Rust wall-clock 13.5 s
+(516 files/s); Python wall-clock 24.4 s (286 files/s) — both
 single-process, single-threaded.
 
 **Global distribution (per-file medians, µs):**
@@ -543,38 +548,52 @@ single-process, single-threaded.
 
 **Per-family breakdown (medians, µs):**
 
+All ratios are computed as `ratio-of-medians` from the row's µs values,
+matching the global section's method. Each `reader/mmap` cell therefore
+equals (reader median) / (mmap median) in the same row; small differences
+from the bench harness's `median-of-per-file-ratios` (also reported in
+the bench output) are expected at this rounding precision.
+
 | Family | Count | `torch.load` | mmap | reader | mmap×torch.load | reader×torch.load | reader/mmap |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `2nd_argmax`    | 3 360 | 503.3 | 123.7 | 168.3 | 4.07× | 2.99× | 1.36× |
-| `argmedian`     | 1 200 | 502.5 | 123.8 | 169.1 | 4.06× | 2.97× | 1.36× |
+| `argmedian`     | 1 200 | 502.5 | 123.8 | 169.1 | 4.06× | 2.97× | 1.37× |
 | `longest_cycle` | 1 200 | 818.1 | 144.1 | 223.8 | 5.68× | 3.66× | 1.55× |
-| `median`        | 1 200 | 502.0 | 121.3 | 164.2 | 4.14× | 3.06× | 1.36× |
+| `median`        | 1 200 | 502.0 | 121.3 | 164.2 | 4.14× | 3.06× | 1.35× |
 
 **Reading the numbers:**
 
 - **The parity claim holds.** The 3-fixture median of 1.53× was a small
-  sample biased upward (one fixture at 1.64×). The 6 960-file median is
-  **1.36×**, with p25 = 1.34× and p75 = 1.39× — a tight distribution
-  that says the reader/mmap gap is structurally fixed at ~40 µs on
-  KiB-scale `.pth` files. The 1.5× re-attempt threshold in this
-  experiment's *Re-attempting* clause stands.
-- **`longest_cycle` is the outlier**, ~17 % slower than the other three
-  families on the mmap path and ~33 % slower on the reader path. The
-  task itself is structurally heavier — `longest_cycle` `AlgZoo` models
-  have more tensors per file (~13 vs ~7 for `2nd_argmax`/`argmedian`/
-  `median`), so the pickle interpreter does more work per file. Both
-  Rust paths and `torch.load` see the same relative slowdown on this
-  family, confirming it's task-driven, not substrate-driven.
+  sample biased upward by the middle fixture's 1.53× ratio sitting well
+  above the corpus distribution: only one of the three in-tree fixtures
+  (1.14×) fell within the 6 960-file p25–p75 band of 1.34×–1.39×. The
+  6 960-file median is **1.36×**, with p25 = 1.34× and p75 = 1.39× — a
+  tight distribution that says the reader/mmap gap is structurally
+  fixed at ~45 µs on KiB-scale `.pth` files (`168.7 − 124.0 = 44.7 µs`
+  at the median). The 1.5× re-attempt threshold in this experiment's
+  *Re-attempting* clause stands.
+- **`longest_cycle` is the outlier**, with median timings ~17 % slower
+  than the other three families on the mmap path, ~34 % slower on the
+  reader path, and ~63 % slower on `torch.load`. The task itself is
+  structurally heavier — `longest_cycle` `AlgZoo` models use the
+  Transformer architecture (more tensors per file) while the other
+  three families use simpler RNN-style models, so the pickle
+  interpreter does more work per file. All three substrates rank
+  `longest_cycle` slowest, confirming it's task-driven, not
+  substrate-driven. The compounding on `torch.load` (Rust paths add
+  ~17–34 %, Python adds ~63 %) is consistent with the extra tensors
+  triggering extra Python-side `torch.Tensor` materialisation on top of
+  the extra pickle-VM work.
 - **The cross-language speedup tightens.** Earlier 3-fixture median
   reader-vs-`torch.load` was **3.5×**; the 6 960-file median is
   **2.99×**. The drop reflects the larger sample averaging out
-  `torch.load`'s tail (the 3-fixture set included `algzoo_transformer_
-  small.pth` whose 858 µs `torch.load` time was an upper-quartile case).
-  The 4.07× mmap speedup is essentially unchanged from the 3-fixture
-  4.0× median.
-- **Both `torch.load` distributions are narrow.** p25/p75 spreads are
-  500.6/512.7 µs — narrower than ±3 % of the median — so the speedup
-  ratios are not an artefact of a fat-tailed Python distribution.
+  `torch.load`'s tail (the 3-fixture set included
+  `algzoo_transformer_small.pth` whose 858 µs `torch.load` time is well
+  above the corpus p75 of 512.7 µs — an upper-decile case). The 4.07×
+  mmap speedup is essentially unchanged from the 3-fixture 4.0× median.
+- **The `torch.load` distribution is narrow.** p25/p75 are 500.6/512.7
+  µs — within ±2 % of the 504.3 µs median — so the speedup ratios are
+  not an artefact of a fat-tailed Python distribution.
 - **None of the conclusions of the 3-fixture experiment are changed.**
   Specifically: the reader path is still **shipped without `BufReader`**;
   the rustdoc parity claim "~1.14–1.64× the time of the mmap-backed
