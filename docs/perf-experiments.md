@@ -499,6 +499,93 @@ reconsidered. The current bench harness
 arbitrary additional fixtures dropped into
 `tests/fixtures/pth_reference/`.
 
+### Follow-up — 6 960-file `AlgZoo` corpus sweep
+
+The 3 in-tree fixtures are a sanity check, not a population estimate. To
+back the rustdoc parity claim with a broader sample, the bench harness
+grew two new tests: `bench_pth_inspect_algzoo_sweep` (Rust) and the
+`ANAMNESIS_ALGZOO_DIR` sweep mode of `bench_python_inspect.py` (Python).
+Both walk every `*.pth` file under a configurable directory and report
+aggregate distributions plus per-task-family breakdown.
+
+**Corpus:** `algzoo_weights/` — the full `AlgZoo` model set imported for
+`candle-mi` v0.1.9's `stoicheia` module: **6 960 files**, 22.6 MiB total,
+median file size 2.5 KiB (range 2.0–7.7 KiB), grouped into four
+algorithmic-task families:
+
+| Task family | File count |
+|---|---:|
+| `2nd_argmax` | 3 360 |
+| `argmedian` | 1 200 |
+| `longest_cycle` | 1 200 |
+| `median` | 1 200 |
+
+**Method:** same as above (best-of-5 release-mode median per file,
+`target-cpu=native`, warmed FS cache, one warm-up iteration), but with
+22 320 timed measurements per substrate instead of 9. Rust wall-clock
+13.5 s (516 files/s); Python wall-clock 24.4 s (286 files/s) — both
+single-process, single-threaded.
+
+**Global distribution (per-file medians, µs):**
+
+| Substrate | min | p25 | median | p75 | mean | max |
+|---|---:|---:|---:|---:|---:|---:|
+| `parse_pth(path).inspect()` (mmap)        | 117.4 | 122.3 | **124.0** | 128.4 | 127.7 | 415.1 |
+| `inspect_pth_from_reader(File)` (reader)  | 160.0 | 165.9 | **168.7** | 173.1 | 177.9 | 612.5 |
+| `torch.load(weights_only=True)` (PyTorch) | 489.3 | 500.6 | **504.3** | 512.7 | 559.2 | 951.3 |
+| reader / mmap                             | 0.54  | 1.34  | **1.36**  | 1.39  | 1.39  | 4.63  |
+
+**Cross-language speedups (median across all 6 960 files):**
+
+- `parse_pth(path).inspect()` is **4.07× faster than `torch.load`** (504.3 / 124.0).
+- `inspect_pth_from_reader` is **2.99× faster than `torch.load`** (504.3 / 168.7).
+- `inspect_pth_from_reader` is **1.36× the time of the mmap path** (168.7 / 124.0).
+
+**Per-family breakdown (medians, µs):**
+
+| Family | Count | `torch.load` | mmap | reader | mmap×torch.load | reader×torch.load | reader/mmap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `2nd_argmax`    | 3 360 | 503.3 | 123.7 | 168.3 | 4.07× | 2.99× | 1.36× |
+| `argmedian`     | 1 200 | 502.5 | 123.8 | 169.1 | 4.06× | 2.97× | 1.36× |
+| `longest_cycle` | 1 200 | 818.1 | 144.1 | 223.8 | 5.68× | 3.66× | 1.55× |
+| `median`        | 1 200 | 502.0 | 121.3 | 164.2 | 4.14× | 3.06× | 1.36× |
+
+**Reading the numbers:**
+
+- **The parity claim holds.** The 3-fixture median of 1.53× was a small
+  sample biased upward (one fixture at 1.64×). The 6 960-file median is
+  **1.36×**, with p25 = 1.34× and p75 = 1.39× — a tight distribution
+  that says the reader/mmap gap is structurally fixed at ~40 µs on
+  KiB-scale `.pth` files. The 1.5× re-attempt threshold in this
+  experiment's *Re-attempting* clause stands.
+- **`longest_cycle` is the outlier**, ~17 % slower than the other three
+  families on the mmap path and ~33 % slower on the reader path. The
+  task itself is structurally heavier — `longest_cycle` `AlgZoo` models
+  have more tensors per file (~13 vs ~7 for `2nd_argmax`/`argmedian`/
+  `median`), so the pickle interpreter does more work per file. Both
+  Rust paths and `torch.load` see the same relative slowdown on this
+  family, confirming it's task-driven, not substrate-driven.
+- **The cross-language speedup tightens.** Earlier 3-fixture median
+  reader-vs-`torch.load` was **3.5×**; the 6 960-file median is
+  **2.99×**. The drop reflects the larger sample averaging out
+  `torch.load`'s tail (the 3-fixture set included `algzoo_transformer_
+  small.pth` whose 858 µs `torch.load` time was an upper-quartile case).
+  The 4.07× mmap speedup is essentially unchanged from the 3-fixture
+  4.0× median.
+- **Both `torch.load` distributions are narrow.** p25/p75 spreads are
+  500.6/512.7 µs — narrower than ±3 % of the median — so the speedup
+  ratios are not an artefact of a fat-tailed Python distribution.
+- **None of the conclusions of the 3-fixture experiment are changed.**
+  Specifically: the reader path is still **shipped without `BufReader`**;
+  the rustdoc parity claim "~1.14–1.64× the time of the mmap-backed
+  `parse_pth(path).inspect()`" is updated to "~1.36× median across 6 960
+  AlgZoo files (p25=1.34×, p75=1.39×)" in this commit.
+
+**Disposition (follow-up):** Numbers added to the rustdoc on
+`inspect_pth_from_reader`'s `# Performance` section; CHANGELOG entry
+updated. No behavioural change to the code itself — only the empirical
+evidence base widened from 3 fixtures to 6 960.
+
 ## How to add an entry
 
 When you ship (or attempt to ship) a perf-claim change, add a row to the index

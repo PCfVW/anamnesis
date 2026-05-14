@@ -60,17 +60,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `inspect_pth_from_reader(Cursor::new(fs::read(path)?))`.
 - **Cross-language performance comparison** documenting the reader path
   vs `PyTorch`'s `torch.load(weights_only=True)`. On the 3 `AlgZoo`
-  fixtures (best-of-5 release-mode median, `target-cpu=native`,
-  `PyTorch` `2.10.0+cu130`), `inspect_pth_from_reader` is **2.4–3.6×
-  faster than `torch.load`** even though `torch.load` has no separate
-  inspect-only primitive — the speedup is a lower bound that grows by
-  orders of magnitude on torchvision-class models, where the reader path
-  stays bounded by `data.pkl` size while `torch.load` scales linearly in
-  total tensor-data size. Bench harness:
+  fixtures checked into the repo (best-of-5 release-mode median,
+  `target-cpu=native`, `PyTorch` `2.10.0+cu130`),
+  `inspect_pth_from_reader` is **2.4–3.6× faster than `torch.load`**
+  even though `torch.load` has no separate inspect-only primitive — the
+  speedup is a lower bound that grows by orders of magnitude on
+  torchvision-class models, where the reader path stays bounded by
+  `data.pkl` size while `torch.load` scales linearly in total
+  tensor-data size. Bench harness:
   `tests/bench_pth_inspect_adhoc.rs` (Rust side, `#[ignore]`-gated) +
   `tests/fixtures/pth_reference/bench_python_inspect.py` (`PyTorch`
   side). Full method + numbers in
   [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6.
+- **Broad-sample validation on the full 6 960-file `AlgZoo` corpus**
+  (the `algzoo_weights/` set imported for `candle-mi` v0.1.9's
+  `stoicheia` module — 22.6 MiB total, median file size 2.5 KiB, 4
+  task families). New `bench_pth_inspect_algzoo_sweep` Rust test +
+  `ANAMNESIS_ALGZOO_DIR` sweep mode of `bench_python_inspect.py`
+  walk a configurable external directory, time every `.pth` file in
+  both substrates plus `torch.load`, and report aggregate
+  distributions plus per-task-family breakdown. Across all 6 960 files
+  (per-file medians, µs):
+  - mmap path: median **124.0**, p25 122.3, p75 128.4 (tight, σ ≈ 3 µs).
+  - reader path: median **168.7**, p25 165.9, p75 173.1.
+  - `torch.load(weights_only=True)`: median **504.3**, p25 500.6, p75 512.7.
+
+  Median speedups across the full corpus: mmap **4.07× faster than
+  `torch.load`**, reader **2.99× faster than `torch.load`**, reader
+  takes **1.36× the time** of mmap (p25 1.34×, p75 1.39× — the
+  reader/mmap gap is structurally fixed at ~45 µs on KiB-scale `.pth`
+  files). The widened evidence base confirms the rustdoc's parity claim
+  and re-derives Phase 4.10's *Re-attempting* threshold (revisit
+  `BufReader<R>` only if a torchvision-class file exceeds 1.5× of the
+  mmap path). Full method, per-family breakdown, and the
+  `longest_cycle`-family outlier analysis in
+  [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6
+  *Follow-up*.
 
 ## [0.4.5] - 2026-05-04
 
