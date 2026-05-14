@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use anamnesis::parse_pth;
+use anamnesis::{inspect_pth_from_reader, parse_pth, PthInspectInfo};
 
 /// Minimal JSON reference structure (deserialized with serde).
 #[derive(serde::Deserialize)]
@@ -275,4 +275,60 @@ fn roundtrip_bytes_algzoo_transformer_small() {
 #[test]
 fn roundtrip_bytes_algzoo_rnn_blog() {
     roundtrip_via_bytes("algzoo_rnn_blog.pth", "algzoo_rnn_blog_reference.json");
+}
+
+// ---------------------------------------------------------------------------
+// Reader-generic API — substrate equivalence on the AlgZoo fixtures (Phase 4.10)
+// ---------------------------------------------------------------------------
+//
+// Asserts that `inspect_pth_from_reader` returns the same `PthInspectInfo` as
+// `parse_pth(path).inspect()` on every AlgZoo fixture, across both an
+// in-memory `Cursor<&[u8]>` substrate and a real `std::fs::File`. This is the
+// contract that downstream `HTTP`-range adapters rely on: the substrate
+// (file vs. cursor vs. range-backed transport) cannot change the metadata.
+
+/// Asserts every field of two `PthInspectInfo` values is equal.
+fn assert_pth_inspect_eq(label: &str, a: &PthInspectInfo, b: &PthInspectInfo) {
+    assert_eq!(a.tensor_count, b.tensor_count, "{label}: tensor_count");
+    assert_eq!(a.total_bytes, b.total_bytes, "{label}: total_bytes");
+    assert_eq!(a.dtypes, b.dtypes, "{label}: dtypes");
+    assert_eq!(a.big_endian, b.big_endian, "{label}: big_endian");
+}
+
+/// Inspects every `AlgZoo` fixture through three different substrates —
+/// the mmap-backed `parse_pth`, a `Cursor<&[u8]>` over the file's
+/// in-memory bytes, and a real `std::fs::File` — and asserts the resulting
+/// `PthInspectInfo` is field-for-field identical across all three.
+#[test]
+fn substrate_equivalence_algzoo_fixtures() {
+    let fixtures = [
+        "algzoo_rnn_small.pth",
+        "algzoo_transformer_small.pth",
+        "algzoo_rnn_blog.pth",
+    ];
+
+    for name in fixtures {
+        let path = fixture_dir().join(name);
+
+        // Substrate 1: path-based (mmap-backed).
+        let path_info = parse_pth(&path)
+            .unwrap_or_else(|e| panic!("parse_pth({name}) failed: {e}"))
+            .inspect();
+
+        // Substrate 2: in-memory `Cursor<&[u8]>`.
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read({name}) failed: {e}"));
+        let cursor_info = inspect_pth_from_reader(std::io::Cursor::new(&bytes))
+            .unwrap_or_else(|e| panic!("inspect_pth_from_reader(Cursor) on {name} failed: {e}"));
+
+        // Substrate 3: real `std::fs::File` — exactly what an `HTTP`-range
+        // adapter or other custom transport would present.
+        let file =
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("open({name}) failed: {e}"));
+        let file_info = inspect_pth_from_reader(file)
+            .unwrap_or_else(|e| panic!("inspect_pth_from_reader(File) on {name} failed: {e}"));
+
+        assert_pth_inspect_eq(&format!("{name} path vs cursor"), &path_info, &cursor_info);
+        assert_pth_inspect_eq(&format!("{name} path vs file"), &path_info, &file_info);
+        assert_pth_inspect_eq(&format!("{name} cursor vs file"), &cursor_info, &file_info);
+    }
 }

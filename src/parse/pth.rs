@@ -1900,6 +1900,32 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// directory + `data.pkl` regions on first access amortise away every
 /// round trip.
 ///
+/// Per-file timings — best-of-5 release-mode median, `target-cpu=native`,
+/// measured by
+/// [`tests/bench_pth_inspect_adhoc.rs`](../tests/bench_pth_inspect_adhoc.rs)
+/// against the matching `torch.load(weights_only=True)` baseline at
+/// [`tests/fixtures/pth_reference/bench_python_inspect.py`](../tests/fixtures/pth_reference/bench_python_inspect.py)
+/// (`PyTorch` `2.10.0+cu130`). On the three in-tree `AlgZoo` fixtures, the
+/// reader path is **2.4–3.6× faster than `torch.load`**, and ~1.14–1.64×
+/// the time of the mmap-backed [`parse_pth`]`.inspect()`. The ~50–90 µs
+/// gap to the mmap path is dominated by fixed costs of the ZIP-archive
+/// abstraction on KiB-scale fixtures and collapses to parity on
+/// torchvision-class files — see
+/// [`docs/perf-experiments.md`](../docs/perf-experiments.md) Experiment 6
+/// for the full analysis.
+///
+/// | Fixture | `torch.load` median | mmap median | reader median |
+/// |---|---:|---:|---:|
+/// | `algzoo_rnn_small.pth` (2.0 KiB) | 532.7 µs | 134.4 µs | 220.1 µs |
+/// | `algzoo_transformer_small.pth` (3.5 KiB) | 858.7 µs | 154.0 µs | 236.1 µs |
+/// | `algzoo_rnn_blog.pth` (3.3 KiB) | 530.6 µs | 133.1 µs | 151.5 µs |
+///
+/// The reader speedup vs `torch.load` is a **lower bound**: scaling to a
+/// torchvision-class 300 MB `.pth`, `torch.load`'s time grows linearly
+/// with total `data/N` size while `inspect_pth_from_reader`'s time stays
+/// bounded by `data.pkl` size (tens of KiB), so the ratio grows by orders
+/// of magnitude on large models.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied

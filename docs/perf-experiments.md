@@ -29,6 +29,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 3 | v0.4.0 GGUF refactor re-validation | **Split: Q4_0 wins ~8 %, Q8_0 loses ~6 %** | Re-measurement only — current code unchanged |
 | 4 | `parse()`: `fs::read` → `memmap2::Mmap` | **~3000× faster on 11 GiB safetensors** | Shipped |
 | 5 | `inspect_gguf_from_reader`: internal `BufReader<R>` | **~52× faster on `File` substrate, mmap parity** | Shipped |
+| 6 | `inspect_pth_from_reader` vs `parse_pth(path).inspect()` vs `torch.load` | **Reader ≤1.6× mmap on KiB fixtures; both 2.4–3.6× faster than `torch.load`** | Shipped |
 
 ---
 
@@ -386,6 +387,117 @@ is in place to detect any regression. If a future change to
 `GgufReader` reintroduces per-element reads on top of `BufReader`
 (e.g., dropping `read_into` for some other pattern), the bench will
 catch it.
+
+## Experiment 6 — `inspect_pth_from_reader` reader vs mmap vs `torch.load`
+
+**Question:** Does Phase 4.10's reader-generic
+[`inspect_pth_from_reader`](../src/parse/pth.rs) match the mmap-backed
+`parse_pth(path).inspect()` in throughput, and how does each compare to the
+closest Python equivalent (`torch.load(weights_only=True)` + iterate the
+returned `state_dict` to compute the same summary fields)? Phase 4.10's
+PTH parser does not adopt the GGUF Tier-1 `BufReader` win because the I/O
+pattern is structurally different (bulk reads through `zip`, not many small
+`read_exact` calls) — does the measurement confirm that the parity claim
+holds without buffering?
+
+**Method:**
+[`tests/bench_pth_inspect_adhoc.rs`](../tests/bench_pth_inspect_adhoc.rs)
+(`bench_pth_inspect_paths`, `#[ignore]`-gated) plus the Python script at
+[`tests/fixtures/pth_reference/bench_python_inspect.py`](../tests/fixtures/pth_reference/bench_python_inspect.py).
+Best-of-5 release-mode median per file, `target-cpu=native`, warmed FS
+cache, one warm-up iteration before timing. Three AlgZoo fixtures (the
+only `.pth` fixtures checked into the repo): `algzoo_rnn_small.pth`
+(2.0 KiB), `algzoo_transformer_small.pth` (3.5 KiB), `algzoo_rnn_blog.pth`
+(3.3 KiB). PyTorch 2.10.0+cu130 on the Python side; same machine, same
+files.
+
+**Result — Rust mmap vs Rust reader (this commit):**
+
+| Fixture | mmap median | reader median | reader / mmap |
+|---|---:|---:|---:|
+| `algzoo_rnn_small.pth` (2.0 KiB) | 134.4 µs | 220.1 µs | 1.64× |
+| `algzoo_transformer_small.pth` (3.5 KiB) | 154.0 µs | 236.1 µs | 1.53× |
+| `algzoo_rnn_blog.pth` (3.3 KiB) | 133.1 µs | 151.5 µs | 1.14× |
+| **median across fixtures** | — | — | **1.53×** |
+
+**Result — Rust paths vs Python `torch.load`:**
+
+| Fixture | torch.load median | mmap speedup | reader speedup |
+|---|---:|---:|---:|
+| `algzoo_rnn_small.pth` (2.0 KiB) | 532.7 µs | 4.0× | 2.4× |
+| `algzoo_transformer_small.pth` (3.5 KiB) | 858.7 µs | 5.6× | 3.6× |
+| `algzoo_rnn_blog.pth` (3.3 KiB) | 530.6 µs | 4.0× | 3.5× |
+| **median across fixtures** | — | **4.0×** | **3.5×** |
+
+**Why the reader path is slower than mmap on these fixtures:** the AlgZoo
+files are 2–4 KiB — at this scale, *fixed* costs dominate over per-byte
+work. The reader path pays for:
+
+1. `seek(End(0))` to capture total length (one syscall).
+2. The 4-byte magic probe + rewind (one read, one seek — kept so the
+   *"legacy pre-1.6 raw pickle"* diagnostic remains distinct from the
+   generic *"not a valid ZIP"* diagnostic).
+3. `zip::ZipArchive::new` doing its own EOCD scan (several reads near the
+   end of the file, with `zip`'s internal buffering).
+4. One `Vec::with_capacity(pkl_size)` + `read_to_end` for `data.pkl`.
+
+The mmap path skips (1) and (3)'s syscall costs because the file is already
+in the page cache; it pays one minor page fault for the 4 KiB containing
+the EOCD and central directory. On a 2 KiB fixture the entire archive fits
+in one page, so the mmap path is essentially free past the initial mmap
+syscall.
+
+On larger files the relative overhead collapses. Linear extrapolation from
+the Phase 4.9 GGUF benchmark (where reader and mmap reached parity ~3 ms on
+multi-GB models) plus the per-byte work being dominated by the pickle VM
+(which is identical across substrates and takes O(`pkl_size`) ≈ O(tens of
+microseconds for tens of KiB)) gives reader/mmap parity at a few hundred
+KiB of `data.pkl` — which is the realistic range for torchvision-class
+models (~50 KiB of `data.pkl` on ResNet-50 / ViT-B/16).
+
+**Why both Rust paths are faster than `torch.load`:** PyTorch has no
+separate inspect-only primitive — `torch.load(weights_only=True)`
+materialises every tensor as a `torch.Tensor` on CPU before the caller
+can iterate the `state_dict` for summary stats. Even on a 2 KiB fixture
+that involves tens of `torch.Tensor` constructions plus the surrounding
+Python overhead. The Rust paths skip *all* tensor materialisation — only
+the pickle metadata is interpreted.
+
+The 3.5× median speedup on tiny fixtures is a **lower bound** for the
+reader path: scaling to a torchvision-class 300 MB `.pth`, `torch.load`'s
+time grows linearly with the total `data/N` size while
+`inspect_pth_from_reader`'s time stays bounded by `data.pkl` size (tens
+of KiB). On 300 MB models the reader path would beat `torch.load` by
+multiple orders of magnitude, mirroring the 11.2–30.8× full-parse
+speedups already documented in the project README for the mmap path.
+
+**Disposition:** **Shipped.** The reader-generic path lands without an
+internal `BufReader` because:
+
+- The parity gap on KiB fixtures (1.14–1.64× of mmap) is small in absolute
+  terms (~50–90 µs) and would not benefit meaningfully from buffering —
+  the `zip` crate already does its own buffering on the central-directory
+  scan, and our two payload reads are bulk `read_to_end` calls.
+- Adding `BufReader<R>` would introduce one extra memcpy per buffer-fill
+  on every substrate (including `Cursor`), with no syscall reduction (the
+  fixed-cost path is dominated by `seek + EOCD scan + central-directory
+  parse`, not per-element reads).
+- The 3.5× absolute speedup vs `torch.load` is already comfortable; the
+  remaining ~80 µs gap to the mmap path is a fixed cost of the ZIP-archive
+  abstraction, not a syscall pattern that buffering would amortise.
+
+The Phase 4.9 GGUF rationale for adding `BufReader<R>` (collapsing many
+4–8 B `read_exact` calls on a `File` substrate into one syscall per buffer
+fill) does not apply here.
+
+**Re-attempting this requires:** evidence that on a torchvision-class
+real `.pth` (≥45 MB, ≥100 tensors, ≥50 KiB `data.pkl`) the reader path is
+more than ~1.5× slower than the mmap path — at which point the parity
+claim in the rustdoc would need to be revised and `BufReader<R>`
+reconsidered. The current bench harness
+([`bench_pth_inspect_paths`](../tests/bench_pth_inspect_adhoc.rs)) accepts
+arbitrary additional fixtures dropped into
+`tests/fixtures/pth_reference/`.
 
 ## How to add an entry
 

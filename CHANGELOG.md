@@ -52,6 +52,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pickle VM via the same private function, so the security allowlist
   (`is_allowed_global`) is identical across the two paths. Any future
   tightening of the pickle interpreter automatically applies to both.
+- **Substrate-equivalence integration test on the `AlgZoo` fixtures**
+  (`tests/cross_validation_pth.rs::substrate_equivalence_algzoo_fixtures`)
+  — for each of the 3 `AlgZoo` fixtures, asserts field-for-field
+  equivalence of `PthInspectInfo` across the three substrates
+  `parse_pth(path).inspect()`, `inspect_pth_from_reader(File::open(path)?)`,
+  and `inspect_pth_from_reader(Cursor::new(fs::read(path)?))`.
+- **Cross-language performance comparison** documenting the reader path
+  vs `PyTorch`'s `torch.load(weights_only=True)`. On the 3 `AlgZoo`
+  fixtures (best-of-5 release-mode median, `target-cpu=native`,
+  `PyTorch` `2.10.0+cu130`), `inspect_pth_from_reader` is **2.4–3.6×
+  faster than `torch.load`** even though `torch.load` has no separate
+  inspect-only primitive — the speedup is a lower bound that grows by
+  orders of magnitude on torchvision-class models, where the reader path
+  stays bounded by `data.pkl` size while `torch.load` scales linearly in
+  total tensor-data size. Bench harness:
+  `tests/bench_pth_inspect_adhoc.rs` (Rust side, `#[ignore]`-gated) +
+  `tests/fixtures/pth_reference/bench_python_inspect.py` (`PyTorch`
+  side). Full method + numbers in
+  [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6.
 
 ## [0.4.5] - 2026-05-04
 
