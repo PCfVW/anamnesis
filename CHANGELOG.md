@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`inspect_pth_from_reader<R: Read + Seek>`** — reader-generic `.pth`
+  metadata inspection. Accepts any `Read + Seek` substrate (in-memory
+  `Cursor`, HTTP-range-backed adapter, custom transport) and returns the
+  same `PthInspectInfo` (`tensor_count`, `total_bytes`, `dtypes`,
+  `big_endian`) as the existing path-based `parse_pth(path).inspect()`,
+  without materialising any of the tensor-data files inside the archive
+  (`data/0`, `data/1`, …). Only the ZIP central directory and the
+  `data.pkl` entry — typically <100 KiB even on torchvision-class 300 MB
+  models — are read. A 300 MB torchvision `.pth` inspects with well under
+  100 KiB of network transfer through an HTTP-range adapter, instead of
+  300 MB. Unblocks `hf-fm` v0.11.3 (remote `.pth` inspect) on top of
+  v0.11.0's `HttpRangeReader` adapter, closing the remote-inspect matrix
+  across all four tensor formats anamnesis supports (`safetensors`, `NPZ`,
+  `GGUF`, `.pth`). Anamnesis itself takes on no network or TLS dependency.
+  Phase 4.10; see [`ROADMAP.md`](ROADMAP.md).
+- **`parse_pth` and `inspect_pth_from_reader` re-exported from the crate
+  root** — both functions are now reachable as `anamnesis::parse_pth` and
+  `anamnesis::inspect_pth_from_reader` (the former was already re-exported;
+  the latter is new). Joins the existing reader-generic family
+  (`parse_safetensors_header_from_reader`, `inspect_npz_from_reader`,
+  `inspect_gguf_from_reader`).
+- **8 new `.pth` unit tests** covering the reader-generic path:
+  `inspect_from_reader_matches_path_empty_dict` (substrate-equivalence on a
+  synthetic minimal archive), `inspect_from_reader_honours_byteorder_entry`
+  (explicit `byteorder` entry plumbed into `PthInspectInfo`),
+  `inspect_from_reader_rejects_legacy_format` (pre-`PyTorch` 1.6 raw
+  pickle surfaces as `Unsupported`),
+  `inspect_from_reader_rejects_wrong_magic` (non-ZIP / non-legacy bytes),
+  `inspect_from_reader_rejects_too_small_file` (fewer than 4 bytes),
+  `inspect_from_reader_rejects_missing_data_pkl` (ZIP with no `data.pkl`
+  entry), `inspect_from_reader_accepts_older_prefix` (older-style
+  `{model_name}/` archive prefix, exercising the suffix-stripping path),
+  and `inspect_from_reader_rejects_oversized_byteorder` (the 64-byte
+  `byteorder` cap fires before allocating).
+- **Shared `build_pth_inspect_info` helper** — both `ParsedPth::inspect()`
+  (mmap path) and `inspect_pth_from_reader` (reader-generic path) now
+  delegate field computation to the same private function, guaranteeing
+  substrate equivalence by construction. Mirrors Phase 4.9's
+  `build_inspect_info` for `GGUF`.
+- **Shared `interpret_pickle_to_meta` helper** — both entry points run the
+  pickle VM via the same private function, so the security allowlist
+  (`is_allowed_global`) is identical across the two paths. Any future
+  tightening of the pickle interpreter automatically applies to both.
+
 ## [0.4.5] - 2026-05-04
 
 ### Added

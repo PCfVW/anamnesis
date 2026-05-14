@@ -25,6 +25,7 @@
 - [NPZ/NPY Parsing](#npznpy-parsing)
 - [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
+- [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
 - [Used by](#used-by)
 - [License](#license)
 - [Development](#development)
@@ -195,6 +196,14 @@ Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with security allowl
 Lossless `.pth` → `.safetensors` conversion preserving original dtypes (F16, BF16, F32, F64, I8–I64, U8, Bool). The conversion pipeline writes directly from mmap slices to the output file — zero intermediate data copies.
 
 Handles both newer (`archive/` prefix) and older (`{model_name}/` prefix) PyTorch ZIP conventions. Legacy (pre-1.6) raw-pickle files are rejected with a clear error.
+
+### PyTorch `.pth` Inspection
+
+Feature-gated behind `pth`. The path-based `parse_pth(path)` memory-maps the file and returns a `ParsedPth` with zero-copy `tensors()` views into the mapping; the reader-generic `inspect_pth_from_reader<R: Read + Seek>(reader)` accepts any positional substrate (in-memory `Cursor`, HTTP-range-backed adapter, custom transport) and returns just the `PthInspectInfo` summary (`tensor_count`, `total_bytes`, `dtypes`, `big_endian`) without materialising any of the tensor-data files inside the archive (`data/0`, `data/1`, …).
+
+Only the ZIP central directory and the `data.pkl` entry — typically <100 KiB even on torchvision-class 300 MB models — are fetched. A 300 MB torchvision `.pth` is inspectable through an HTTP-range adapter in well under 100 KiB of network transfer, instead of 300 MB.
+
+`Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
 
 ## Used by
 

@@ -30,7 +30,10 @@ pub use npz::{
     NpzTensorInfo,
 };
 #[cfg(feature = "pth")]
-pub use pth::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
+pub use pth::{
+    inspect_pth_from_reader, parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor,
+    PthTensorInfo,
+};
 pub use safetensors::{
     parse_safetensors_header, parse_safetensors_header_from_reader, AwqCompanions, AwqConfig,
     Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,

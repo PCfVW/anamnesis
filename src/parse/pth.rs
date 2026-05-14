@@ -22,11 +22,29 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::parse::utils::byteswap_inplace;
+
+/// Maximum declared size for a `.pth` archive's `data.pkl` entry that
+/// [`inspect_pth_from_reader`] will materialise.
+///
+/// Real `data.pkl` is typically <100 KiB even on torchvision-class 300 MB
+/// models; 100 MiB is roughly three orders of magnitude above realistic.
+/// The cap defends against an adversarial central directory that claims a
+/// multi-GiB pickle: we reject before allocating, so `Vec::with_capacity`
+/// cannot be coaxed into an OOM on attacker-controlled input.
+const MAX_PKL_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Maximum declared size for a `.pth` archive's `byteorder` entry.
+///
+/// The entry contains literally `"little"` or `"big"` (≤6 bytes). 64 B is
+/// generous head-room; anything beyond that signals a malformed or
+/// adversarial archive.
+const MAX_BYTEORDER_SIZE: u64 = 64;
 
 // ---------------------------------------------------------------------------
 // PthDtype
@@ -355,29 +373,7 @@ impl ParsedPth {
     /// No I/O — purely computed from the tensor metadata extracted during
     /// [`parse_pth`].
     pub fn inspect(&self) -> PthInspectInfo {
-        let mut total_bytes: u64 = 0;
-        let mut dtypes: Vec<PthDtype> = Vec::new();
-        for m in &self.meta {
-            // CAST: usize → u64, element counts and byte sizes fit in u64
-            #[allow(clippy::as_conversions)]
-            let n_elements: u64 = m
-                .shape
-                .iter()
-                .copied()
-                .fold(1u64, |acc, d| acc.saturating_mul(d as u64));
-            #[allow(clippy::as_conversions)]
-            let byte_size = m.dtype.byte_size() as u64;
-            total_bytes = total_bytes.saturating_add(n_elements.saturating_mul(byte_size));
-            if !dtypes.contains(&m.dtype) {
-                dtypes.push(m.dtype);
-            }
-        }
-        PthInspectInfo {
-            tensor_count: self.meta.len(),
-            total_bytes,
-            dtypes,
-            big_endian: self.big_endian,
-        }
+        build_pth_inspect_info(&self.meta, self.big_endian)
     }
 
     /// Converts the parsed `.pth` tensors to a safetensors file.
@@ -1722,7 +1718,8 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
         None => false, // default: little-endian
     };
 
-    // 3. Read and execute the pickle stream.
+    // 3. Read and execute the pickle stream, then extract tensor metadata.
+    //    Data is NOT copied here — `tensors()` will borrow from the mmap.
     let &(pkl_start, pkl_len) =
         entry_index
             .get("data.pkl")
@@ -1734,11 +1731,41 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: "data.pkl slice out of bounds".into(),
             })?;
+    let meta = interpret_pickle_to_meta(pkl_data)?;
+
+    Ok(ParsedPth {
+        mmap: raw,
+        meta,
+        entry_index,
+        big_endian,
+    })
+}
+
+/// Runs the pickle VM on `pkl_data` and extracts the per-tensor metadata
+/// records (name, shape, dtype, storage key, storage offset, strides) that
+/// both [`parse_pth`] and [`inspect_pth_from_reader`] need.
+///
+/// Sharing this step by construction keeps the security boundary identical
+/// across the two entry points: every callable that reaches [`PickleVm`]
+/// goes through the same [`is_allowed_global`] allowlist regardless of the
+/// substrate the bytes came from. Any future tightening of the pickle
+/// interpreter automatically applies to both paths.
+///
+/// `pkl_data` is borrowed; the returned [`TensorMeta`] records own their
+/// strings and shape vectors so they outlive the input buffer (the
+/// reader-generic entry point hands us an owned `Vec<u8>` that goes out of
+/// scope before we return).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] for any malformed opcode, stack
+/// underflow, disallowed `GLOBAL`, or invalid `_rebuild_tensor_v2` argument
+/// shape — same error surface as the pickle VM and tensor-reference
+/// extractors return on their own.
+fn interpret_pickle_to_meta(pkl_data: &[u8]) -> crate::Result<Vec<TensorMeta>> {
     let mut vm = PickleVm::new(pkl_data);
     let root = vm.execute()?;
 
-    // 4. Extract tensor metadata from the pickle structure.
-    //    Data is NOT copied here — tensors() will borrow from the mmap.
     let dict_pairs = extract_dict_pairs(&root, 0)?;
     let mut meta = Vec::new();
     for (key, value) in dict_pairs {
@@ -1755,13 +1782,350 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
             });
         }
     }
+    Ok(meta)
+}
 
-    Ok(ParsedPth {
-        mmap: raw,
-        meta,
-        entry_index,
+/// Builds a [`PthInspectInfo`] from the parsed per-tensor metadata.
+///
+/// Shared by [`ParsedPth::inspect`] (mmap-backed path) and
+/// [`inspect_pth_from_reader`] (reader-generic path) so the two entry
+/// points are guaranteed substrate-equivalent — every field of the
+/// resulting `PthInspectInfo` is computed by the same code regardless of
+/// which entry point produced the underlying [`TensorMeta`] records.
+fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectInfo {
+    let mut total_bytes: u64 = 0;
+    let mut dtypes: Vec<PthDtype> = Vec::new();
+    for m in meta {
+        // CAST: usize → u64, element counts and byte sizes fit in u64
+        #[allow(clippy::as_conversions)]
+        let n_elements: u64 = m
+            .shape
+            .iter()
+            .copied()
+            .fold(1u64, |acc, d| acc.saturating_mul(d as u64));
+        // CAST: usize → u64, byte size of a single element is ≤ 8 → fits
+        #[allow(clippy::as_conversions)]
+        let byte_size = m.dtype.byte_size() as u64;
+        total_bytes = total_bytes.saturating_add(n_elements.saturating_mul(byte_size));
+        if !dtypes.contains(&m.dtype) {
+            dtypes.push(m.dtype);
+        }
+    }
+    PthInspectInfo {
+        tensor_count: meta.len(),
+        total_bytes,
+        dtypes,
         big_endian,
-    })
+    }
+}
+
+/// Inspects a `PyTorch` `.pth` archive from any `Read + Seek` source,
+/// returning tensor-count / total-bytes / dtype / byte-order summary without
+/// materialising any of the tensor-data files inside the archive.
+///
+/// This is the reader-generic core of `.pth` inspection: callers supply any
+/// positional substrate (in-memory [`std::io::Cursor`], an `HTTP`-range-
+/// backed adapter, a custom transport, …) and receive the same
+/// [`PthInspectInfo`] as [`ParsedPth::inspect`]. The path-based [`parse_pth`]
+/// remains the right entry point for callers that need the full
+/// [`ParsedPth`] (with zero-copy tensor data via `memmap2::Mmap`);
+/// `inspect_pth_from_reader` exists for the inspect-only case where
+/// materialising the tensor-data files is wasteful — typically the use case
+/// is browsing a remote shard before deciding whether to download it.
+///
+/// # Range-read access pattern
+///
+/// `.pth` is a ZIP archive: a sequence of local-file headers followed by a
+/// central directory at the end of the file. The bytes
+/// `inspect_pth_from_reader` actually touches on the substrate are:
+///
+/// 1. **`seek(SeekFrom::End(0))` once** to discover the total content
+///    length and the EOCD scan window. An `HTTP`-range adapter that already
+///    knows the `Content-Length` of the artefact answers this without a
+///    fetch.
+/// 2. **A short read of the local-file header magic at offset 0** —
+///    4 bytes, used to separate *"legacy pre-1.6 raw pickle"* from
+///    *"not a valid ZIP"* before handing the reader to `zip::ZipArchive`.
+/// 3. **The end-of-central-directory (EOCD) scan** that
+///    `zip::ZipArchive::new` performs — up to ~64 KiB read near the end of
+///    the file.
+/// 4. **The central directory** — typically a few KiB, also near the end of
+///    the file.
+/// 5. **One bulk read of `data.pkl`** — `archive.by_name("…/data.pkl")`
+///    seeks to the local-file header, reads ~30 B of header, then reads the
+///    entry data (typically <100 KiB even on torchvision-class 300 MB
+///    models).
+/// 6. **Optional one bulk read of `byteorder`** — usually 6 bytes
+///    (`"little"`), 3 bytes (`"big"`), or absent.
+///
+/// The tensor-data files (`data/0`, `data/1`, …) inside the archive are
+/// **never touched**. Total transfer for an `HTTP`-range adapter inspecting
+/// a 300 MB torchvision `.pth`: well under 100 KiB instead of 300 MB.
+///
+/// Why `Read + Seek` (and not just `Read`): the ZIP format reads the central
+/// directory at the end of the file, then seeks back to each local-file
+/// header to read entry payloads. `zip::ZipArchive::new` already requires
+/// `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits
+/// the constraint verbatim.
+///
+/// Anamnesis itself does not ship an `HTTP` transport; the network layer
+/// belongs in downstream crates (e.g., `hf-fm`'s `HttpRangeReader`
+/// adapter). This function defines the I/O contract such an adapter must
+/// satisfy.
+///
+/// # Why metadata-only (no `parse_pth_from_reader`)
+///
+/// The local-file [`parse_pth(path)`](parse_pth) returns a [`ParsedPth`]
+/// with `Cow::Borrowed` zero-copy slices into the underlying mmap. A
+/// reader-based equivalent that preserved that contract would need the
+/// reader to outlive every borrowed slice — workable for some
+/// `Read + Seek` substrates but awkward for `HTTP`-range adapters where
+/// each tensor read is a fresh fetch. Constraining the reader-based entry
+/// point to **inspect-only** sidesteps that lifetime complexity for the
+/// v0.11 use case (browsing tensor metadata before downloading) while
+/// leaving room for a future `parse_pth_from_reader` if a streaming-data
+/// use case develops.
+///
+/// # Performance
+///
+/// Unlike the GGUF reader-generic path, this function does **not** wrap the
+/// caller-supplied reader in [`std::io::BufReader`]. The asymmetry is
+/// deliberate: GGUF's parser issues many small `read_exact` calls (4–8 B
+/// per typed primitive) which collapse one syscall per primitive on a raw
+/// [`std::fs::File`] substrate; `inspect_pth_from_reader` only ever issues
+/// bulk reads (the ZIP central-directory scan inside `zip::ZipArchive`
+/// followed by one `read_to_end` per named entry). Adding a `BufReader`
+/// would only insert one extra memcpy per buffer-fill without saving any
+/// syscalls. `HTTP`-range adapters that prefetch the EOCD + central
+/// directory + `data.pkl` regions on first access amortise away every
+/// round trip.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
+/// reader fails, or if the underlying [`zip`] crate fails to parse the
+/// archive structure.
+///
+/// Returns [`AnamnesisError::Parse`] if the file is shorter than 4 bytes,
+/// the local-file header magic is not `PK\x03\x04`, the `data.pkl` entry
+/// is missing, the `data.pkl` declared size exceeds the
+/// 100 MiB cap (defensive against adversarial central directories), the
+/// `byteorder` entry declared size exceeds its 64 B cap, the `byteorder`
+/// bytes are not UTF-8 or not `"little"`/`"big"`, the pickle VM rejects
+/// the opcode stream, or any `_rebuild_tensor_v2` call has malformed
+/// arguments.
+///
+/// Returns [`AnamnesisError::Unsupported`] for legacy (pre-`PyTorch` 1.6)
+/// `.pth` files that begin with a raw pickle byte (`0x80` followed by a
+/// protocol byte ≤ `0x05`) rather than the ZIP magic.
+///
+/// # Source context
+///
+/// Errors describe the **format-level problem**, not the source identity.
+/// The function is reader-agnostic — the source could be a file, an
+/// in-memory `Cursor`, or an `HTTP`-range adapter. Callers that have a
+/// source name (filename, URL, etc.) should wrap the returned error with
+/// that context. This matches anamnesis's existing convention
+/// (`parse_safetensors_header_from_reader`, `inspect_npz_from_reader`, and
+/// `inspect_gguf_from_reader` all return source-agnostic errors).
+///
+/// # Memory
+///
+/// Allocates only metadata structures: the materialised `data.pkl` bytes
+/// (typically <100 KiB; capped at 100 MiB before allocation), the
+/// pickle-VM stack and memo table (O(`n_tensors`)), and the per-tensor
+/// `Vec<TensorMeta>` (O(`n_tensors`)). The materialised `data.pkl` buffer
+/// is dropped before the function returns. No tensor-data files inside the
+/// archive are read or allocated for. Peak heap is `O(pkl_size + n_tensors)`,
+/// independent of the file's total size — a torchvision 300 MB `.pth`
+/// inspects with ~150 KiB peak heap.
+pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthInspectInfo> {
+    let (big_endian, pkl_bytes) = read_pth_archive_for_inspect(reader)?;
+    let meta = interpret_pickle_to_meta(&pkl_bytes)?;
+    Ok(build_pth_inspect_info(&meta, big_endian))
+}
+
+/// I/O step of [`inspect_pth_from_reader`]: separates legacy-format
+/// detection, ZIP-archive open, byte-order resolution, and `data.pkl`
+/// materialisation from the format-agnostic pickle interpretation.
+///
+/// Returns `(big_endian, pkl_bytes)`. Splitting the I/O step keeps
+/// [`inspect_pth_from_reader`] readable as three short calls (read bytes,
+/// interpret, summarise).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if reading or seeking fails, or if the
+/// `zip` crate cannot open the archive.
+///
+/// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::Unsupported`]
+/// under the same conditions documented on [`inspect_pth_from_reader`].
+fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<(bool, Vec<u8>)> {
+    // Probe the local-file header magic to keep the *"legacy pre-1.6 raw
+    // pickle"* diagnostic distinct from the generic *"not a ZIP"* diagnostic
+    // — same precedent as the mmap-backed `parse_pth`. We rewind after the
+    // probe so `zip::ZipArchive::new` sees the archive from offset 0.
+    let total_len = reader.seek(SeekFrom::End(0)).map_err(AnamnesisError::Io)?;
+    if total_len < 4 {
+        return Err(AnamnesisError::Parse {
+            reason: "file too small to be a .pth archive".into(),
+        });
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(AnamnesisError::Io)?;
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).map_err(AnamnesisError::Io)?;
+    if magic[0] == 0x80 && magic[1] <= 0x05 {
+        return Err(AnamnesisError::Unsupported {
+            format: "pth".into(),
+            detail: "legacy .pth format (pre-PyTorch 1.6) is not supported; \
+                     re-save with torch.save()"
+                .into(),
+        });
+    }
+    if magic != *b"PK\x03\x04" {
+        return Err(AnamnesisError::Parse {
+            reason: "file is not a ZIP archive (missing PK\\x03\\x04 magic)".into(),
+        });
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(AnamnesisError::Io)?;
+
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| AnamnesisError::Parse {
+        reason: format!("failed to open ZIP archive: {e}"),
+    })?;
+
+    // Walk the central directory once to locate `data.pkl` and (optional)
+    // `byteorder` by suffix — same suffix-stripping convention as
+    // `build_entry_index` so we accept both newer-style `archive/data.pkl`
+    // and older-style `{model_name}/data.pkl` archives.
+    let (pkl_name, pkl_size, byteorder_name, byteorder_size) =
+        locate_inspect_entries(&mut archive)?;
+
+    if pkl_size > MAX_PKL_SIZE {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "ZIP entry `{pkl_name}`: declared size {pkl_size} bytes exceeds \
+                 the {MAX_PKL_SIZE}-byte inspect cap"
+            ),
+        });
+    }
+
+    let big_endian = match byteorder_name {
+        Some(name) => {
+            // `byteorder_size` was matched in `locate_inspect_entries`; if
+            // we got `Some(name)` we also got `Some(size)` in the same
+            // tuple slot — see the helper's return shape.
+            let size = byteorder_size.unwrap_or(0);
+            if size > MAX_BYTEORDER_SIZE {
+                return Err(AnamnesisError::Parse {
+                    reason: format!(
+                        "ZIP entry `{name}`: declared size {size} bytes exceeds \
+                         the {MAX_BYTEORDER_SIZE}-byte byteorder cap"
+                    ),
+                });
+            }
+            let mut entry = archive.by_name(&name).map_err(|e| AnamnesisError::Parse {
+                reason: format!("failed to open ZIP entry `{name}`: {e}"),
+            })?;
+            let cap = usize::try_from(size).map_err(|_| AnamnesisError::Parse {
+                reason: format!("ZIP entry `{name}`: declared size overflows usize"),
+            })?;
+            let mut buf = Vec::with_capacity(cap);
+            entry.read_to_end(&mut buf).map_err(AnamnesisError::Io)?;
+            let text = std::str::from_utf8(&buf).map_err(|e| AnamnesisError::Parse {
+                reason: format!("byteorder entry is not UTF-8: {e}"),
+            })?;
+            match text.trim() {
+                "little" => false,
+                "big" => true,
+                other => {
+                    return Err(AnamnesisError::Parse {
+                        reason: format!(
+                            "unknown byte order `{other}` (expected `little` or `big`)"
+                        ),
+                    });
+                }
+            }
+        }
+        None => false, // default: little-endian
+    };
+
+    let cap = usize::try_from(pkl_size).map_err(|_| AnamnesisError::Parse {
+        reason: format!("ZIP entry `{pkl_name}`: declared size overflows usize"),
+    })?;
+    let mut entry = archive
+        .by_name(&pkl_name)
+        .map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to open ZIP entry `{pkl_name}`: {e}"),
+        })?;
+    let mut pkl_bytes = Vec::with_capacity(cap);
+    entry
+        .read_to_end(&mut pkl_bytes)
+        .map_err(AnamnesisError::Io)?;
+
+    Ok((big_endian, pkl_bytes))
+}
+
+/// Locates the `data.pkl` and optional `byteorder` entries in a `.pth`
+/// archive, returning `(pkl_full_name, pkl_size, byteorder_full_name,
+/// byteorder_size)`.
+///
+/// The archive's prefix (e.g., `archive/` on `PyTorch ≥ 1.6` or
+/// `{model_name}/` on older saves) is preserved in the returned names so
+/// the caller can pass them to `archive.by_name(...)` verbatim. The
+/// `byteorder` slot is `(None, None)` when the entry is absent.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if a `data.pkl` entry is not present
+/// in the archive, or if reading any central-directory entry fails.
+fn locate_inspect_entries<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> crate::Result<(String, u64, Option<String>, Option<u64>)> {
+    let mut pkl: Option<(String, u64)> = None;
+    let mut byteorder: Option<(String, u64)> = None;
+
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to read ZIP entry {i}: {e}"),
+        })?;
+        // BORROW: owned copy — entry name borrows from `ZipArchive`, but
+        // the candidate names must outlive the entry borrow so the caller
+        // can re-open the entry by name.
+        let full_name = entry.name().to_owned();
+        let size = entry.size();
+
+        // Strip the archive prefix to get the suffix; same logic as
+        // `build_entry_index`. `find('/')` returns `Some(idx)` for every
+        // realistic `.pth` archive (both `archive/data.pkl` and
+        // `{model_name}/data.pkl`); files without a prefix are treated
+        // verbatim.
+        let suffix = match full_name.find('/') {
+            Some(pos) => match full_name.get(pos + 1..) {
+                Some(s) => s,
+                None => full_name.as_str(),
+            },
+            None => full_name.as_str(),
+        };
+
+        if suffix == "data.pkl" && pkl.is_none() {
+            pkl = Some((full_name.clone(), size));
+        } else if suffix == "byteorder" && byteorder.is_none() {
+            byteorder = Some((full_name.clone(), size));
+        }
+    }
+
+    let (pkl_name, pkl_size) = pkl.ok_or_else(|| AnamnesisError::Parse {
+        reason: "ZIP entry `data.pkl` not found".into(),
+    })?;
+    let (byteorder_name, byteorder_size) = match byteorder {
+        Some((n, s)) => (Some(n), Some(s)),
+        None => (None, None),
+    };
+    Ok((pkl_name, pkl_size, byteorder_name, byteorder_size))
 }
 
 /// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`.
@@ -2732,6 +3096,197 @@ mod tests {
                 .to_string()
                 .contains("nesting limit exceeded"),
             "expected nesting limit error"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Reader-generic API — substrate-equivalence tests (Phase 4.10)
+    // -----------------------------------------------------------------
+
+    /// Asserts every field of two `PthInspectInfo` values is equal.
+    /// Substrate equivalence means the path-based and reader-generic entry
+    /// points must be indistinguishable in their output.
+    fn assert_pth_inspect_eq(path_info: &PthInspectInfo, reader_info: &PthInspectInfo) {
+        assert_eq!(path_info.tensor_count, reader_info.tensor_count);
+        assert_eq!(path_info.total_bytes, reader_info.total_bytes);
+        assert_eq!(path_info.dtypes, reader_info.dtypes);
+        assert_eq!(path_info.big_endian, reader_info.big_endian);
+    }
+
+    /// Builds a minimal synthetic `.pth` ZIP archive whose `data.pkl` is a
+    /// valid empty pickle (`PROTO 2`, `EMPTY_DICT`, `STOP`). Returns the
+    /// archive bytes. Used to exercise the reader-generic path without
+    /// depending on external fixtures.
+    fn build_minimal_empty_pth() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            // INDEX: `&mut buf` is a writable byte sink; `zip::ZipWriter`
+            // requires `Write + Seek`, and `std::io::Cursor<&mut Vec<u8>>`
+            // satisfies both.
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            // PROTO 2, EMPTY_DICT, STOP — valid empty `state_dict`.
+            zip.write_all(b"\x80\x02}.").unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// `inspect_pth_from_reader` over an in-memory `Cursor` returns the
+    /// same `PthInspectInfo` as `parse_pth(path).inspect()` over the same
+    /// archive on disk. Locks the contract that the reader-generic and
+    /// path-based APIs are substrate-equivalent — the substrate (file vs.
+    /// cursor) cannot change the metadata. This is what downstream
+    /// `HTTP`-range adapters rely on.
+    #[test]
+    fn inspect_from_reader_matches_path_empty_dict() {
+        let bytes = build_minimal_empty_pth();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+
+        let path_info = parse_pth(tmp.path()).unwrap().inspect();
+        let reader_info = inspect_pth_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_pth_inspect_eq(&path_info, &reader_info);
+
+        // Spot-check the absolute values so we're not just comparing two
+        // equal-but-wrong outputs.
+        assert_eq!(reader_info.tensor_count, 0);
+        assert_eq!(reader_info.total_bytes, 0);
+        assert!(reader_info.dtypes.is_empty());
+        assert!(!reader_info.big_endian);
+    }
+
+    /// `inspect_pth_from_reader` honours the `byteorder` archive entry
+    /// when present — the value is propagated into `PthInspectInfo`
+    /// identically to the path-based parser.
+    #[test]
+    fn inspect_from_reader_honours_byteorder_entry() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap();
+            zip.start_file("archive/byteorder", opts).unwrap();
+            zip.write_all(b"little").unwrap();
+            zip.finish().unwrap();
+        }
+        let info = inspect_pth_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        assert!(!info.big_endian);
+        assert_eq!(info.tensor_count, 0);
+    }
+
+    /// Legacy (pre-`PyTorch` 1.6) raw-pickle files must surface as
+    /// `AnamnesisError::Unsupported` rather than a generic parse error —
+    /// same diagnostic split as the path-based parser.
+    #[test]
+    fn inspect_from_reader_rejects_legacy_format() {
+        let data: &[u8] = &[0x80, 0x02, 0x00, 0x00, 0x00];
+        let err = inspect_pth_from_reader(std::io::Cursor::new(data)).unwrap_err();
+        match err {
+            AnamnesisError::Unsupported { format, detail } => {
+                assert_eq!(format, "pth");
+                assert!(detail.contains("legacy"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Non-ZIP, non-legacy bytes produce `AnamnesisError::Parse` — the
+    /// magic-byte check fires before `zip::ZipArchive::new` would.
+    #[test]
+    fn inspect_from_reader_rejects_wrong_magic() {
+        let data: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0x04];
+        let err = inspect_pth_from_reader(std::io::Cursor::new(data)).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+        assert!(err.to_string().contains("not a ZIP archive"));
+    }
+
+    /// A file shorter than the 4-byte magic is rejected with a clear
+    /// "too small" message rather than panicking on the magic read.
+    #[test]
+    fn inspect_from_reader_rejects_too_small_file() {
+        let data: &[u8] = &[0x50, 0x4B]; // Just `PK` — 2 bytes
+        let err = inspect_pth_from_reader(std::io::Cursor::new(data)).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+        assert!(err.to_string().contains("too small"));
+    }
+
+    /// A ZIP archive without a `data.pkl` entry surfaces the same
+    /// `data.pkl not found` diagnostic as the path-based parser.
+    #[test]
+    fn inspect_from_reader_rejects_missing_data_pkl() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/not_a_pkl.txt", opts).unwrap();
+            zip.write_all(b"hello").unwrap();
+            zip.finish().unwrap();
+        }
+        let err = inspect_pth_from_reader(std::io::Cursor::new(&buf)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data.pkl") && msg.contains("not found"),
+            "expected `data.pkl not found`, got: {msg}"
+        );
+    }
+
+    /// The reader-generic path strips the archive prefix the same way as
+    /// `build_entry_index`, so a `.pth` whose entries use a non-`archive/`
+    /// prefix (older `PyTorch` saves, e.g., `mymodel/data.pkl`) inspects
+    /// identically.
+    #[test]
+    fn inspect_from_reader_accepts_older_prefix() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // Older-style prefix: `{model_name}/data.pkl` instead of
+            // `archive/data.pkl`.
+            zip.start_file("mymodel/data.pkl", opts).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap();
+            zip.finish().unwrap();
+        }
+        let info = inspect_pth_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(info.tensor_count, 0);
+    }
+
+    /// A `byteorder` entry whose declared central-directory size exceeds
+    /// the 64-byte cap is rejected before `read_to_end` allocates — the
+    /// cap is a defensive boundary, not a post-read trim.
+    #[test]
+    fn inspect_from_reader_rejects_oversized_byteorder() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap();
+            // A `byteorder` of >64 bytes — the central directory will
+            // honestly report this size, so the cap fires.
+            zip.start_file("archive/byteorder", opts).unwrap();
+            // 80 ASCII zeros: way above the 64-byte ceiling.
+            zip.write_all(&[b'0'; 80]).unwrap();
+            zip.finish().unwrap();
+        }
+        let err = inspect_pth_from_reader(std::io::Cursor::new(&buf)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("byteorder") && (msg.contains("exceeds") || msg.contains("cap")),
+            "expected byteorder cap violation, got: {msg}"
         );
     }
 }

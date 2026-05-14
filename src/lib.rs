@@ -79,8 +79,14 @@
 //!   `GgufInspectInfo` summary, so a multi-GB quantised `GGUF`'s metadata
 //!   can be inspected in a few range fetches over the front-loaded header
 //!   without downloading the data section (requires `gguf` feature)
-//! - `parse_pth()` — parse a `PyTorch` `.pth` file into a `ParsedPth`
-//!   with zero-copy `tensors()` (requires `pth` feature)
+//! - `parse_pth()` / `inspect_pth_from_reader()` — `PyTorch` `.pth` parsing
+//!   / inspection. The path-based variant memory-maps the file and returns
+//!   a `ParsedPth` with zero-copy `tensors()`; the reader-generic variant
+//!   accepts any `Read + Seek` substrate and returns just the
+//!   `PthInspectInfo` summary, so a torchvision-class `.pth` is inspectable
+//!   in a single `<100 KiB` range fetch over the ZIP central directory and
+//!   `data.pkl` entry — no tensor-data files inside the archive are read
+//!   (requires `pth` feature)
 //! - `pth_to_safetensors()` — lossless `.pth` → `.safetensors` conversion
 //!   (requires `pth` feature)
 //!
@@ -119,7 +125,10 @@ pub use parse::{
     NpzTensorInfo,
 };
 #[cfg(feature = "pth")]
-pub use parse::{parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo};
+pub use parse::{
+    inspect_pth_from_reader, parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor,
+    PthTensorInfo,
+};
 pub use parse::{
     parse_safetensors_header, parse_safetensors_header_from_reader, AwqCompanions, AwqConfig,
     Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,
