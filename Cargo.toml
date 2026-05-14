@@ -37,7 +37,7 @@ indicatif = ["dep:indicatif"]
 clap = { version = "4", features = ["derive"], optional = true }
 float8 = "0.7"
 half = "2"
-indicatif = { version = "0.17", optional = true }
+indicatif = { version = "0.18", optional = true }
 # memmap2 is mandatory: used by the always-on safetensors `parse()` path
 # to avoid eagerly reading the full file into a `Vec<u8>` (`fs::read`).
 # See `docs/perf-experiments.md` entry on audit finding #2.
