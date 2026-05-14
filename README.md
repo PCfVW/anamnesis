@@ -203,6 +203,16 @@ Feature-gated behind `pth`. The path-based `parse_pth(path)` memory-maps the fil
 
 Only the ZIP central directory and the `data.pkl` entry — typically <100 KiB even on torchvision-class 300 MB models — are fetched. A 300 MB torchvision `.pth` is inspectable through an HTTP-range adapter in well under 100 KiB of network transfer, instead of 300 MB.
 
+Measured across the **full 6 960-file [AlgZoo](https://github.com/alignment-research-center/alg-zoo) corpus** (the `algzoo_weights/` set imported for `candle-mi` v0.1.9's `stoicheia` module; best-of-5 release-mode median per file, `target-cpu=native`, PyTorch 2.10.0+cu130):
+
+| Substrate                                    | Median per file | vs `torch.load` |
+|---|---:|---:|
+| `parse_pth(path).inspect()` (mmap)           | 124.0 µs |  **4.07x faster** |
+| `inspect_pth_from_reader(File)` (reader)     | 168.7 µs |  **2.99x faster** |
+| `torch.load(weights_only=True)` (PyTorch)    | 504.3 µs |        baseline   |
+
+PyTorch has no separate inspect-only primitive — `torch.load(weights_only=True)` is the closest comparable; it fully materialises every tensor before the caller can iterate the `state_dict` for summary stats, so the speedup is a **lower bound** that grows by orders of magnitude on larger models (the reader path stays bounded by `data.pkl` size while `torch.load` scales linearly in total tensor-data size). Per-family breakdown and the full method are in [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6.
+
 `Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
 
 ## Used by
