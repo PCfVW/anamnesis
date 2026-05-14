@@ -38,6 +38,8 @@
 //!
 //! # Quick Start
 //!
+//! Path-based dequantisation (FP8 → BF16):
+//!
 //! ```rust,no_run
 //! use anamnesis::{parse, TargetDtype};
 //!
@@ -47,6 +49,31 @@
 //!
 //! model.remember("model-bf16.safetensors", TargetDtype::BF16)?;
 //! # Ok::<(), anamnesis::AnamnesisError>(())
+//! ```
+//!
+//! Reader-generic inspection over any `Read + Seek` substrate (in-memory
+//! `Cursor`, `HTTP`-range-backed adapter, custom transport). The example
+//! below uses a `std::fs::File`; an `HTTP`-range adapter from a
+//! downstream crate (e.g. `hf-fm`'s `HttpRangeReader`) plugs in
+//! identically — anamnesis itself stays HTTP-free. Four reader-generic
+//! entry points cover the supported tensor formats:
+//!
+//! ```rust,no_run
+//! # #[cfg(all(feature = "npz", feature = "pth", feature = "gguf"))]
+//! # fn run() -> anamnesis::Result<()> {
+//! use anamnesis::{
+//!     inspect_gguf_from_reader, inspect_npz_from_reader,
+//!     inspect_pth_from_reader, parse_safetensors_header_from_reader,
+//! };
+//!
+//! let st_header = parse_safetensors_header_from_reader(
+//!     std::fs::File::open("shard.safetensors")?,
+//! )?;
+//! let npz_info = inspect_npz_from_reader(std::fs::File::open("weights.npz")?)?;
+//! let gguf_info = inspect_gguf_from_reader(std::fs::File::open("model.gguf")?)?;
+//! let pth_info = inspect_pth_from_reader(std::fs::File::open("model.pth")?)?;
+//! # let _ = (st_header, npz_info, gguf_info, pth_info);
+//! # Ok(()) }
 //! ```
 //!
 //! # Architecture
