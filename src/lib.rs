@@ -105,6 +105,11 @@
 // clippy lint suppression is a potential MSRV CI break.
 #![allow(unknown_lints)]
 
+/// Command-line interface implementation shared by the `anamnesis` and
+/// `amn` binaries. Feature-gated behind `cli`; pulls in [`clap`] only
+/// when enabled.
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod error;
 pub mod inspect;
 pub mod model;

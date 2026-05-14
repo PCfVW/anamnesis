@@ -43,12 +43,12 @@ thiserror = "2"
 
 [[bin]]
 name = "anamnesis"
-path = "src/bin/main.rs"
+path = "src/bin/anamnesis.rs"
 required-features = ["cli"]
 
 [[bin]]
 name = "amn"
-path = "src/bin/main.rs"
+path = "src/bin/amn.rs"
 required-features = ["cli"]
 
 [dev-dependencies]

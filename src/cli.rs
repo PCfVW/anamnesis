@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Command-line interface implementation, shared by the `anamnesis` and
+//! `amn` binaries.
+//!
+//! Feature-gated behind `cli`; pulls in `clap` for argument parsing.
+//! The two binary entry points (`src/bin/anamnesis.rs` and
+//! `src/bin/amn.rs`) are 5-line wrappers that each delegate to `run`,
+//! so the actual CLI code compiles exactly once and links into both
+//! binaries instead of being compiled twice as two separate crate
+//! roots (which is what the previous shared-`src/bin/main.rs` shape
+//! did, producing the Cargo *"file found to be present in multiple
+//! build targets"* warning on every invocation).
+
 use std::path::PathBuf;
-use std::process;
 
 use clap::{Parser, Subcommand};
 
-use anamnesis::{format_bytes, parse, InspectInfo, TargetDtype};
+use crate::{format_bytes, parse, InspectInfo, TargetDtype};
 
 /// Parse any format, recover any precision.
 #[derive(Parser)]
@@ -69,12 +80,8 @@ enum Format {
 /// enabled — when the binary is built with all three the helper has no
 /// callers and triggers `dead_code`.
 #[cfg(not(all(feature = "pth", feature = "npz", feature = "gguf")))]
-fn missing_feature_err(
-    format_name: &str,
-    kind: &str,
-    feature_flag: &str,
-) -> anamnesis::AnamnesisError {
-    anamnesis::AnamnesisError::Unsupported {
+fn missing_feature_err(format_name: &str, kind: &str, feature_flag: &str) -> crate::AnamnesisError {
+    crate::AnamnesisError::Unsupported {
         format: format_name.into(),
         detail: format!(
             "input is {kind} but the `{feature_flag}` Cargo feature is not enabled in this \
@@ -105,7 +112,7 @@ fn missing_feature_err(
 // the all-features clippy build clean without weakening detection
 // elsewhere.
 #[allow(clippy::unnecessary_wraps)]
-fn detect_format(path: &std::path::Path) -> anamnesis::Result<Format> {
+fn detect_format(path: &std::path::Path) -> crate::Result<Format> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -234,7 +241,18 @@ fn has_gguf_magic(path: &std::path::Path) -> bool {
 // Subcommand runners
 // ---------------------------------------------------------------------------
 
-fn run() -> anamnesis::Result<()> {
+/// Parses CLI arguments and dispatches to the appropriate subcommand
+/// runner.
+///
+/// Entry point shared by the `anamnesis` and `amn` binaries; both thin
+/// wrappers under `src/bin/` call this function and translate any
+/// returned error into a `process::exit(1)`.
+///
+/// # Errors
+///
+/// Propagates any [`crate::AnamnesisError`] returned by the underlying
+/// format parsers, dequantisation kernels, or output writers.
+pub fn run() -> crate::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -244,7 +262,7 @@ fn run() -> anamnesis::Result<()> {
     }
 }
 
-fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
+fn run_parse(path: &std::path::Path) -> crate::Result<()> {
     match detect_format(path)? {
         Format::Safetensors => run_parse_safetensors(path),
         #[cfg(feature = "pth")]
@@ -256,7 +274,7 @@ fn run_parse(path: &std::path::Path) -> anamnesis::Result<()> {
     }
 }
 
-fn run_parse_safetensors(path: &std::path::Path) -> anamnesis::Result<()> {
+fn run_parse_safetensors(path: &std::path::Path) -> crate::Result<()> {
     let model = parse(path)?;
     let info = InspectInfo::from(&model.header);
     let total = model.header.tensors.len();
@@ -310,8 +328,8 @@ fn run_parse_safetensors(path: &std::path::Path) -> anamnesis::Result<()> {
 }
 
 #[cfg(feature = "pth")]
-fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
-    let parsed = anamnesis::parse_pth(path)?;
+fn run_parse_pth(path: &std::path::Path) -> crate::Result<()> {
+    let parsed = crate::parse_pth(path)?;
     let info = parsed.inspect();
     // Use tensor_info() (metadata only) instead of tensors() — avoids
     // materializing tensor data just for the display path.
@@ -357,10 +375,10 @@ fn run_parse_pth(path: &std::path::Path) -> anamnesis::Result<()> {
 }
 
 #[cfg(feature = "npz")]
-fn run_parse_npz(path: &std::path::Path) -> anamnesis::Result<()> {
+fn run_parse_npz(path: &std::path::Path) -> crate::Result<()> {
     // Use inspect_npz (header-only) instead of parse_npz — avoids loading
     // all tensor data into memory for a display-only operation.
-    let info = anamnesis::inspect_npz(path)?;
+    let info = crate::inspect_npz(path)?;
 
     println!(
         "Parsed {} (NPZ archive)",
@@ -389,14 +407,14 @@ fn run_parse_npz(path: &std::path::Path) -> anamnesis::Result<()> {
 }
 
 #[cfg(feature = "npz")]
-fn run_inspect_npz(path: &std::path::Path) -> anamnesis::Result<()> {
+fn run_inspect_npz(path: &std::path::Path) -> crate::Result<()> {
     // Header-only — no tensor data loaded.
-    let info = anamnesis::inspect_npz(path)?;
+    let info = crate::inspect_npz(path)?;
     println!("{info}");
     Ok(())
 }
 
-fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
+fn run_inspect(path: &std::path::Path) -> crate::Result<()> {
     match detect_format(path)? {
         Format::Safetensors => {
             let model = parse(path)?;
@@ -405,7 +423,7 @@ fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
         }
         #[cfg(feature = "pth")]
         Format::Pth => {
-            let parsed = anamnesis::parse_pth(path)?;
+            let parsed = crate::parse_pth(path)?;
             let info = parsed.inspect();
             println!("{info}");
         }
@@ -413,7 +431,7 @@ fn run_inspect(path: &std::path::Path) -> anamnesis::Result<()> {
         Format::Npz => run_inspect_npz(path)?,
         #[cfg(feature = "gguf")]
         Format::Gguf => {
-            let parsed = anamnesis::parse_gguf(path)?;
+            let parsed = crate::parse_gguf(path)?;
             let info = parsed.inspect();
             println!("{info}");
         }
@@ -425,14 +443,14 @@ fn run_remember(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
-) -> anamnesis::Result<()> {
+) -> crate::Result<()> {
     match detect_format(path)? {
         Format::Safetensors => run_remember_safetensors(path, to, output),
         #[cfg(feature = "pth")]
         Format::Pth => {
             let to_lower = to.to_ascii_lowercase();
             if to_lower != "safetensors" && to_lower != "bf16" {
-                return Err(anamnesis::AnamnesisError::Unsupported {
+                return Err(crate::AnamnesisError::Unsupported {
                     format: "pth".into(),
                     detail: format!(
                         "unsupported --to value `{to}` for .pth files \
@@ -444,7 +462,7 @@ fn run_remember(
             run_remember_pth(path, output)
         }
         #[cfg(feature = "npz")]
-        Format::Npz => Err(anamnesis::AnamnesisError::Unsupported {
+        Format::Npz => Err(crate::AnamnesisError::Unsupported {
             format: "NPZ".into(),
             detail: "NPZ tensors are already full-precision; \
                      no dequantization or conversion needed"
@@ -454,7 +472,7 @@ fn run_remember(
         Format::Gguf => {
             let to_lower = to.to_ascii_lowercase();
             if to_lower != "safetensors" && to_lower != "bf16" {
-                return Err(anamnesis::AnamnesisError::Unsupported {
+                return Err(crate::AnamnesisError::Unsupported {
                     format: "GGUF".into(),
                     detail: format!(
                         "unsupported --to value `{to}` for .gguf files \
@@ -471,7 +489,7 @@ fn run_remember_safetensors(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
-) -> anamnesis::Result<()> {
+) -> crate::Result<()> {
     let target: TargetDtype = to.parse()?;
 
     let model = parse(path)?;
@@ -517,11 +535,8 @@ fn run_remember_safetensors(
 }
 
 #[cfg(feature = "pth")]
-fn run_remember_pth(
-    path: &std::path::Path,
-    output: Option<&std::path::Path>,
-) -> anamnesis::Result<()> {
-    let parsed = anamnesis::parse_pth(path)?;
+fn run_remember_pth(path: &std::path::Path, output: Option<&std::path::Path>) -> crate::Result<()> {
+    let parsed = crate::parse_pth(path)?;
     let info = parsed.inspect();
 
     let output_path = if let Some(p) = output {
@@ -555,8 +570,8 @@ fn run_remember_pth(
 }
 
 #[cfg(feature = "gguf")]
-fn run_parse_gguf(path: &std::path::Path) -> anamnesis::Result<()> {
-    let parsed = anamnesis::parse_gguf(path)?;
+fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
+    let parsed = crate::parse_gguf(path)?;
     let info = parsed.inspect();
     let tensor_info = parsed.tensor_info();
 
@@ -597,8 +612,8 @@ fn run_parse_gguf(path: &std::path::Path) -> anamnesis::Result<()> {
 fn run_remember_gguf(
     path: &std::path::Path,
     output: Option<&std::path::Path>,
-) -> anamnesis::Result<()> {
-    let parsed = anamnesis::parse_gguf(path)?;
+) -> crate::Result<()> {
+    let parsed = crate::parse_gguf(path)?;
     let info = parsed.inspect();
 
     let output_path = if let Some(p) = output {
@@ -640,14 +655,13 @@ fn run_remember_gguf(
                 .shape
                 .iter()
                 .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| anamnesis::AnamnesisError::Parse {
+                .ok_or_else(|| crate::AnamnesisError::Parse {
                     reason: format!(
                         "GGUF tensor `{}` shape {:?} element count overflows usize",
                         tensor.name, tensor.shape
                     ),
                 })?;
-            let bf16_data =
-                anamnesis::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
+            let bf16_data = crate::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
             tensor_data.push((
                 tensor.name.to_owned(),
                 bf16_data,
@@ -680,19 +694,19 @@ fn run_remember_gguf(
             .iter()
             .map(|(name, data, shape, dtype)| {
                 let view = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
-                    .map_err(|e| anamnesis::AnamnesisError::Parse {
+                    .map_err(|e| crate::AnamnesisError::Parse {
                         reason: format!("failed to create TensorView for `{name}`: {e}"),
                     })?;
                 Ok((name.clone(), view))
             })
-            .collect::<anamnesis::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?;
 
     safetensors::tensor::serialize_to_file(views, &None, output_path.as_ref()).map_err(
         // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
         #[allow(clippy::wildcard_enum_match_arm)]
         |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => anamnesis::AnamnesisError::Io(io_err),
-            other => anamnesis::AnamnesisError::Parse {
+            safetensors::SafeTensorError::IoError(io_err) => crate::AnamnesisError::Io(io_err),
+            other => crate::AnamnesisError::Parse {
                 reason: format!("failed to write safetensors file: {other}"),
             },
         },
@@ -702,25 +716,23 @@ fn run_remember_gguf(
     Ok(())
 }
 
-/// Maps a non-quantized [`GgufType`](anamnesis::GgufType) to the
-/// corresponding `safetensors::Dtype`.
+/// Maps a non-quantized [`GgufType`](crate::GgufType) to the corresponding
+/// `safetensors::Dtype`.
 #[cfg(feature = "gguf")]
-fn gguf_type_to_safetensors_dtype(
-    dtype: anamnesis::GgufType,
-) -> anamnesis::Result<safetensors::Dtype> {
+fn gguf_type_to_safetensors_dtype(dtype: crate::GgufType) -> crate::Result<safetensors::Dtype> {
     // EXHAUSTIVE: GgufType is a foreign #[non_exhaustive] enum — new
     // variants may be added. The wildcard covers future types.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
-        anamnesis::GgufType::F32 => Ok(safetensors::Dtype::F32),
-        anamnesis::GgufType::F16 => Ok(safetensors::Dtype::F16),
-        anamnesis::GgufType::BF16 => Ok(safetensors::Dtype::BF16),
-        anamnesis::GgufType::F64 => Ok(safetensors::Dtype::F64),
-        anamnesis::GgufType::I8 => Ok(safetensors::Dtype::I8),
-        anamnesis::GgufType::I16 => Ok(safetensors::Dtype::I16),
-        anamnesis::GgufType::I32 => Ok(safetensors::Dtype::I32),
-        anamnesis::GgufType::I64 => Ok(safetensors::Dtype::I64),
-        other => Err(anamnesis::AnamnesisError::Unsupported {
+        crate::GgufType::F32 => Ok(safetensors::Dtype::F32),
+        crate::GgufType::F16 => Ok(safetensors::Dtype::F16),
+        crate::GgufType::BF16 => Ok(safetensors::Dtype::BF16),
+        crate::GgufType::F64 => Ok(safetensors::Dtype::F64),
+        crate::GgufType::I8 => Ok(safetensors::Dtype::I8),
+        crate::GgufType::I16 => Ok(safetensors::Dtype::I16),
+        crate::GgufType::I32 => Ok(safetensors::Dtype::I32),
+        crate::GgufType::I64 => Ok(safetensors::Dtype::I64),
+        other => Err(crate::AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!("no safetensors equivalent for {other}"),
         }),
@@ -786,11 +798,4 @@ fn derive_output_path(input: &std::path::Path, target: TargetDtype) -> PathBuf {
     input
         .parent()
         .map_or_else(|| PathBuf::from(&new_name), |p| p.join(&new_name))
-}
-
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {e}");
-        process::exit(1);
-    }
 }

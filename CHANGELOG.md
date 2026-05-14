@@ -97,6 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6
   *Follow-up*.
 
+### Changed
+
+- **CLI entry-point layout.** The `anamnesis` and `amn` binaries no
+  longer share a single `src/bin/main.rs` (which produced a Cargo
+  *"file found to be present in multiple build targets"* warning on
+  every invocation because Cargo treats each `[[bin]]` as a separate
+  crate root). The CLI implementation now lives in
+  [`anamnesis::cli`](src/cli.rs) (feature-gated behind `cli`); each
+  binary is a 5-line wrapper that delegates to `anamnesis::cli::run()`.
+  No user-visible change: `cargo install anamnesis --features cli,...`
+  still installs both `anamnesis` and `amn` with identical behaviour.
+  Internal benefits: the warning is gone, the CLI code compiles once
+  (not twice), and link time is lower.
+
 ## [0.4.5] - 2026-05-04
 
 ### Added
