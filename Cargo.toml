@@ -9,11 +9,18 @@ repository = "https://github.com/PCfVW/anamnesis"
 homepage = "https://github.com/PCfVW/anamnesis"
 documentation = "https://docs.rs/anamnesis"
 keywords = ["safetensors", "dequantization", "pytorch", "gptq", "machine-learning"]
-
-[package.metadata.docs.rs]
-features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]
 categories = ["science", "parser-implementations"]
 default-run = "anamnesis"
+
+# `[package.metadata.docs.rs]` accepts only docs.rs-specific build keys
+# (features, targets, all-features, no-default-features). Other Cargo
+# package fields placed here are silently ignored — `categories` and
+# `default-run` previously sat here and never took effect, so the
+# published crate had no categories on crates.io and `cargo run` without
+# `--bin` errored. Both keys now sit in `[package]` where Cargo reads
+# them.
+[package.metadata.docs.rs]
+features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]
 
 [features]
 default = []
