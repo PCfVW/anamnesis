@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-architecture plain-`FP4` fixture (Qwen3)** — new
+  `tests/fixtures/bnb_reference/qwen3_mcqa_fp4.bin` extracted from
+  `ema1234/qwen_mcqa_bnb_fp4` (Qwen3 architecture, different HF org
+  from the existing `HF-Quantization/Llama-3.2-1B-BNB-FP4` Llama
+  fixture). Decode + encode cross-validation tests
+  (`cross_validate_qwen3_mcqa_fp4` and
+  `cross_validate_encode_qwen3_mcqa_fp4`) confirm the sign-of-zero
+  preservation rule (introduced for the Llama `FP4` fixture)
+  generalises beyond a single org's quantization pipeline — byte-exact
+  round-trip holds on Qwen3 too. Phase 5 step 1b deliverable per
+  `ROADMAP.md`.
 - **`lethe` namespace** (`src/lethe/`) — precision-compression (encoding)
   counterpart to `remember`. Phase 5 ships `BnB` encode plus a generic
   bit-exact round-trip validation harness; subsequent encode kernel

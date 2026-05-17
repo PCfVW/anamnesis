@@ -294,3 +294,16 @@ fn cross_validate_llama_1b_int8() {
     let data = include_bytes!("fixtures/bnb_reference/llama_1b_int8.bin");
     run_int8_cross_validation("Llama-3.2-1B INT8", data, 0);
 }
+
+#[test]
+fn cross_validate_qwen3_mcqa_fp4() {
+    // Step 1b — cross-architecture plain-FP4 decode validation.
+    // Same on-disk codebook structure as `llama_1b_fp4` (`+0.0` at both
+    // index 0 and index 8); decode exercises the sign-of-zero
+    // preservation rule on a different architecture (Qwen3) and HF org
+    // (`ema1234`). `compare_bf16` treats `±0` as IEEE-equivalent, so
+    // the sign-of-zero divergence from bitsandbytes' Python decode does
+    // not break bit-exactness.
+    let data = include_bytes!("fixtures/bnb_reference/qwen3_mcqa_fp4.bin");
+    run_bnb4_cross_validation("Qwen3 MCQA FP4", data, 0);
+}

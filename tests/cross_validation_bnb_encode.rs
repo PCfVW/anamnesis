@@ -433,6 +433,24 @@ fn cross_validate_encode_llama_1b_int8() {
     run_int8_encode_cross_validation("Llama-3.2-1B INT8", "llama_1b_int8.bin", data);
 }
 
+#[test]
+fn cross_validate_encode_qwen3_mcqa_fp4() {
+    // Step 1b — cross-architecture plain-FP4 fixture.
+    // Different architecture (Qwen3 vs Llama 3.2) and different HF org
+    // (`ema1234` vs `HF-Quantization`); same on-disk codebook structure
+    // (`+0.0` at both index 0 and index 8, the bitsandbytes Python
+    // collapse). Byte-exactness on this fixture confirms the
+    // sign-of-zero preservation rule introduced in Step 1a generalises
+    // beyond a single org's quantization pipeline.
+    let data = include_bytes!("fixtures/bnb_reference/qwen3_mcqa_fp4.bin");
+    run_bnb4_encode_cross_validation(
+        "Qwen3 MCQA FP4",
+        "qwen3_mcqa_fp4.bin",
+        data,
+        ByteContract::Required,
+    );
+}
+
 // Note: cross_validate_encode_llama_1b_nf4_double_quant is intentionally
 // omitted. Phase 5 step 1 ships only encode_bnb4 (single-quant) and
 // encode_bnb_int8; double-quant encode requires a fourth kernel

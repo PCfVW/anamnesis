@@ -249,6 +249,17 @@ MODELS = [
         "format": "int8",
         "layer_base": "model.layers.0.mlp.gate_proj",
     },
+    # Step 1b — cross-architecture plain-FP4 fixture (Qwen3).
+    # Proves the sign-of-zero preservation rule (introduced in Step 1a for
+    # the Llama FP4 fixture) generalises to a different architecture and
+    # a different HF org. Same on-disk layout as the Llama FP4 fixture:
+    # F32 absmax + F32 quant_map + U8 packed weight + U8 quant_state blob.
+    {
+        "name": "qwen3_mcqa_fp4",
+        "model_dir": HF_CACHE / "models--ema1234--qwen_mcqa_bnb_fp4",
+        "format": "bnb4",
+        "layer_base": "model.layers.0.mlp.gate_proj",
+    },
 ]
 
 
