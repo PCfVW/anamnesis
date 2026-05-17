@@ -307,3 +307,24 @@ fn cross_validate_qwen3_mcqa_fp4() {
     let data = include_bytes!("fixtures/bnb_reference/qwen3_mcqa_fp4.bin");
     run_bnb4_cross_validation("Qwen3 MCQA FP4", data, 0);
 }
+
+#[test]
+fn cross_validate_qwen2_5_1_5b_nf4_dq() {
+    // Step 1c — cross-architecture NF4 double-quant decode validation.
+    // Qwen2.5 architecture from the unsloth org. Surfaced by
+    // `hf-fm inspect` during candidate selection: every non-Llama
+    // BnB-NF4 model checked uses double-quant (the bitsandbytes
+    // default). This fixture extends decode coverage to a second
+    // architecture under the DQ layout.
+    let data = include_bytes!("fixtures/bnb_reference/qwen2_5_1_5b_nf4_dq.bin");
+    run_bnb4_cross_validation("Qwen2.5-1.5B NF4 double-quant", data, 0);
+}
+
+#[test]
+fn cross_validate_phi3_5_mini_nf4_dq() {
+    // Step 1c — cross-architecture NF4 double-quant decode validation.
+    // Phi-3.5 architecture from the unsloth org. Third architecture
+    // family (after Llama and Qwen) validating the NF4 DQ decode path.
+    let data = include_bytes!("fixtures/bnb_reference/phi3_5_mini_nf4_dq.bin");
+    run_bnb4_cross_validation("Phi-3.5-mini NF4 double-quant", data, 0);
+}

@@ -19,6 +19,6 @@ pub mod round_trip;
 
 #[cfg(feature = "bnb")]
 pub use bnb::{
-    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb_int8, encode_bnb_int8_compute_scb,
-    FP4_CODEBOOK, NF4_CODEBOOK,
+    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb4_double_quant, encode_bnb_int8,
+    encode_bnb_int8_compute_scb, FP4_CODEBOOK, NF4_CODEBOOK,
 };

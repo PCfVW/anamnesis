@@ -52,8 +52,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anamnesis::remember::bnb::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
-use anamnesis::{encode_bnb4, encode_bnb_int8};
+use anamnesis::remember::bnb::{
+    dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16,
+};
+use anamnesis::{encode_bnb4, encode_bnb4_double_quant, encode_bnb_int8};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing (mirrors tests/cross_validation_bnb.rs)
@@ -71,6 +73,11 @@ struct Bnb4Fixture {
     weight_data: Vec<u8>,
     absmax_data: Vec<u8>,
     quant_map_data: Vec<u8>,
+    /// Empty for `format_id == 0` (plain `NF4`/`FP4`); populated for
+    /// `format_id == 2` (double-quant).
+    nested_absmax_data: Vec<u8>,
+    /// Empty for plain; 1024 bytes (256 x F32) for double-quant.
+    nested_quant_map_data: Vec<u8>,
 }
 
 struct BnbInt8Fixture {
@@ -87,8 +94,8 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
     let weight_len = read_u32_le(data, 12) as usize;
     let absmax_len = read_u32_le(data, 16) as usize;
     let quant_map_len = read_u32_le(data, 20) as usize;
-    let _nested_absmax_len = read_u32_le(data, 24) as usize;
-    let _nested_quant_map_len = read_u32_le(data, 28) as usize;
+    let nested_absmax_len = read_u32_le(data, 24) as usize;
+    let nested_quant_map_len = read_u32_le(data, 28) as usize;
     let _expected_len = read_u32_le(data, 32) as usize;
 
     let header_size = 36;
@@ -99,6 +106,10 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
     let absmax_data = data[offset..offset + absmax_len].to_vec();
     offset += absmax_len;
     let quant_map_data = data[offset..offset + quant_map_len].to_vec();
+    offset += quant_map_len;
+    let nested_absmax_data = data[offset..offset + nested_absmax_len].to_vec();
+    offset += nested_absmax_len;
+    let nested_quant_map_data = data[offset..offset + nested_quant_map_len].to_vec();
 
     Bnb4Fixture {
         format_id,
@@ -107,6 +118,8 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
         weight_data,
         absmax_data,
         quant_map_data,
+        nested_absmax_data,
+        nested_quant_map_data,
     }
 }
 
@@ -400,6 +413,97 @@ fn run_int8_encode_cross_validation(fixture_name: &str, fixture_filename: &str, 
     print_runtime_summary(fixture_name, anamnesis_us, sidecar);
 }
 
+fn run_bnb4_double_quant_encode_cross_validation(
+    fixture_name: &str,
+    fixture_filename: &str,
+    data: &[u8],
+) {
+    let fixture = parse_bnb4_fixture(data);
+    assert_eq!(
+        fixture.format_id, 2,
+        "this runner only handles NF4/FP4 double-quant (format_id=2); \
+         got format_id={} for {fixture_name}",
+        fixture.format_id,
+    );
+
+    // Infer nested_block_size from absmax / nested_absmax sizes, matching
+    // the convention used by tests/cross_validation_bnb.rs decode runner.
+    let absmax_count = fixture.absmax_data.len();
+    let nested_absmax_count = fixture.nested_absmax_data.len() / 4;
+    let nested_block_size = if nested_absmax_count > 0 {
+        absmax_count.div_ceil(nested_absmax_count)
+    } else {
+        256
+    };
+
+    eprintln!(
+        "{fixture_name}: NF4 double-quant encode, block_size={}, nested_block_size={}, \
+         {} elements",
+        fixture.block_size, nested_block_size, fixture.total_elements,
+    );
+
+    // Decode (validated in cross_validation_bnb.rs) to obtain the BF16
+    // intermediate.
+    let bf16_from_pytorch_bytes = dequantize_bnb4_double_quant_to_bf16(
+        &fixture.weight_data,
+        &fixture.absmax_data,
+        &fixture.quant_map_data,
+        &fixture.nested_absmax_data,
+        &fixture.nested_quant_map_data,
+        fixture.total_elements,
+        fixture.block_size,
+        nested_block_size,
+    )
+    .expect("BnB4 double-quant decode failed during encode cross-validation");
+
+    let start = Instant::now();
+    let re_encoded = encode_bnb4_double_quant(
+        &bf16_from_pytorch_bytes,
+        &fixture.absmax_data,
+        &fixture.quant_map_data,
+        &fixture.nested_absmax_data,
+        &fixture.nested_quant_map_data,
+        fixture.total_elements,
+        fixture.block_size,
+        nested_block_size,
+    )
+    .expect("BnB4 double-quant encode failed");
+    let elapsed = start.elapsed();
+    let anamnesis_us = elapsed.as_secs_f64() * 1e6;
+
+    // Decode-equivalence: must hold unconditionally.
+    let bf16_from_re_encoded = dequantize_bnb4_double_quant_to_bf16(
+        &re_encoded,
+        &fixture.absmax_data,
+        &fixture.quant_map_data,
+        &fixture.nested_absmax_data,
+        &fixture.nested_quant_map_data,
+        fixture.total_elements,
+        fixture.block_size,
+        nested_block_size,
+    )
+    .expect("BnB4 double-quant decode of re-encoded bytes failed");
+    assert_bf16_equal(
+        &bf16_from_re_encoded,
+        &bf16_from_pytorch_bytes,
+        fixture_name,
+    );
+
+    // Byte-exactness: every BnB4-DQ fixture inherits the same effectively-
+    // injective codebook treatment as plain NF4 (recovered f32 absmax
+    // values are pairwise-distinct in practice), plus the sign-of-zero
+    // rule for any +0/+0 codebook collisions on FP4. Byte-exact is the
+    // operative contract.
+    assert_bytes_equal(&re_encoded, &fixture.weight_data, fixture_name);
+    eprintln!(
+        "  {fixture_name}: byte-exact vs PyTorch encoding (0 diffs / {} bytes)",
+        fixture.weight_data.len(),
+    );
+
+    let sidecar = read_pytorch_quantize_us(&sidecar_path_for(fixture_filename));
+    print_runtime_summary(fixture_name, anamnesis_us, sidecar);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -431,6 +535,54 @@ fn cross_validate_encode_llama_1b_fp4() {
 fn cross_validate_encode_llama_1b_int8() {
     let data = include_bytes!("fixtures/bnb_reference/llama_1b_int8.bin");
     run_int8_encode_cross_validation("Llama-3.2-1B INT8", "llama_1b_int8.bin", data);
+}
+
+#[test]
+fn cross_validate_encode_llama_1b_nf4_double_quant() {
+    // Step 1c — `encode_bnb4_double_quant` against the existing Llama DQ
+    // fixture (no new download). This is the proof-of-correctness test
+    // for the new kernel: the fixture's `weight_data` was produced by
+    // bitsandbytes' Python quantize, decoded by our existing
+    // `dequantize_bnb4_double_quant_to_bf16` (validated in
+    // `cross_validation_bnb.rs`), then re-encoded by the new
+    // `encode_bnb4_double_quant`. Byte equality with the original
+    // `weight_data` confirms the recovered-absmax path matches the
+    // decode side and the inner nibble-encode is byte-for-byte
+    // inversive.
+    let data = include_bytes!("fixtures/bnb_reference/llama_1b_nf4_double_quant.bin");
+    run_bnb4_double_quant_encode_cross_validation(
+        "Llama-3.2-1B NF4 double-quant",
+        "llama_1b_nf4_double_quant.bin",
+        data,
+    );
+}
+
+#[test]
+fn cross_validate_encode_qwen2_5_1_5b_nf4_dq() {
+    // Step 1c — cross-architecture NF4 double-quant encode (Qwen2.5).
+    // First non-Llama architecture exercising `encode_bnb4_double_quant`
+    // end-to-end against PyTorch-quantised bytes. Validates that the
+    // double-quant encode path generalises beyond a single org's
+    // quantization pipeline.
+    let data = include_bytes!("fixtures/bnb_reference/qwen2_5_1_5b_nf4_dq.bin");
+    run_bnb4_double_quant_encode_cross_validation(
+        "Qwen2.5-1.5B NF4 double-quant",
+        "qwen2_5_1_5b_nf4_dq.bin",
+        data,
+    );
+}
+
+#[test]
+fn cross_validate_encode_phi3_5_mini_nf4_dq() {
+    // Step 1c — cross-architecture NF4 double-quant encode (Phi-3.5).
+    // Third architecture family (after Llama and Qwen2.5) validating
+    // the NF4 DQ encode path end-to-end.
+    let data = include_bytes!("fixtures/bnb_reference/phi3_5_mini_nf4_dq.bin");
+    run_bnb4_double_quant_encode_cross_validation(
+        "Phi-3.5-mini NF4 double-quant",
+        "phi3_5_mini_nf4_dq.bin",
+        data,
+    );
 }
 
 #[test]

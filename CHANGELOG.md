@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`encode_bnb4_double_quant`** — fourth `BnB` encode kernel, the
+  inverse of `dequantize_bnb4_double_quant_to_bf16`. Recovers the
+  per-block `f32` absmax from the `U8` quantised absmax + nested
+  codebook using the same formula the decoder applies, then re-encodes
+  `BF16` to packed nibbles via the same nearest-codebook search as
+  `encode_bnb4`. Signature strict-
+  mirrors the decode side: caller supplies `absmax_data` (`U8`),
+  `quant_map_data`, `nested_absmax_data`, `nested_quant_map_data`,
+  plus `block_size` and `nested_block_size`. Promoted from a deferred
+  Phase 5 polish item to a required Step 1c gate after `hf-fm inspect`
+  on candidate cross-architecture models surfaced that every non-Llama
+  `bnb-4bit` upload in the wild uses double-quant (the bitsandbytes
+  default). The strict mirror is the round-trip API; a future
+  `_compute_*` convenience that derives all metadata from a fresh
+  `BF16` source is needed by the Phase 6 "any input -> BnB-NF4
+  safetensors" conversion path and is deferred there.
+- **Two cross-architecture NF4 double-quant fixtures (Qwen2.5 + Phi-3.5)** —
+  new `tests/fixtures/bnb_reference/qwen2_5_1_5b_nf4_dq.bin` (from
+  `unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit`) and `phi3_5_mini_nf4_dq.bin`
+  (from `unsloth/Phi-3.5-mini-instruct-bnb-4bit`), plus PyTorch
+  quantize-timing sidecars. Decode + encode cross-validation tests
+  (`cross_validate_{qwen2_5_1_5b,phi3_5_mini}_nf4_dq` and
+  `cross_validate_encode_{qwen2_5_1_5b,phi3_5_mini}_nf4_dq`) confirm
+  the `encode_bnb4_double_quant` kernel works across three
+  architectures (Llama, Qwen2.5, Phi-3.5) at byte-exact round-trip
+  versus the original PyTorch `bitsandbytes` bytes.
 - **Cross-architecture plain-`FP4` fixture (Qwen3)** — new
   `tests/fixtures/bnb_reference/qwen3_mcqa_fp4.bin` extracted from
   `ema1234/qwen_mcqa_bnb_fp4` (Qwen3 architecture, different HF org
@@ -20,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generalises beyond a single org's quantization pipeline — byte-exact
   round-trip holds on Qwen3 too. Phase 5 step 1b deliverable per
   `ROADMAP.md`.
+- **PyTorch quantize-timing sidecars for double-quant fixtures** —
+  `generate_bnb.py` now also times a `bitsandbytes`-style
+  double-quant quantize pass (with pre-recovered absmax matching the
+  Rust `encode_bnb4_double_quant` signature) and writes the result
+  alongside the existing plain-quant sidecars. Rust tests print
+  side-by-side anamnesis-vs-PyTorch quantize timings for every fixture.
 - **`lethe` namespace** (`src/lethe/`) — precision-compression (encoding)
   counterpart to `remember`. Phase 5 ships `BnB` encode plus a generic
   bit-exact round-trip validation harness; subsequent encode kernel

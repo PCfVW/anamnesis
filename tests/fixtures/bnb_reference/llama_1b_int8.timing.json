@@ -1,5 +1,5 @@
 {
-  "pytorch_quantize_ns": 101000,
+  "pytorch_quantize_ns": 94300,
   "pytorch_quantize_iters": 5,
   "operation": "bitsandbytes-style quantize_int8"
 }

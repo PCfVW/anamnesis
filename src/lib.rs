@@ -189,8 +189,8 @@ pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 #[cfg(feature = "bnb")]
 pub use lethe::{
-    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb_int8, encode_bnb_int8_compute_scb,
-    FP4_CODEBOOK, NF4_CODEBOOK,
+    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb4_double_quant, encode_bnb_int8,
+    encode_bnb_int8_compute_scb, FP4_CODEBOOK, NF4_CODEBOOK,
 };
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "gguf")]

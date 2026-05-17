@@ -1,0 +1,5 @@
+{
+  "pytorch_quantize_ns": 293600,
+  "pytorch_quantize_iters": 5,
+  "operation": "bitsandbytes-style quantize_4bit_double_quant"
+}

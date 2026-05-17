@@ -160,17 +160,48 @@ def quantize_bnb4_pytorch(
     num_blocks = total // block_size
     blocks = flat.reshape(num_blocks, block_size)
     absmax = blocks.abs().max(dim=1).values  # [num_blocks]
-    # Normalise each element by its block absmax, then find nearest codebook entry.
+    return _quantize_bnb4_inner_pytorch(blocks, absmax, quant_map, block_size)
+
+
+def _quantize_bnb4_inner_pytorch(
+    blocks: torch.Tensor,        # [num_blocks, block_size], F32
+    absmax: torch.Tensor,        # [num_blocks], F32
+    quant_map: torch.Tensor,     # [16], F32
+    block_size: int,
+) -> torch.Tensor:
+    """Shared inner kernel: normalise by absmax, nearest-codebook search,
+    pack nibbles. Used by both plain `quantize_bnb4_pytorch` (derives
+    absmax from source) and `quantize_bnb4_double_quant_pytorch` (takes
+    pre-recovered absmax)."""
     safe_absmax = absmax.unsqueeze(1).clamp(min=1e-30)
-    normalised = blocks / safe_absmax            # [num_blocks, block_size]
-    # Broadcast difference against codebook: [num_blocks, block_size, 16]
+    normalised = blocks / safe_absmax
     diff = (normalised.unsqueeze(-1) - quant_map.to(torch.float32).reshape(1, 1, -1)).abs()
-    nibbles = diff.argmin(dim=-1).to(torch.uint8)  # [num_blocks, block_size]
+    nibbles = diff.argmin(dim=-1).to(torch.uint8)
     flat_nibbles = nibbles.reshape(-1)
     low = flat_nibbles[0::2]
     high = flat_nibbles[1::2]
     packed = (high << 4) | (low & 0x0F)
     return packed
+
+
+def quantize_bnb4_double_quant_pytorch(
+    source_bf16: torch.Tensor,
+    recovered_absmax: torch.Tensor,  # F32 [num_blocks], from nested decode
+    quant_map: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Quantize BF16 → packed U8 nibbles using a pre-recovered F32 absmax.
+
+    Mirrors the Rust `encode_bnb4_double_quant` signature (takes the
+    decoded-and-recovered absmax rather than re-deriving from source).
+    Used solely for *timing measurement* in the encode sidecar for
+    double-quant fixtures.
+    """
+    flat = source_bf16.reshape(-1).to(torch.float32)
+    total = flat.numel()
+    num_blocks = total // block_size
+    blocks = flat.reshape(num_blocks, block_size)
+    return _quantize_bnb4_inner_pytorch(blocks, recovered_absmax, quant_map, block_size)
 
 
 # ---- INT8 dequantization ----
@@ -258,6 +289,24 @@ MODELS = [
         "name": "qwen3_mcqa_fp4",
         "model_dir": HF_CACHE / "models--ema1234--qwen_mcqa_bnb_fp4",
         "format": "bnb4",
+        "layer_base": "model.layers.0.mlp.gate_proj",
+    },
+    # Step 1c — cross-architecture double-quant NF4 fixtures.
+    # Surfaced by `hf-fm inspect` during candidate selection: every
+    # non-Llama BnB-NF4 model checked uses double-quant (bitsandbytes'
+    # default). These two fixtures validate `encode_bnb4_double_quant`
+    # across two more architectures (Qwen2.5 and Phi-3.5) — the
+    # ecosystem-realistic test set for the NF4 encode path.
+    {
+        "name": "qwen2_5_1_5b_nf4_dq",
+        "model_dir": HF_CACHE / "models--unsloth--Qwen2.5-1.5B-Instruct-bnb-4bit",
+        "format": "bnb4_dq",
+        "layer_base": "model.layers.0.mlp.gate_proj",
+    },
+    {
+        "name": "phi3_5_mini_nf4_dq",
+        "model_dir": HF_CACHE / "models--unsloth--Phi-3.5-mini-instruct-bnb-4bit",
+        "format": "bnb4_dq",
         "layer_base": "model.layers.0.mlp.gate_proj",
     },
 ]
@@ -353,9 +402,32 @@ def generate_bnb4_fixture(model_info: dict) -> None:
 
     # ---- Time the inverse (quantize) for the encode-side sidecar ----
     # Inputs: the decoded BF16, the same per-block absmax, the same codebook.
-    # Skip double-quant (Phase 5 step 1 ships single-quant encode only).
-    if not is_double_quant:
-        quantize_iters_ns: list[int] = []
+    # Plain (single-quant) and double-quant variants have different signatures:
+    # plain derives absmax from source, double-quant takes pre-recovered absmax
+    # (matches the Rust API split between `encode_bnb4` and
+    # `encode_bnb4_double_quant`).
+    quantize_iters_ns: list[int] = []
+    if is_double_quant:
+        # Recover absmax via the same nested-codebook decode the Rust side
+        # uses. The recovered F32 array is what `encode_bnb4_double_quant`
+        # internally derives in its first pass.
+        absmax_indices = absmax_slice.long()
+        absmax_values_lut = nested_quant_map_slice[absmax_indices]
+        recovered_absmax = torch.zeros(slice_blocks, dtype=torch.float32)
+        for i in range(slice_blocks):
+            nb_idx = i // nested_block_size
+            recovered_absmax[i] = absmax_values_lut[i] * nested_absmax_slice[nb_idx]
+        for _ in range(5):
+            q0 = time.perf_counter_ns()
+            _packed = quantize_bnb4_double_quant_pytorch(
+                result_bf16, recovered_absmax, quant_map, block_size,
+            )
+            q1 = time.perf_counter_ns()
+            quantize_iters_ns.append(q1 - q0)
+        write_timing_sidecar(
+            name, "bitsandbytes-style quantize_4bit_double_quant", quantize_iters_ns
+        )
+    else:
         for _ in range(5):
             q0 = time.perf_counter_ns()
             _packed = quantize_bnb4_pytorch(result_bf16, quant_map, block_size)
