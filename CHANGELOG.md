@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-17
+
+**Lethe lands.** Phase 5 ships the encode-side inverse of `remember`:
+the `lethe` namespace with `BnB` encode kernels (`NF4` / `FP4` /
+`INT8`, plain + double-quant), the bit-exact round-trip validation
+harness every subsequent encode kernel family will reuse, and the
+sign-of-zero preservation tweak in the decode path that lets the
+round-trip recover the original nibble byte-exactly even on the
+bitsandbytes Python `FP4` `quant_map` that collapses `+0.0` and `-0.0`
+to the same bits. Cross-validated byte-exact (0 byte diffs) against
+the original PyTorch-quantised bytes on **7 fixtures across 4
+architecture families** (Llama 3.2 / Qwen3 / Qwen2.5 / Phi-3.5).
+
 ### Added
 
 - **`encode_bnb4_double_quant`** — fourth `BnB` encode kernel, the

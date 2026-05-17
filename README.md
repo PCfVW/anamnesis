@@ -20,6 +20,7 @@
   - [GPTQ Dequantization](#gptq-dequantization)
   - [AWQ Dequantization](#awq-dequantization)
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
+  - [BitsAndBytes Quantization (Lethe — Phase 5)](#bitsandbytes-quantization-lethe--phase-5)
   - [GGUF Block-Quant Dequantization](#gguf-block-quant-dequantization)
 - [Safetensors Header Inspection](#safetensors-header-inspection)
 - [NPZ/NPY Parsing](#npznpy-parsing)
@@ -122,6 +123,26 @@ Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-
 | Llama-3.2-1B-BNB-INT8 | INT8 | 65,536 | 1.2x faster |
 
 > **Note:** INT8 speedup is modest because the operation is trivially simple (`i8→f32→multiply`). Both PyTorch and anamnesis are near memory bandwidth limits at ~0.7–0.8 ns/element. The AVX2 hot loop is fully vectorized — the 1.2× reflects the inherent ceiling, not a missed optimization.
+
+### BitsAndBytes Quantization (Lethe — Phase 5)
+
+The inverse direction. Phase 5 ships the `lethe` namespace alongside `remember`: `encode_bnb4` / `encode_bnb4_double_quant` / `encode_bnb_int8` plus the bit-exact `round_trip` validation harness. Cross-validated against PyTorch `bitsandbytes` on **7 fixtures across 4 architecture families** (Llama 3.2 / Qwen3 / Qwen2.5 / Phi-3.5): every fixture round-trips **byte-exact** (0 byte diffs) against the original PyTorch-quantised bytes.
+
+| Fixture | Format | Elements | Byte-exact round-trip | vs PyTorch quantize (CPU) |
+|---|---|---|---|---|
+| Llama-3.2-1B-Instruct-bnb-nf4 | NF4 plain | 4,096 | ✓ 0 / 2048 | 0.22× (slower) |
+| Llama-3.2-1B-BNB-FP4 | FP4 plain | 4,096 | ✓ 0 / 2048 | 0.24× (slower) |
+| Llama-3.2-1B-Instruct-bnb-nf4-double-quant | NF4 double-quant | 4,096 | ✓ 0 / 2048 | 0.22× (slower) |
+| Llama-3.2-1B-BNB-INT8 | INT8 | 65,536 | ✓ 0 / 65536 | 0.03× (32× slower) |
+| ema1234/qwen_mcqa_bnb_fp4 | FP4 plain (Qwen3) | 4,096 | ✓ 0 / 2048 | 0.20× (slower) |
+| unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit | NF4 double-quant (Qwen2.5) | 4,096 | ✓ 0 / 2048 | 0.18× (slower) |
+| unsloth/Phi-3.5-mini-instruct-bnb-4bit | NF4 double-quant (Phi-3.5) | 4,096 | ✓ 0 / 2048 | 0.18× (slower) |
+
+> **Sign-of-zero preservation finding (FP4):** The on-disk `bitsandbytes` Python `FP4` `quant_map` stores `+0.0` at *both* index 0 *and* index 8 — collapsing the `±0` pair. A naive `decode → encode` round-trip would be mathematically impossible under that codebook. Phase 5 introduces a narrow, principled tweak in `dequantize_bnb4_to_bf16`: when a codebook entry is exactly `+0.0` AND the nibble has its high bit set (`nibble & 0x8 != 0`), the emitted `BF16` is `-0.0`. This recovers the sign information `bitsandbytes`' Python decode discards. Arithmetically invisible (both are IEEE 754 zero), affects `0.2 %` of `FP4` elements, no-op for `NF4`. The encoder mirrors the rule with `apply_sign_magnitude_encode_correction`. Confirmed to generalise: the Qwen3 FP4 fixture shows the same `+0.0` / `+0.0` codebook collapse and round-trips byte-exact under the rule.
+
+> **Ecosystem finding (NF4 double-quant):** `hf-fm inspect` HTTP-range probes during cross-architecture candidate selection revealed that **every** non-Llama BnB-NF4 model checked uses double-quant — bitsandbytes' default. Plain NF4 is effectively a Llama-fixture-only phenomenon. Without `encode_bnb4_double_quant` (Step 1c), anamnesis would only encode a tiny corner of real-world BnB-4bit models. Promoted from deferred polish to required Step 1c gate on `v0.5.0`.
+
+> **On the "slower than PyTorch" column:** The encode kernels are 4–6× slower than PyTorch's broadcast-vectorised quantize on `BnB4`, 32× slower on `INT8`. This is expected — PyTorch encode uses a single broadcast tensor op (`(blocks.unsqueeze(-1) - codebook).abs().argmin(dim=-1)`) that vectorises across the whole tensor; the Rust encode loop is currently scalar per element. **Phase 9 (CPU SIMD pass) is the natural target** — this table makes the gap visible. The same loop-fission + `target-cpu=native` infrastructure that gave the decode path its 18–54× wins is the candidate retrofit on the encode side.
 
 ### GGUF Block-Quant Dequantization
 
