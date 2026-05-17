@@ -650,10 +650,10 @@ future regressions.
 
 | Fixture | Before tweak | After tweak (decode + encode mirror) |
 |---|---|---|
-| `HF-Quantization/Llama-3.2-1B-BNB-FP4` (Llama) | 8 / 2048 byte diffs | **0 / 2048** |
-| `ema1234/qwen_mcqa_bnb_fp4` (Qwen3) | confirmed same `+0/+0` collapse via `hf-fm inspect`; not measured pre-tweak | **0 / 2048** |
-| `medmekk/Llama-3.2-1B-Instruct-bnb-nf4` (NF4, plain) | 0 / 2048 (tweak inactive — codebook has no `+0/+0` collision) | **0 / 2048** (unchanged) |
-| `medmekk/Llama-3.2-1B-Instruct-bnb-nf4-double-quant` (NF4, DQ) | 0 / 2048 (tweak inactive) | **0 / 2048** (unchanged) |
+| `HF-Quantization/Llama-3.2-1B-BNB-FP4` (Llama) | 8 / 2048 byte diffs (measured) | **0 / 2048** |
+| `ema1234/qwen_mcqa_bnb_fp4` (Qwen3) | not measured pre-tweak; post-tweak byte-exact round-trip is consistent with the tweak firing on this fixture's codebook too | **0 / 2048** |
+| `medmekk/Llama-3.2-1B-Instruct-bnb-nf4` (NF4, plain) | 0 / 2048 (tweak inactive on NF4 — `codebook[8] = 0.0795 …`, no `+0/+0` collision) | **0 / 2048** (unchanged) |
+| `medmekk/Llama-3.2-1B-Instruct-bnb-nf4-double-quant` (NF4, DQ) | 0 / 2048 (tweak inactive on NF4) | **0 / 2048** (unchanged) |
 | `unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit` (NF4 DQ, Qwen2.5) | not measured pre-tweak (tweak inactive on NF4) | **0 / 2048** |
 | `unsloth/Phi-3.5-mini-instruct-bnb-4bit` (NF4 DQ, Phi-3.5) | not measured pre-tweak (tweak inactive on NF4) | **0 / 2048** |
 | `HF-Quantization/Llama-3.2-1B-BNB-INT8` (INT8) | 0 / 65536 (no codebook) | **0 / 65536** (unchanged) |
@@ -670,19 +670,19 @@ The downstream cost of dropping the constraint is bounded:
 - **Decode bit-exactness test breakage** was prevented by a one-line tweak to `compare_bf16` in `tests/cross_validation_bnb.rs`: treat `±0` as IEEE-equivalent when computing ULP distance. Documented, principled, narrow.
 - **No-op for every codebook whose upper-half indices have non-zero entries** — NF4 (`codebook[7] = 0.0`, `codebook[15] = 1.0`), every GGUF codebook, FP8 (no codebook collapse), etc. The tweak is FP4-specific by construction even though it's expressed as a general "if codebook entry is `+0` AND nibble high bit set" rule.
 
-**Disposition: Shipped**. Three commits:
+**Disposition: Shipped**. Three commits (use `git log` or [`CHANGELOG.md`](../CHANGELOG.md)'s `[0.5.0]` entry for context):
 
-- [`a5c452d`](../CHANGELOG.md) (Phase 5 step 1a) — tweak introduced in `dequantize_bnb4_to_bf16` + mirror in `encode_bnb4`; `compare_bf16` updated; unit tests `apply_sign_magnitude_zero_flips_only_when_codebook_is_plus_zero` + `apply_sign_magnitude_encode_correction_lifts_to_upper_when_duplicated` lock the behaviour.
-- [`24cba42`](../CHANGELOG.md) (Phase 5 step 1b) — Qwen3 FP4 fixture proves cross-architecture generalisation.
-- [`ab4e735`](../CHANGELOG.md) (Phase 5 step 1c) — `encode_bnb4_double_quant` extends the same tweak through the double-quant path.
+- `a5c452d` (Phase 5 step 1a) — tweak introduced in `dequantize_bnb4_to_bf16` + mirror in `encode_bnb4`; `compare_bf16` updated; unit tests `apply_sign_magnitude_zero_flips_only_when_codebook_is_plus_zero` + `apply_sign_magnitude_encode_correction_lifts_to_upper_when_duplicated` lock the behaviour.
+- `24cba42` (Phase 5 step 1b) — Qwen3 FP4 fixture proves cross-architecture generalisation.
+- `ab4e735` (Phase 5 step 1c) — `encode_bnb4_double_quant` extends the same tweak through the double-quant path.
 
 **Trade-offs accepted:**
 
 - Anamnesis's decode is no longer a bit-exact mirror of bitsandbytes' Python decode on the `0.2 %` of `FP4` elements where the codebook collapse fires. The deviation is arithmetically invisible (`+0` vs `-0` IEEE 754 equivalence), documented in [`src/remember/bnb.rs`](../src/remember/bnb.rs)'s `dequantize_bnb4_to_bf16` rustdoc, and unit-tested.
 - A future bitsandbytes Python release that fixes the `quant_map` collapse (storing `-0.0` at index 8 instead of `+0.0`) would re-establish bit-exactness on both sides — our tweak would become a no-op on the fixed codebook because `codebook[8].to_bits() != codebook[0].to_bits()` would short-circuit the condition. Forward-compatible by construction.
 
-**Re-attempting this requires:** N/A — this is the success case. If the change ever needs to be reverted, the cross-architecture FP4 round-trip tests in [`tests/cross_validation_bnb_encode.rs`](../tests/cross_validation_bnb_encode.rs) will surface the 8/2048 regression on the Llama fixture and the Qwen3 fixture within the next test run.
+**Re-attempting this requires:** N/A — this is the success case. If the change ever needs to be reverted, the cross-architecture FP4 round-trip tests in [`tests/cross_validation_bnb_encode.rs`](../tests/cross_validation_bnb_encode.rs) will surface a byte regression on the Llama fixture (the 8 / 2048 originally measured) and on the Qwen3 fixture (count not pre-measured but at least 1 since the post-tweak round-trip is byte-exact) within the next test run.
 
-**Cross-reference:** The full design discussion that led to this rule is summarised in [`ROADMAP.md`](../ROADMAP.md)'s Phase 5 "Boundary-pushing finding (sign-of-zero preservation)" paragraph. The user's prompt that surfaced the over-claim is preserved in the v0.5.0 commit-message history (commit `a5c452d`).
+**Cross-reference:** The full design discussion that led to this rule is summarised in [`ROADMAP.md`](../ROADMAP.md)'s Phase 5 "Boundary-pushing finding (sign-of-zero preservation)" paragraph and in commit `a5c452d`'s commit-message body.
 
 **Template for future encode-side correctness findings:** when adding a new encode kernel family in Phase 7.5 (FP8, GGUF legacy/K/IQ/TQ/MXFP4), check whether the on-disk codebook has any collapsed-entry pairs of the form `codebook[i].to_bits() == codebook[j].to_bits()` for `i != j`. If so, the same template applies: (1) measure baseline round-trip error, (2) identify whether decode could disambiguate via some carrier the existing kernel ignores, (3) apply the narrowest possible decode + encode tweak pair, (4) verify on cross-architecture fixtures.
