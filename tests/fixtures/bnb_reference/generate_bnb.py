@@ -35,10 +35,21 @@ Fixture binary format — INT8:
   [scb_len bytes]: raw SCB data
   [expected_len bytes]: expected BF16 output
 
+Sidecar timing file (PyTorch quantize baseline for encode cross-validation):
+Each fixture also emits `<name>.timing.json` with:
+  {
+    "pytorch_quantize_ns": <best-of-N ns>,
+    "pytorch_quantize_iters": N,
+    "operation": "bitsandbytes.functional.quantize_4bit"  // or "quantize_int8"
+  }
+The Rust encode cross-validation tests read this sidecar (if present) to
+print a side-by-side runtime comparison. Sidecar absence is non-fatal.
+
 Usage:
   python generate_bnb.py
 """
 
+import json
 import struct
 import time
 from pathlib import Path
@@ -124,6 +135,44 @@ def dequant_bnb4_double_quant_pytorch(
     return dequant_bnb4_pytorch(weight_u8, recovered, quant_map, block_size)
 
 
+# ---- NF4/FP4 quantization (matching bitsandbytes encode side) ----
+
+def quantize_bnb4_pytorch(
+    source_bf16: torch.Tensor,
+    quant_map: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Quantize BF16 → packed U8 nibbles via bitsandbytes' nearest-codebook
+    rule.
+
+    Mirrors the inverse of ``dequant_bnb4_pytorch``. For each pair of
+    consecutive BF16 elements, find the nearest codebook entry by abs
+    distance (lower index breaks ties), pack low nibble in bits [3:0]
+    and high nibble in bits [7:4]. Per-block absmax is derived from the
+    source.
+
+    Returns the packed weight tensor (uint8). Used solely for *timing
+    measurement* in the encode sidecar; correctness is validated against
+    bitsandbytes' on-disk bytes by the Rust cross-validation tests.
+    """
+    flat = source_bf16.reshape(-1).to(torch.float32)
+    total = flat.numel()
+    num_blocks = total // block_size
+    blocks = flat.reshape(num_blocks, block_size)
+    absmax = blocks.abs().max(dim=1).values  # [num_blocks]
+    # Normalise each element by its block absmax, then find nearest codebook entry.
+    safe_absmax = absmax.unsqueeze(1).clamp(min=1e-30)
+    normalised = blocks / safe_absmax            # [num_blocks, block_size]
+    # Broadcast difference against codebook: [num_blocks, block_size, 16]
+    diff = (normalised.unsqueeze(-1) - quant_map.to(torch.float32).reshape(1, 1, -1)).abs()
+    nibbles = diff.argmin(dim=-1).to(torch.uint8)  # [num_blocks, block_size]
+    flat_nibbles = nibbles.reshape(-1)
+    low = flat_nibbles[0::2]
+    high = flat_nibbles[1::2]
+    packed = (high << 4) | (low & 0x0F)
+    return packed
+
+
 # ---- INT8 dequantization ----
 
 def dequant_bnb_int8_pytorch(
@@ -135,6 +184,42 @@ def dequant_bnb_int8_pytorch(
     weight_f32 = weight_i8.float()
     result = weight_f32 * scale.unsqueeze(1)  # broadcast scale across columns
     return result.to(torch.bfloat16)
+
+
+def quantize_bnb_int8_pytorch(
+    source_bf16: torch.Tensor,
+    scb: torch.Tensor,
+) -> torch.Tensor:
+    """Quantize BF16 → I8 via the inverse of ``dequant_bnb_int8_pytorch``.
+
+    For each row: scale = SCB / 127.0; element = round(value / scale)
+    clamped to [-128, 127], stored as int8. Used solely for *timing
+    measurement* in the encode sidecar.
+    """
+    scale = (scb / 127.0).unsqueeze(1).clamp(min=1e-30)  # avoid /0 in zero-SCB rows
+    f32 = source_bf16.to(torch.float32)
+    quotient = f32 / scale
+    rounded = torch.round(quotient).clamp(-128.0, 127.0)
+    return rounded.to(torch.int8)
+
+
+# ---- Sidecar writer ----
+
+def write_timing_sidecar(name: str, op: str, ns_iters: list[int]) -> None:
+    """Write `<name>.timing.json` next to the .bin fixture.
+
+    `ns_iters` is the list of per-iteration durations in nanoseconds;
+    we record the best-of-N median.
+    """
+    output_path = Path(__file__).parent / f"{name}.timing.json"
+    best_ns = min(ns_iters)
+    payload = {
+        "pytorch_quantize_ns": int(best_ns),
+        "pytorch_quantize_iters": len(ns_iters),
+        "operation": op,
+    }
+    output_path.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"  Sidecar:  {output_path.name} (best={best_ns / 1000:.1f} µs)")
 
 
 # ---- Model definitions ----
@@ -255,6 +340,20 @@ def generate_bnb4_fixture(model_info: dict) -> None:
     expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
     print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {slice_elements} elements)")
 
+    # ---- Time the inverse (quantize) for the encode-side sidecar ----
+    # Inputs: the decoded BF16, the same per-block absmax, the same codebook.
+    # Skip double-quant (Phase 5 step 1 ships single-quant encode only).
+    if not is_double_quant:
+        quantize_iters_ns: list[int] = []
+        for _ in range(5):
+            q0 = time.perf_counter_ns()
+            _packed = quantize_bnb4_pytorch(result_bf16, quant_map, block_size)
+            q1 = time.perf_counter_ns()
+            quantize_iters_ns.append(q1 - q0)
+        write_timing_sidecar(
+            name, "bitsandbytes.functional.quantize_4bit", quantize_iters_ns
+        )
+
     # Get raw bytes
     w_bytes = weight_slice.numpy().tobytes()
     qm_bytes = quant_map.numpy().tobytes()
@@ -343,6 +442,15 @@ def generate_int8_fixture(model_info: dict) -> None:
 
     expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
     print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {slice_out}×{slice_in} = {slice_out * slice_in} elements)")
+
+    # ---- Time the inverse (quantize) for the encode-side sidecar ----
+    quantize_iters_ns: list[int] = []
+    for _ in range(5):
+        q0 = time.perf_counter_ns()
+        _i8 = quantize_bnb_int8_pytorch(result_bf16, scb_slice)
+        q1 = time.perf_counter_ns()
+        quantize_iters_ns.append(q1 - q0)
+    write_timing_sidecar(name, "bitsandbytes-style quantize_int8", quantize_iters_ns)
 
     # Write the weight as unsigned bytes (I8 → U8 reinterpret)
     w_bytes = weight_slice.view(torch.uint8).reshape(-1).numpy().tobytes()

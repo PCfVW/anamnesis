@@ -147,6 +147,17 @@ fn compare_bf16(actual: &[u8], expected: &[u8], max_ulp_diff: u16) -> (usize, u1
             continue;
         }
 
+        // IEEE 754 signed-zero equivalence: +0 and -0 are arithmetically
+        // identical. anamnesis' BnB4 decode emits -0 for nibble high-bit
+        // entries whose codebook value collapsed to +0 (the sign-of-zero
+        // preservation rule that lets encode round-trip the original
+        // nibble byte-exactly); bitsandbytes' Python decode emits +0 at
+        // those positions. The arithmetic value is the same.
+        // BITWISE: low 15 bits zero ⇒ value is +0 or -0 (sign-only diff).
+        if a_bits.trailing_zeros() >= 15 && e_bits.trailing_zeros() >= 15 {
+            continue;
+        }
+
         let diff = a_bits.abs_diff(e_bits);
         if diff > max_ulp_diff {
             mismatches += 1;

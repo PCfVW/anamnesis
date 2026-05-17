@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lethe` namespace** (`src/lethe/`) — precision-compression (encoding)
+  counterpart to `remember`. Phase 5 ships `BnB` encode plus a generic
+  bit-exact round-trip validation harness; subsequent encode kernel
+  families (`FP8`, `GGUF` legacy / `K-quants` / `IQ` / `TQ` / `MXFP4`)
+  will reuse the same harness in Phase 7.5. Feature-gated behind the
+  existing `bnb` feature (no new feature flag).
+- **`encode_bnb4`** / **`encode_bnb4_compute_absmax`** — `NF4` / `FP4`
+  encode to packed nibbles. `encode_bnb4` mirrors the
+  `dequantize_bnb4_to_bf16` signature exactly (caller supplies absmax
+  + codebook); the `_compute_absmax` variant derives per-block absmax
+  from the source `BF16`. Round-trip is byte-exact on every shipped
+  `BnB` fixture.
+- **`encode_bnb_int8`** / **`encode_bnb_int8_compute_scb`** —
+  `LLM.int8()` per-row absmax + `i8` round-to-nearest with clamp to
+  `[-128, 127]`. Round-trip is byte-exact (every `i8` value recovers).
+- **`NF4_CODEBOOK`** / **`FP4_CODEBOOK`** — canonical 16-entry
+  `bitsandbytes` lookup tables exposed as `pub const`. The `FP4`
+  constant stores `-0.0` distinct from `+0.0` at index 8 (recovering
+  the sign-of-zero information that `bitsandbytes`' Python on-disk
+  `quant_map` collapses to `+0.0`).
+- **`lethe::round_trip`** — generic bit-exact round-trip harness:
+  `assert_bnb4_decode_encode_round_trip` and
+  `assert_bnb_int8_decode_encode_round_trip` for `BnB`; future kernel
+  families will add sibling helpers.
+- **Sign-of-zero preservation in `dequantize_bnb4_to_bf16`** — when a
+  looked-up codebook entry is exactly `+0.0` AND the nibble's high bit
+  is set (`nibble & 0x8 != 0`), the emitted `BF16` is `-0.0` instead
+  of `+0.0`. This is a deliberate, narrow divergence from
+  `bitsandbytes`' Python decode that lets `encode_bnb4` round-trip
+  every `BnB` fixture byte-exactly (`FP4` included). Arithmetically
+  invisible (both `+0` and `-0` are IEEE 754 zero); the only
+  observable difference is the sign bit on `0.2 %` of `FP4` elements.
+  No-op for `NF4` and every codebook whose upper-half indices hold
+  non-zero entries.
+- Cross-validation test (`tests/cross_validation_bnb_encode.rs`) round-trips
+  every shipped `BnB` fixture (`NF4`, `FP4`, `INT8`) at 0-ULP bit
+  exactness against the original `bitsandbytes`-quantised
+  `weight_data`. Optional `PyTorch` quantize-timing sidecar
+  (`<fixture>.timing.json`) prints side-by-side runtime comparison
+  when present.
+- `tests/fixtures/bnb_reference/generate_bnb.py` now also times
+  `bitsandbytes`-equivalent quantize passes and emits the
+  `<fixture>.timing.json` sidecar for the encode cross-validation
+  runtime comparison.
+
+### Changed
+
+- `tests/cross_validation_bnb.rs` `compare_bf16` helper now treats
+  `+0` and `-0` `BF16` as IEEE 754 equivalent so the deliberate
+  sign-of-zero divergence in `dequantize_bnb4_to_bf16` does not break
+  the existing decode bit-exactness contract on `FP4` fixtures.
+
+### Known gaps
+
+- `encode_bnb4_double_quant` (nested-absmax encode) is **not** shipped
+  in this drop. Phase 5 step 1 covers three encode kernels (`NF4`,
+  `FP4`, `INT8`); double-quant encode adds a fourth kernel
+  (nested-absmax derivation + nested-codebook search) and is tracked
+  for a follow-up commit. The `llama_1b_nf4_double_quant` fixture
+  continues to validate the decode path in
+  `cross_validation_bnb.rs`.
+
 ## [0.4.6] - 2026-05-14
 
 ### Added

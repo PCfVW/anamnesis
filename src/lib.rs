@@ -9,7 +9,7 @@
 //! (zero-copy mmap with lossless safetensors conversion, 11–31× faster
 //! than `torch.load()`).
 //!
-//! # Supported Quantization Schemes
+//! # Supported Quantization Schemes (decode — [`remember`])
 //!
 //! | Scheme | Feature gate | Speedup vs `PyTorch` CPU (AVX2) |
 //! |--------|-------------|-------------------------------|
@@ -21,6 +21,25 @@
 //!
 //! All schemes produce **bit-exact** output (0 ULP difference) against
 //! `PyTorch` reference implementations, verified on real models.
+//!
+//! # Supported Quantization Schemes (encode — [`lethe`])
+//!
+//! Phase 5 introduces the encode side as the architectural inverse of
+//! [`remember`]. Each kernel here takes the `BF16` bytes that
+//! [`remember`] produces and writes the corresponding quantised bytes
+//! plus the per-block / per-row metadata (`absmax`, `SCB`, …), so
+//! `encode(decode(q, scale)) == q` holds bit-exactly for every codebook-
+//! `LUT` family (`NF4`, `FP4`) and within `i8` representation error
+//! plus the documented clamp at `± 127` for `INT8`.
+//!
+//! | Scheme | Feature gate | Cross-validation contract |
+//! |--------|-------------|---------------------------|
+//! | `BitsAndBytes` `NF4`/`FP4` encode | `bnb` | 0-ULP bit-exact round trip on every fixture |
+//! | `BitsAndBytes` `INT8` encode | `bnb` | 0-ULP bit-exact round trip on every fixture |
+//!
+//! Subsequent encode-kernel families (`FP8`, `GGUF` legacy / `K-quants`
+//! / `IQ` / `TQ` / `MXFP4`) land in Phase 7.5 and reuse the
+//! `lethe::round_trip` harness introduced here.
 //!
 //! # `NPZ`/`NPY` Parsing
 //!
@@ -118,8 +137,30 @@
 //!   (requires `pth` feature)
 //!
 //! The [`remember`] module contains one submodule per quantization family
-//! ([`remember::fp8`], [`remember::gptq`], [`remember::awq`],
-//! [`remember::bnb`]), each feature-gated independently.
+//! ([`remember::fp8`] always-on; `remember::gptq`, `remember::awq`,
+//! `remember::bnb` feature-gated independently under `gptq` / `awq` /
+//! `bnb`).
+//!
+//! The [`lethe`] module mirrors that layout on the encode side. Phase 5
+//! ships `lethe::bnb` (feature-gated behind `bnb`) plus the
+//! always-on `lethe::round_trip` validation harness. Encoding a fresh
+//! `BF16` source into `BnB-NF4`:
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "bnb")]
+//! # fn run() -> anamnesis::Result<()> {
+//! use anamnesis::{encode_bnb4_compute_absmax, NF4_CODEBOOK};
+//!
+//! // 64 BF16 elements arranged as one 64-element block.
+//! let bf16_bytes: Vec<u8> = vec![0u8; 64 * 2];
+//! let codebook_bytes: Vec<u8> =
+//!     NF4_CODEBOOK.iter().flat_map(|v| v.to_le_bytes()).collect();
+//! let (weight, absmax) =
+//!     encode_bnb4_compute_absmax(&bf16_bytes, &codebook_bytes, 64, 64)?;
+//! assert_eq!(weight.len(), 32);   // 64 elements / 2 nibbles per byte
+//! assert_eq!(absmax.len(), 4);    // 1 block × F32 LE
+//! # Ok(()) }
+//! ```
 
 // `deny` (not `forbid`) allows feature-gated modules to opt in to unsafe
 // where required by external APIs (e.g., memmap2 in the `pth` module).
@@ -139,12 +180,18 @@
 pub mod cli;
 pub mod error;
 pub mod inspect;
+pub mod lethe;
 pub mod model;
 pub mod parse;
 pub mod remember;
 
 pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
+#[cfg(feature = "bnb")]
+pub use lethe::{
+    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb_int8, encode_bnb_int8_compute_scb,
+    FP4_CODEBOOK, NF4_CODEBOOK,
+};
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "gguf")]
 pub use parse::{

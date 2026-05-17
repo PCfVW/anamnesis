@@ -30,6 +30,37 @@ fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
     Some(f32::from_le_bytes(arr))
 }
 
+/// Applies the sign-magnitude zero-preservation rule to one looked-up
+/// codebook entry.
+///
+/// When the entry is exactly `+0.0` (IEEE 754 bits `0x00000000`) AND
+/// the nibble has its high bit set (`nibble & 0x8 != 0`), returns
+/// `-0.0`. Otherwise returns the entry unchanged.
+///
+/// The rule implements `BnB`-style sign-magnitude convention: in
+/// `bitsandbytes` `FP4`, the high nibble bit encodes the sign of the
+/// quantised value, but the on-disk `quant_map` stores `+0.0` at both
+/// index 0 and index 8 (a lossy compression of the codebook). Without
+/// this tweak, our decoded `BF16` would emit `0x0000` for both nibbles,
+/// destroying the sign information. With it, nibble 8 decodes to
+/// `0x8000` (negative zero), so a subsequent encode can recover the
+/// original nibble byte-exactly.
+///
+/// No-op for any codebook whose upper-half (indices 8..16) has no
+/// `+0.0` entry — `NF4` (index-8 entry is `0.0795…`), every `GGUF`
+/// codebook, etc.
+#[inline]
+#[must_use]
+fn apply_sign_magnitude_zero(entry: f32, nibble: usize) -> f32 {
+    // BITWISE: detect IEEE 754 +0.0 via exact bit equality (treats only
+    // +0, not -0, as the trigger — -0 is already what we'd emit).
+    if entry.to_bits() == 0 && (nibble & 0x8) != 0 {
+        -0.0_f32
+    } else {
+        entry
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NF4/FP4 dequantization (4-bit, lookup-table based)
 // ---------------------------------------------------------------------------
@@ -79,6 +110,18 @@ fn dequantize_bnb4_core(
 
         // --- Pass 1 (unpack): byte → 2 nibbles → table lookup → f32 scratch ---
         // Each byte produces two f32 values via the quant_map lookup.
+        //
+        // Sign-of-zero preservation (FP4-style sign-magnitude codebooks):
+        // when the looked-up codebook entry is exactly +0.0 AND the
+        // nibble has its high bit set (n & 0x8 != 0), we substitute
+        // -0.0. This recovers the sign information that bitsandbytes'
+        // Python on-disk `FP4` `quant_map` discards (its index-8 entry
+        // is stored as +0.0 instead of -0.0). The arithmetic value is
+        // unchanged — both are IEEE 754 zero — but the BF16 sign bit
+        // is preserved across a decode→encode round trip, so the
+        // round-trip is byte-exact rather than only decode-equivalent.
+        // This is a no-op for `NF4` (codebook[8] = 0.0795…, never +0)
+        // and for any codebook whose upper half lacks a +0.0 entry.
         // VECTORIZED: pass 1 extracts nibbles and performs table lookup;
         // pass 2 does pure f32 multiply + BF16 convert (verified: vmulps ymm
         // with target-cpu=native).
@@ -95,8 +138,8 @@ fn dequantize_bnb4_core(
             // INDEX: low and high are 0-15, quant_map has 16 entries
             #[allow(clippy::indexing_slicing)]
             {
-                pair[0] = quant_map[low];
-                pair[1] = quant_map[high];
+                pair[0] = apply_sign_magnitude_zero(quant_map[low], low);
+                pair[1] = apply_sign_magnitude_zero(quant_map[high], high);
             }
         }
 
@@ -121,6 +164,26 @@ fn dequantize_bnb4_core(
 /// (`byte & 0x0F`), high nibble second (`byte >> 4`). Each nibble indexes
 /// into `quant_map_data` (a 16-entry `F32` lookup table). The looked-up
 /// value is then scaled by the block's absmax.
+///
+/// # Sign-of-zero preservation
+///
+/// When a looked-up codebook entry is exactly `+0.0` (bits `0x00000000`)
+/// AND the nibble has its high bit set (`nibble & 0x8 != 0`), the
+/// emitted `BF16` is `-0.0` (bits `0x8000`) rather than `+0.0`. This
+/// recovers the sign information that `bitsandbytes`' Python on-disk
+/// `FP4` `quant_map` discards (its index-8 entry is stored as `+0.0`
+/// instead of `-0.0`). The arithmetic value is unchanged — both `+0`
+/// and `-0` are IEEE 754 zero — but the sign bit propagates through
+/// the encode round trip so [`encode_bnb4`](crate::encode_bnb4) can
+/// recover the original nibble byte-exactly.
+///
+/// This is a **deliberate divergence** from `bitsandbytes`' Python
+/// decode (which always emits `+0` for nibble 8 under that codebook).
+/// The divergence is arithmetically invisible (zero is zero); the only
+/// observable difference is the sign bit on a small fraction of
+/// elements (`8 / 4096 = 0.2 %` on the existing `FP4` fixture). It is
+/// a no-op for `NF4` and any other codebook whose upper-half indices
+/// hold non-zero entries.
 ///
 /// # Arguments
 ///
@@ -506,6 +569,69 @@ mod tests {
         let bits = u16::from_le_bytes([output[offset], output[offset + 1]]);
         let f32_bits = u32::from(bits) << 16;
         f32::from_bits(f32_bits)
+    }
+
+    // --- Sign-of-zero preservation (FP4-style collapsed codebooks) ---
+
+    #[test]
+    fn apply_sign_magnitude_zero_flips_only_when_codebook_is_plus_zero() {
+        // +0.0 entry + nibble high bit set → emit -0.0.
+        let out = apply_sign_magnitude_zero(0.0, 8);
+        assert_eq!(
+            out.to_bits(),
+            0x8000_0000,
+            "expected -0.0 (bits 0x80000000)"
+        );
+        // +0.0 entry + nibble high bit clear → unchanged (still +0.0).
+        let out = apply_sign_magnitude_zero(0.0, 0);
+        assert_eq!(out.to_bits(), 0x0000_0000, "expected +0.0");
+        // -0.0 entry already → unchanged regardless of nibble.
+        let out = apply_sign_magnitude_zero(-0.0, 8);
+        assert_eq!(out.to_bits(), 0x8000_0000);
+        let out = apply_sign_magnitude_zero(-0.0, 0);
+        assert_eq!(out.to_bits(), 0x8000_0000);
+        // Non-zero entry → unchanged regardless of nibble.
+        assert_eq!(apply_sign_magnitude_zero(0.5, 8), 0.5);
+        assert_eq!(apply_sign_magnitude_zero(-0.5, 11), -0.5);
+        // NF4 codebook[7] = 0.0; nibble 7 has high bit clear → unchanged.
+        assert_eq!(apply_sign_magnitude_zero(0.0, 7).to_bits(), 0x0000_0000);
+        // NF4 codebook[8] = 0.0795… (non-zero) → unchanged even with high bit set.
+        let v = 0.079_580_3_f32;
+        assert_eq!(apply_sign_magnitude_zero(v, 8).to_bits(), v.to_bits());
+    }
+
+    #[test]
+    fn bnb4_decode_preserves_sign_on_collapsed_fp4_codebook() {
+        // Build a codebook with +0 at both index 0 and 8 (the
+        // bitsandbytes Python FP4 layout); nibble 0 should decode to +0,
+        // nibble 8 should decode to -0.
+        let mut cb = [0.0f32; 16];
+        cb[0] = 0.0;
+        cb[8] = 0.0; // collapsed: same bits as cb[0]
+        cb[1] = 0.1; // arbitrary non-zero to avoid an all-zero codebook
+        cb[9] = -0.1;
+        let cb_bytes: Vec<u8> = cb.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Weight bytes: 0x10 (low=0, high=1), 0x98 (low=8, high=9).
+        // 4 elements, block_size=4, absmax=[1.0]. 1 block.
+        let weight = vec![0x10u8, 0x98u8];
+        let absmax = f32_to_bytes(&[1.0]);
+        let out = dequantize_bnb4_to_bf16(&weight, &absmax, &cb_bytes, 4, 4).unwrap();
+        let elem0 = u16::from_le_bytes([out[0], out[1]]);
+        let elem1 = u16::from_le_bytes([out[2], out[3]]);
+        let elem2 = u16::from_le_bytes([out[4], out[5]]);
+        let elem3 = u16::from_le_bytes([out[6], out[7]]);
+        assert_eq!(elem0, 0x0000, "nibble 0 → +0 BF16");
+        assert_eq!(
+            elem1 & 0x7FFF,
+            0x3DCD & 0x7FFF,
+            "nibble 1 → ~0.1 BF16 (magnitude check)"
+        );
+        assert!(elem1 & 0x8000 == 0, "nibble 1 → positive sign");
+        assert_eq!(
+            elem2, 0x8000,
+            "nibble 8 → -0 BF16 (the new sign-preservation rule)"
+        );
+        assert!(elem3 & 0x8000 != 0, "nibble 9 → negative sign");
     }
 
     // --- NF4/FP4 tests ---
