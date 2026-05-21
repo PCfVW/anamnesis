@@ -2,11 +2,16 @@
 
 //! Peak-heap regression assertions for `AWQ` dequantisation.
 //!
-//! Mirrors [`peak_heap_gptq`](../peak_heap_gptq.rs) — `AWQ` shares
-//! `GPTQ`'s asymptotic claim ("`output_size + O(out_features)`, not
-//! `O(num_groups × out_features)`") and the same scratch-buffer
-//! shape (three `Vec<f32>[out_features]` arrays for unpacked weights,
-//! zero-points, and scales — see `src/remember/awq.rs` lines 263–265).
+//! Mirrors [`peak_heap_gptq`](peak_heap_gptq.rs). `AWQ` shares
+//! `GPTQ`'s asymptotic claim — Phase 6.5 of the ROADMAP carries the
+//! same wording on [`dequantize_awq_to_bf16`](anamnesis::dequantize_awq_to_bf16):
+//!
+//! > "lazy precomputation keeps peak heap within `output_size +
+//! > O(out_features)`, not `output_size + O(num_groups × out_features)`"
+//!
+//! `AWQ`'s kernel uses the same scratch-buffer shape as `GPTQ`:
+//! three `Vec<f32>[out_features]` arrays for unpacked weights,
+//! zero-points, and scales — see `src/remember/awq.rs` lines 263–265.
 //! The only structural difference is the `qweight` layout: `AWQ` is
 //! column-packed (`[in_features, out_features / pack_factor]`) where
 //! `GPTQ` is row-packed (`[in_features / pack_factor, out_features]`),
@@ -21,7 +26,7 @@
 //!
 //! # Memory
 //!
-//! Same as [`peak_heap_gptq`](../peak_heap_gptq.rs): output bytes
+//! Same as [`peak_heap_gptq`](peak_heap_gptq.rs): output bytes
 //! dominate; scratch is `3 × out_features × 4` bytes per the kernel
 //! contract. The layer-size variant peaks at ~90 `MiB` resident; the
 //! small variant peaks at ~2 `MiB`.
@@ -81,10 +86,13 @@ fn synth_awq_fixture(
     let qweight = synth_bytes(in_features * (out_features / pack_factor) * 4);
 
     let num_groups = in_features / group_size;
+    // BF16 LE = 2 bytes per element. `0x3F00` = BF16 0.5 (so dequant
+    // produces well-defined non-zero output instead of NaN-soup that
+    // an arbitrary bit pattern in `scales` could yield).
     let mut scales = vec![0u8; num_groups * out_features * 2];
     for pair in scales.chunks_exact_mut(2) {
         pair[0] = 0x00;
-        pair[1] = 0x3F; // BF16 0.5
+        pair[1] = 0x3F;
     }
 
     let qzeros = synth_bytes(num_groups * (out_features / pack_factor) * 4);
@@ -93,9 +101,18 @@ fn synth_awq_fixture(
 }
 
 // ---------------------------------------------------------------------------
-// Decomposition assertion (identical to peak_heap_gptq.rs)
+// Decomposition assertion (identical shape to peak_heap_gptq.rs)
 // ---------------------------------------------------------------------------
 
+/// Computes the ceiling `output_size + K × out_features × 4` and
+/// asserts the dhat-observed peak stays below it. `K = 5` covers the
+/// three `Vec<f32>` scratch buffers (3 × 4 bytes/element = 12 bytes
+/// per element) plus a 2× headroom for allocator overhead.
+///
+/// On failure, the message decomposes the actual peak so the reader
+/// can spot whether the regression is in scratch (still `O(out_features)`
+/// but bigger) or in eager-precomputation (now scaling with
+/// `num_groups × out_features`).
 const K_AWQ_SCRATCH: usize = 5;
 
 fn assert_peak_heap_within(out_features: usize, output_bytes: usize, max_bytes: usize) {
@@ -122,6 +139,8 @@ fn assert_peak_heap_within(out_features: usize, output_bytes: usize, max_bytes: 
 #[test]
 #[ignore = "dhat peak-heap assertion; run with --ignored --nocapture"]
 fn peak_heap_awq_small_1m_elements() {
+    // 1024 × 1024 = 1_048_576 elements; output ≈ 2 MiB; scratch =
+    // 3 × 1024 × 4 = 12 KiB.
     let in_features: usize = 1024;
     let out_features: usize = 1024;
     let group_size: usize = 128;
@@ -156,6 +175,8 @@ fn peak_heap_awq_small_1m_elements() {
 #[test]
 #[ignore = "dhat peak-heap assertion; run with --ignored --nocapture"]
 fn peak_heap_awq_layer_45m_elements() {
+    // 4096 × 11008 ≈ 45M elements; output ≈ 90 MiB; scratch =
+    // 3 × 11008 × 4 = 130 KiB.
     let in_features: usize = 4096;
     let out_features: usize = 11008;
     let group_size: usize = 128;

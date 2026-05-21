@@ -70,11 +70,18 @@ required-features = ["cli"]
 # feature is left at its default — Criterion's reports live in
 # `target/criterion/` and are never published.
 criterion = "0.5"
-# Phase 6.5 dev-only peak-heap profiler. Wraps the global allocator
-# in the `tests/peak_heap_*.rs` binaries (and only there) to record
-# `max_bytes` for ratio-form heap regression assertions. Every dhat
-# test is `#[ignore]`d so default `cargo test` skips them; the dhat
-# allocator only fires when the user opts in via `--ignored`.
+# Phase 6.5 dev-only peak-heap profiler. The `tests/peak_heap_*.rs`
+# binaries (and only there) declare `dhat::Alloc` as their
+# `#[global_allocator]`, so every allocation in those binaries is
+# wrapped — but actual heap-stats tracking only starts when a
+# `dhat::Profiler` is constructed inside a test fn. Both peak_heap
+# tests in each binary are `#[ignore]`d so default `cargo test`
+# skips them entirely; the dhat allocator's per-allocation overhead
+# is paid only at binary startup (a few KiB to a few ms) and
+# `Profiler` is never created. Two assertion forms ship:
+# `K × out_features × 4` ratio (GPTQ/AWQ) and `4 KiB` noise-tolerance
+# decomposition (BnB-DQ). See `tests/peak_heap_README.md` for the
+# rationale + calibration tables.
 dhat = "0.3"
 tempfile = "3"
 
