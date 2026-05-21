@@ -29,6 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (behind `npz`) and `write_bnb_nf4_safetensors` /
   `write_bnb_nf4_safetensors_bytes` / `is_eligible_for_nf4` /
   `classify_inputs` (behind `bnb`).
+- **Cross-format round-trip validation suite**
+  (`tests/cross_validation_convert.rs`) — 13 integration tests
+  covering every v0.6.0-available format pair, both directions where
+  reversible. Phase 6 Step 3. Includes BnB-NF4 byte-exactness against
+  the existing Python `bitsandbytes` fixture (`llama_1b_nf4.bin`),
+  full `safetensors-BF16 → GGUF → safetensors-BF16` byte-exact loops,
+  full `GGUF → safetensors → GGUF` byte-exact loops, BnB-NF4 encode
+  idempotency, multi-hop `NPZ → safetensors → GGUF`, mixed-dtype
+  safetensors → GGUF, multi-dimensional shape preservation (1-D,
+  3-D, 4-D), non-default `general.alignment = 8` round-trip, and
+  empty-GGUF metadata-only round-trip. Each test records wall-clock
+  µs and compares against a checked-in Python sidecar
+  (`tests/fixtures/convert_reference/*.timing.json`, refreshable via
+  `generate_convert_timings.py`) when one is available — silently
+  skips the comparison line when not, so the suite has no Python
+  runtime dependency.
 
 ## [0.5.0] - 2026-05-17
 
