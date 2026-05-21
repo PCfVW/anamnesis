@@ -513,8 +513,8 @@ The same `# Source context` block (with format name swapped) should appear on `i
 
 **Peak-memory validation (`tests/`):**
 
-- [ ] Peak-heap assertions for GPTQ/AWQ dequantization — verify lazy precomputation keeps peak heap within `output_size + O(out_features)`, not `output_size + O(num_groups × out_features)` — **commit**
-- [ ] Peak-heap assertions for BnB double-quant — verify no intermediate byte-serialization allocation — **commit** — **PUSH**
+- [x] Peak-heap assertions for GPTQ/AWQ dequantization — `dhat-rs` instrumented tests at [tests/peak_heap_gptq.rs](tests/peak_heap_gptq.rs) and [tests/peak_heap_awq.rs](tests/peak_heap_awq.rs). Two `#[ignore]`d assertions per file (1M-element + 45M-element fixtures) that compare the dhat-observed `max_bytes` against the decomposed ceiling `output_size + K × out_features × 4` with K=5 slack. Result: **observed scratch matches the documented `3 × out_features × 4` claim to the byte at both scales**, on commits `6d53a77` (GPTQ) and `9d24eb9` (AWQ)
+- [x] Peak-heap assertions for BnB double-quant — `dhat-rs` instrumented test at [tests/peak_heap_bnb_dq.rs](tests/peak_heap_bnb_dq.rs). Uses a tighter noise-tolerance assertion (4 KiB above the documented `num_blocks × 4 + block_size × 4` scratch) rather than a ratio multiplier, so a single accidental `Vec<u8>[num_blocks × 4]` intermediate would trip immediately. Result: **zero excess observed** beyond the documented scratch at both 1M and 45M element scales, on commit `5190a5d`
 
 **New dev-dependencies:** `criterion` (runtime), `dhat` (peak heap). Not compiled into the published crate. `ollama` feature flag (for the path-resolution helper) is library-side and adds no third-party dependency — pure stdlib + `serde_json` (already a runtime dep).
 
