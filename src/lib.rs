@@ -77,6 +77,63 @@
 //! best-of-5 median. Full table including PyTorch-CPU equivalents for
 //! the two non-PyTorch paths is in the project README.
 //!
+//! # `Ollama` integration (Phase 6.5)
+//!
+//! Feature-gated behind `ollama` (implies `gguf`). Adds **no
+//! third-party dependency** — pure stdlib + `serde_json` (already a
+//! runtime dep). Exposes one function:
+//!
+//! - `resolve_ollama_model("llama3.2:1b") -> PathBuf` — reads the
+//!   `Ollama` manifest at
+//!   `~/.ollama/models/manifests/registry.ollama.ai/library/<name>/<tag>`
+//!   and returns the `GGUF` blob path
+//!   (`~/.ollama/models/blobs/sha256-<hash>`). The `OLLAMA_MODELS`
+//!   env var overrides the cache root. Accepts the `ollama:name:tag`
+//!   URL-scheme form for `amn` CLI integration.
+//!
+//! The `amn` CLI's `parse` / `inspect` / `remember` / `convert`
+//! subcommands recognise the `ollama:` URL scheme prefix and resolve
+//! transparently:
+//!
+//! ```text
+//! amn inspect ollama:llama3.2:1b
+//! amn remember ollama:gemma2:2b --to bf16 -o gemma2.safetensors
+//! amn convert ollama:qwen2.5-coder:7b-instruct --to safetensors
+//! ```
+//!
+//! `cross_validation_ollama.rs` cross-validates anamnesis's `GGUF`
+//! dequant byte-exactly against the `gguf-py` reference on a slice
+//! pulled from a real `Ollama`-cached blob — the same kernel anamnesis
+//! already validates against bartowski / `TheBloke` quantisations,
+//! now also validated on the dominant local-LLM distribution channel.
+//!
+//! # Validation infrastructure (Phase 6.5, dev-only)
+//!
+//! Phase 6.5 ships three dev-only validation tracks. None of them
+//! affect the published crate (`benches/`, `tests/peak_heap_*.rs`,
+//! and the `dhat` / `criterion` dev-dependencies are excluded from
+//! the published tarball by Cargo's defaults).
+//!
+//! 1. **Criterion runtime benchmarks** (`benches/dequant.rs`,
+//!    `benches/parsing.rs`) — throughput baselines per kernel family
+//!    plus a real-world bench on the Ollama-cached `llama3.2:1b`
+//!    `Q8_0` slice. Run via `cargo bench --features
+//!    gptq,awq,bnb,gguf,npz,pth`. See
+//!    `benches/README.md` for run commands + machine-spec baselines.
+//! 2. **`dhat-rs` peak-heap assertions** (`tests/peak_heap_gptq.rs`,
+//!    `tests/peak_heap_awq.rs`, `tests/peak_heap_bnb_dq.rs`) — three
+//!    `#[ignore]`d test binaries that wrap the global allocator and
+//!    assert observed peak heap stays within the documented
+//!    `output_size + O(out_features)` (`GPTQ` / `AWQ`) or
+//!    `output_size + num_blocks × 4 + block_size × 4` (`BnB`
+//!    double-quant) ceiling. Each kernel's scratch matches the
+//!    documented `# Memory` claim to the byte on the reference
+//!    machine. See `tests/peak_heap_README.md` for calibration and
+//!    failure-interpretation guidance.
+//! 3. **Ollama-fixture cross-validation** (`tests/cross_validation_ollama.rs`)
+//!    — bit-exact `Q8_0` dequant against `gguf-py` on a real Ollama
+//!    blob (see the `Ollama` integration section above).
+//!
 //! # `NPZ`/`NPY` Parsing
 //!
 //! Feature-gated behind `npz`. Custom `NPY` header parser with bulk
