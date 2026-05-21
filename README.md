@@ -21,6 +21,7 @@
   - [AWQ Dequantization](#awq-dequantization)
   - [BitsAndBytes Dequantization](#bitsandbytes-dequantization)
   - [BitsAndBytes Quantization (Lethe — Phase 5)](#bitsandbytes-quantization-lethe--phase-5)
+  - [Format Conversion Pipeline (Phase 6, v0.6.0)](#format-conversion-pipeline-phase-6-v060)
   - [GGUF Block-Quant Dequantization](#gguf-block-quant-dequantization)
 - [Safetensors Header Inspection](#safetensors-header-inspection)
 - [NPZ/NPY Parsing](#npznpy-parsing)
@@ -46,10 +47,11 @@ Installs both `anamnesis` and `amn` (short alias). Feature flags: `gptq`, `awq`,
 | `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`, `.gguf`) |
 | `amn inspect <file>` | Show format, tensor counts, size estimates, and byte order |
 | `amn remember <file>` | Dequantize to BF16 (safetensors) or convert `.pth`/`.gguf` → `.safetensors` |
+| `amn convert <file> --to <target>` | Convert any input format to `safetensors` / `gguf` / `bnb-nf4` through a single dispatch (Phase 6, v0.6.0) |
 
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`.
 
-Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser, `.npz` files go through the header-only NPZ inspector, `.gguf` files go through the GGUF parser. `.bin` files are probed for ZIP/GGUF magic to distinguish PyTorch, GGUF, and safetensors.
+Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser, `.npz` files go through the header-only NPZ inspector, `.gguf` files go through the GGUF parser. `.bin` files are probed for ZIP/GGUF magic to distinguish PyTorch, GGUF, and safetensors. `amn convert` reuses the same detector and dispatches to the appropriate (input × target) pair; combinations not in the v0.6.0 matrix (e.g. `pth → bnb-nf4`) return a clear `Unsupported` error rather than silently falling through.
 
 ```
 $ amn parse model.pth

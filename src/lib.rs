@@ -41,6 +41,42 @@
 //! / `IQ` / `TQ` / `MXFP4`) land in Phase 7.5 and reuse the
 //! `lethe::round_trip` harness introduced here.
 //!
+//! # Format Conversion Pipeline (Phase 6, v0.6.0)
+//!
+//! `amn convert <input> --to <target>` routes any v0.6.0-available
+//! format pair through a single CLI dispatch. The same pipeline is
+//! exposed as a library through three new helper families:
+//!
+//! - `write_gguf` / `write_gguf_to_writer` / `GgufWriteTensor` — the
+//!   format-symmetric inverse of `parse_gguf`. Phase 6 emits scalar
+//!   dtypes only (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`); quantised
+//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 7.5 through
+//!   the same writer scaffold. Behind the `gguf` feature.
+//! - `npz_to_safetensors` / `npz_to_safetensors_bytes` — lossless
+//!   `NPZ → safetensors` conversion. Every [`NpzDtype`] variant maps
+//!   directly to its `safetensors::Dtype` counterpart. Behind the
+//!   `npz` feature.
+//! - `write_bnb_nf4_safetensors` / `write_bnb_nf4_safetensors_bytes`
+//!   / `BnbWriteInput` / `classify_inputs` / `is_eligible_for_nf4`
+//!   — end-to-end `BF16 → BnB-NF4 safetensors file` path. Wraps the
+//!   [`encode_bnb4_compute_absmax`] kernel into the four-tensor
+//!   on-disk companion layout (`weight`, `weight.absmax`,
+//!   `weight.quant_map`, `weight.quant_state.bitsandbytes__nf4`).
+//!   2-D tensors only; 1-D biases / norms / embeddings pass through
+//!   unchanged in `BF16`. Behind the `bnb` feature.
+//!
+//! | Conversion | anamnesis (CPU) | Python baseline (CPU) | Ratio |
+//! |---|---:|---:|---:|
+//! | `NPZ → safetensors` (4096×4096 F32) | 11.2 ms | 75.7 ms (numpy + safetensors-py) | 6.75× |
+//! | `PTH → safetensors` (4096×4096 BF16) | 5.7 ms | 29.6 ms (torch.load + safetensors.torch) | 5.18× |
+//! | `safetensors-BF16 → GGUF` (4096×4096 BF16) | 13.6 ms | 15.1 ms (gguf-py) | 1.11× |
+//! | `safetensors-BF16 → BnB-NF4` (4096×4096 BF16) | 141 ms | 376.8 ms (bitsandbytes CPU) | 2.67× |
+//!
+//! Headline numbers measured by `t14_perf_vs_python_size_matched` in
+//! `tests/cross_validation_convert.rs` at `target-cpu=native`, release,
+//! best-of-5 median. Full table including PyTorch-CPU equivalents for
+//! the two non-PyTorch paths is in the project README.
+//!
 //! # `NPZ`/`NPY` Parsing
 //!
 //! Feature-gated behind `npz`. Custom `NPY` header parser with bulk
@@ -133,8 +169,19 @@
 //!   in a single `<100 KiB` range fetch over the ZIP central directory and
 //!   `data.pkl` entry — no tensor-data files inside the archive are read
 //!   (requires `pth` feature)
-//! - `pth_to_safetensors()` — lossless `.pth` → `.safetensors` conversion
-//!   (requires `pth` feature)
+//! - `pth_to_safetensors()` / `pth_to_safetensors_bytes()` — lossless
+//!   `.pth` → `.safetensors` conversion (requires `pth` feature)
+//! - `npz_to_safetensors()` / `npz_to_safetensors_bytes()` — lossless
+//!   `.npz` → `.safetensors` conversion (requires `npz` feature; Phase 6)
+//! - `write_gguf()` / `write_gguf_to_writer()` — emit a `.gguf` file
+//!   from scalar-dtype tensors plus a metadata `KV` table; the
+//!   format-symmetric inverse of `parse_gguf` (requires `gguf` feature;
+//!   Phase 6)
+//! - `write_bnb_nf4_safetensors()` / `write_bnb_nf4_safetensors_bytes()`
+//!   — end-to-end `BF16 → BnB-NF4 safetensors` path with the four-tensor
+//!   companion layout (`weight`, `weight.absmax`, `weight.quant_map`,
+//!   `weight.quant_state.bitsandbytes__nf4`) (requires `bnb` feature;
+//!   Phase 6)
 //!
 //! The [`remember`] module contains one submodule per quantization family
 //! ([`remember::fp8`] always-on; `remember::gptq`, `remember::awq`,
@@ -159,6 +206,27 @@
 //!     encode_bnb4_compute_absmax(&bf16_bytes, &codebook_bytes, 64, 64)?;
 //! assert_eq!(weight.len(), 32);   // 64 elements / 2 nibbles per byte
 //! assert_eq!(absmax.len(), 4);    // 1 block × F32 LE
+//! # Ok(()) }
+//! ```
+//!
+//! Writing a `GGUF` file (Phase 6 — scalar dtypes only):
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "gguf")]
+//! # fn run() -> anamnesis::Result<()> {
+//! use std::collections::HashMap;
+//! use anamnesis::{write_gguf, GgufType, GgufWriteTensor};
+//!
+//! // Two BF16 tensors. `shape` is most-significant-first, matching
+//! // `parse_gguf` on the read side.
+//! let w_data: Vec<u8> = vec![0u8; 8 * 2];
+//! let b_data: Vec<u8> = vec![0u8; 4 * 2];
+//! let tensors = [
+//!     GgufWriteTensor { name: "w", shape: &[4, 2], dtype: GgufType::BF16, data: &w_data },
+//!     GgufWriteTensor { name: "b", shape: &[4],    dtype: GgufType::BF16, data: &b_data },
+//! ];
+//! // Metadata is optional; `general.alignment` is injected if absent.
+//! write_gguf("out.gguf", &tensors, &HashMap::new())?;
 //! # Ok(()) }
 //! ```
 
