@@ -178,11 +178,20 @@ What's distinctive about `anamnesis` isn't *that* it exists — it's the **libra
 
 ---
 
-## Next steps (not done — flagging for your call)
+## Open questions
 
-This survey leans on the author's knowledge of the ecosystem for version numbers and capability claims. To bring it up to `hf-fm`'s level of precision (specific release dates, star counts, recent activity verification, version-pin accuracy), the table cells should be cross-checked via `WebFetch` against each crate's `crates.io` / GitHub page. Worth doing before any wider circulation. Other open questions:
+These items remain genuinely undecided and worth a follow-up pass before wider circulation:
 
-- **NoUnsafe** and **BitExact** as table columns? Currently relegated to the "quality properties" paragraph since they're properties rather than capabilities, but a "rigour" column would be a real differentiator vs e.g. unsafe-heavy framework loaders.
-- Per-tool detail length: kept brief (~1–3 sentences each) for this survey; could expand each tool's section to `hf-fm`'s level (4–8 lines each with versions / star counts / reverse-dep notes) if needed for wider circulation.
-- **Adjacent CLI tools** not surveyed but possibly worth a row: `llmserve` (cache discovery), `ollama` (out of scope — Go, not Rust; mentioned in the "Beyond Rust" footer instead).
-- Phase 7.5 forward-looking coverage is now visible through the **GGUFWrite** column (cell flags "scalar dtypes (Phase 7.5: quantised)" for anamnesis). A separate forward-looking column for the deferred `FP8`/`IQ`/`TQ`/`MXFP4` encode kernels would be redundant once Phase 7.5 lands — they will appear in **EncBnB** generalised to a multi-family **Enc-\*** column at that point.
+- **Version-pin precision.** This survey leans on the author's knowledge of the ecosystem for version numbers and capability claims. To bring it up to `hf-fm`'s level of precision (specific release dates, star counts, recent activity verification, version-pin accuracy), the table cells should be cross-checked via `WebFetch` against each crate's `crates.io` / GitHub page. Phase 6's commit `cae2365` did a first round of refresh for `llmserve` / `hf-hub` references but did not re-verify every other tool's version pin.
+- **`NoUnsafe` and `BitExact` as table columns?** Currently relegated to the "quality properties" paragraph since they're properties rather than capabilities, but a "rigour" column would be a real differentiator vs e.g. unsafe-heavy framework loaders.
+- **Per-tool detail length.** Kept brief (~1–3 sentences each) for this survey; could expand each tool's section to `hf-fm`'s level (4–8 lines each with versions / star counts / reverse-dep notes) if needed for wider circulation.
+
+## Resolved scope decisions
+
+These are recorded so the survey does not loop back to them in future passes:
+
+- **Adjacent CLI tools considered and excluded:**
+  - `llmserve` ([github.com/AlexsJones/llmserve](https://github.com/AlexsJones/llmserve)) — Rust TUI launcher for existing inference engines (llama-server, KoboldCpp, LocalAI, MLX, …) plus model-file discovery across LM Studio / HuggingFace cache / arbitrary paths. Out of scope: does not parse, dequantise, or convert tensor formats — strictly discovery + launch. Different niche (find + serve) from anamnesis (parse + transform).
+  - `ollama` ([github.com/ollama/ollama](https://github.com/ollama/ollama)) — Go, covered in the "Beyond Rust" footer above.
+  - `hf-hub` ([crates.io/crates/hf-hub](https://crates.io/crates/hf-hub)) — Rust port of `huggingface_hub` for downloading + caching model files. Different layer: pre-anamnesis (you use `hf-hub` to fetch the `.safetensors` shard, then anamnesis transforms it). Complement, not competitor.
+- **Phase 7.5 forward-looking column.** Already visible through the **GGUFWrite** column whose anamnesis cell reads "scalar dtypes (Phase 7.5: quantised)". A separate planned-feature column would be redundant once Phase 7.5 lands; the deferred `FP8`/`IQ`/`TQ`/`MXFP4` encode kernels will appear in **EncBnB** generalised to a multi-family **Enc-\*** column at that point.
