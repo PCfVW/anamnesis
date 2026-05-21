@@ -64,7 +64,27 @@ path = "src/bin/amn.rs"
 required-features = ["cli"]
 
 [dev-dependencies]
+# Phase 6.5 dev-only benchmark harness. Provides statistical-rigour
+# throughput measurement (Welch t-tests, bootstrap CIs), HTML report
+# generation, and regression detection across runs. The `html_reports`
+# feature is left at its default — Criterion's reports live in
+# `target/criterion/` and are never published.
+criterion = "0.5"
 tempfile = "3"
+
+# Phase 6.5: dequantisation throughput benchmarks (decode side).
+# Will gain `benches/encode.rs` at Phase 7.5 when the encode kernels
+# land; today's deferred-split rationale lives in ROADMAP.md.
+[[bench]]
+name = "dequant"
+harness = false
+required-features = ["gptq", "awq", "bnb", "gguf"]
+
+# Phase 6.5: parser throughput benchmarks vs raw `fs::read` baseline.
+[[bench]]
+name = "parsing"
+harness = false
+required-features = ["npz", "pth", "gguf"]
 
 [lints.rust]
 # `deny` (not `forbid`) so feature-gated modules (e.g., pth with memmap2)
