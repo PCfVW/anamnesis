@@ -15,6 +15,8 @@ pub mod fp8;
 pub mod gguf;
 #[cfg(feature = "gptq")]
 pub mod gptq;
+#[cfg(feature = "npz")]
+pub mod npz;
 #[cfg(feature = "pth")]
 pub mod pth;
 #[cfg(any(feature = "gptq", feature = "awq"))]
@@ -31,5 +33,7 @@ pub use fp8::{
 pub use gguf::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
 #[cfg(feature = "gptq")]
 pub use gptq::dequantize_gptq_to_bf16;
+#[cfg(feature = "npz")]
+pub use npz::{npz_to_safetensors, npz_to_safetensors_bytes};
 #[cfg(feature = "pth")]
 pub use pth::{pth_to_safetensors, pth_to_safetensors_bytes};

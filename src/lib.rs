@@ -189,8 +189,10 @@ pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 #[cfg(feature = "bnb")]
 pub use lethe::{
-    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb4_double_quant, encode_bnb_int8,
-    encode_bnb_int8_compute_scb, FP4_CODEBOOK, NF4_CODEBOOK,
+    classify_inputs, encode_bnb4, encode_bnb4_compute_absmax, encode_bnb4_double_quant,
+    encode_bnb_int8, encode_bnb_int8_compute_scb, is_eligible_for_nf4, write_bnb_nf4_safetensors,
+    write_bnb_nf4_safetensors_bytes, BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE,
+    NF4_CODEBOOK,
 };
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "gguf")]
@@ -225,5 +227,7 @@ pub use remember::{
 };
 #[cfg(feature = "gguf")]
 pub use remember::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
+#[cfg(feature = "npz")]
+pub use remember::{npz_to_safetensors, npz_to_safetensors_bytes};
 #[cfg(feature = "pth")]
 pub use remember::{pth_to_safetensors, pth_to_safetensors_bytes};

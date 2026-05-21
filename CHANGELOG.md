@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Q*`, `IQ*`, `TQ*`, `MXFP4`) are rejected with `Unsupported`
   pending the Phase 7.5 encoders. Files round-trip byte-exactly
   through `parse_gguf`. Behind the `gguf` feature flag.
+- **`amn convert` CLI subcommand** — unified entry point that routes
+  every v0.6.0-available format pair through a single dispatch.
+  Targets: `safetensors` (alias `bf16`), `gguf` (unquantised
+  passthrough), `bnb-nf4`. Phase 6 Step 2. New conversion paths
+  unlocked: `safetensors-bf16 → bnb-nf4` (encodes 2-D weights to
+  BnB-NF4 with the four-tensor companion layout), `safetensors-bf16
+  → gguf` (writes a self-describing GGUF), `npz → safetensors` (and
+  `npz → gguf`), `pth → gguf`. Quantised GGUF targets (`gguf-q4km`,
+  …) land in Phase 7.5 via the same dispatch. Includes the new
+  library helpers `npz_to_safetensors` / `npz_to_safetensors_bytes`
+  (behind `npz`) and `write_bnb_nf4_safetensors` /
+  `write_bnb_nf4_safetensors_bytes` / `is_eligible_for_nf4` /
+  `classify_inputs` (behind `bnb`).
 
 ## [0.5.0] - 2026-05-17
 

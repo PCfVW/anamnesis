@@ -510,7 +510,9 @@ fn write_zeros(w: &mut impl Write, n: u64) -> crate::Result<()> {
         // targets when `remaining > usize::MAX` — bigger than any single
         // call should ever need; the `.min(ZEROS.len())` clamps the chunk
         // size to the stack buffer regardless.
-        let chunk = usize::try_from(remaining).unwrap_or(usize::MAX).min(ZEROS.len());
+        let chunk = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(ZEROS.len());
         // INDEX: chunk ≤ ZEROS.len() == 256 by construction above
         #[allow(clippy::indexing_slicing)]
         let slice = &ZEROS[..chunk];
