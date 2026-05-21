@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-21
+
+**Phase 6 lands — the format conversion matrix.** v0.6.0 ships a
+unified `amn convert` dispatch covering every decode-side conversion
+(any input → safetensors BF16), the BnB-NF4 encode path
+(safetensors-BF16 → BnB-NF4 safetensors via the four-tensor companion
+layout), and the format-symmetric inverse of `parse_gguf`
+(`write_gguf`, scalar dtypes today; quantised dtypes reserved for
+Phase 7.5 through the same scaffold). Measured **1.11×–6.75× faster
+than the closest Python ecosystem default** (numpy / gguf-py /
+bitsandbytes CPU) at 4096×4096 on CPU, **2.17×–8.24× faster than
+PyTorch-CPU equivalents** for the two non-PyTorch paths. 13
+byte-exact integration tests cover every v0.6.0 conversion pair both
+directions where reversible, plus a size-matched perf comparison
+against six checked-in Python sidecars.
+
 ### Added
 
 - **GGUF output writer** (`write_gguf`, `write_gguf_to_writer`,
