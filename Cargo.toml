@@ -20,7 +20,7 @@ default-run = "anamnesis"
 # `--bin` errored. Both keys now sit in `[package]` where Cargo reads
 # them.
 [package.metadata.docs.rs]
-features = ["npz", "pth", "gguf", "awq", "gptq", "bnb"]
+features = ["npz", "pth", "gguf", "awq", "gptq", "bnb", "ollama"]
 
 [features]
 default = []
@@ -31,6 +31,11 @@ bnb = []
 npz = ["dep:zip"]
 pth = ["dep:zip"]
 gguf = []
+# Ollama model-cache path resolver — turns `ollama:llama3.2:1b` into
+# the local GGUF blob path by reading the Ollama manifest. Adds NO
+# third-party dependency: uses only stdlib + `serde_json` (already a
+# runtime dep). Implies `gguf` because every Ollama blob is a GGUF.
+ollama = ["gguf"]
 indicatif = ["dep:indicatif"]
 
 [dependencies]

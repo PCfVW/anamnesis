@@ -20,6 +20,12 @@ pub mod gguf;
 #[cfg(feature = "gguf")]
 pub mod gguf_write;
 
+/// `Ollama` model-cache path resolver — turns `llama3.2:1b` into the
+/// local `GGUF` blob path. Feature-gated behind `ollama` (which implies
+/// [`gguf`] because every Ollama blob is a `GGUF`).
+#[cfg(feature = "ollama")]
+pub mod ollama;
+
 /// Shared parsing utilities (byte-swap, etc.) used by multiple format parsers.
 #[cfg(any(feature = "npz", feature = "pth"))]
 pub(crate) mod utils;
@@ -36,6 +42,8 @@ pub use npz::{
     inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor,
     NpzTensorInfo,
 };
+#[cfg(feature = "ollama")]
+pub use ollama::resolve_ollama_model;
 #[cfg(feature = "pth")]
 pub use pth::{
     inspect_pth_from_reader, parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor,

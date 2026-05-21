@@ -277,11 +277,67 @@ pub fn run() -> crate::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Parse { path } => run_parse(&path),
-        Commands::Inspect { path } => run_inspect(&path),
-        Commands::Remember { path, to, output } => run_remember(&path, &to, output.as_deref()),
-        Commands::Convert { path, to, output } => run_convert(&path, &to, output.as_deref()),
+        Commands::Parse { path } => {
+            let resolved = resolve_input_path(path)?;
+            run_parse(&resolved)
+        }
+        Commands::Inspect { path } => {
+            let resolved = resolve_input_path(path)?;
+            run_inspect(&resolved)
+        }
+        Commands::Remember { path, to, output } => {
+            let resolved = resolve_input_path(path)?;
+            run_remember(&resolved, &to, output.as_deref())
+        }
+        Commands::Convert { path, to, output } => {
+            let resolved = resolve_input_path(path)?;
+            run_convert(&resolved, &to, output.as_deref())
+        }
     }
+}
+
+/// Resolves a CLI-supplied input path, expanding the `ollama:` URL
+/// scheme to the on-disk `GGUF` blob path inside the local `Ollama`
+/// model cache.
+///
+/// Recognised forms:
+///
+/// - `ollama:<model>:<tag>` (e.g., `ollama:llama3.2:1b`) — resolves
+///   the manifest at `~/.ollama/models/manifests/registry.ollama.ai/library/<model>/<tag>`
+///   to its model-layer blob.
+/// - `ollama:<model>` — same as above with the tag defaulting to
+///   `latest`.
+/// - Any other input — returned unchanged; the existing format
+///   detection pipeline handles regular file paths.
+///
+/// # Errors
+///
+/// Returns [`crate::AnamnesisError::Unsupported`] when the input uses
+/// the `ollama:` scheme but the binary was built without the
+/// `ollama` Cargo feature.
+///
+/// Returns the [`crate::AnamnesisError`] variants documented on
+/// [`resolve_ollama_model`](crate::resolve_ollama_model) otherwise.
+#[allow(clippy::unnecessary_wraps)]
+fn resolve_input_path(raw: PathBuf) -> crate::Result<PathBuf> {
+    let s = raw.to_string_lossy();
+    if s.starts_with("ollama:") {
+        #[cfg(feature = "ollama")]
+        {
+            return crate::resolve_ollama_model(&s);
+        }
+        #[cfg(not(feature = "ollama"))]
+        {
+            return Err(crate::AnamnesisError::Unsupported {
+                format: "ollama:".into(),
+                detail: "the `ollama:` URL scheme requires the `ollama` Cargo feature; \
+                         rebuild with `cargo install anamnesis --features cli,ollama` \
+                         (or `cargo build --features cli,ollama`) to add support"
+                    .into(),
+            });
+        }
+    }
+    Ok(raw)
 }
 
 fn run_parse(path: &std::path::Path) -> crate::Result<()> {

@@ -263,6 +263,8 @@ pub use lethe::{
     NF4_CODEBOOK,
 };
 pub use model::{parse, ParsedModel, TargetDtype};
+#[cfg(feature = "ollama")]
+pub use parse::resolve_ollama_model;
 #[cfg(feature = "gguf")]
 pub use parse::{
     inspect_gguf_from_reader, parse_gguf, write_gguf, write_gguf_to_writer, GgufInspectInfo,
