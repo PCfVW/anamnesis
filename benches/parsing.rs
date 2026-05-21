@@ -18,6 +18,20 @@
 //! ```text
 //! cargo bench --features npz,pth,gguf --bench parsing
 //! ```
+//!
+//! Reports land in `target/criterion/`; HTML index at
+//! `target/criterion/report/index.html`.
+//!
+//! # Memory
+//!
+//! Each fixture builder allocates one ~8 `MiB` tensor-data buffer
+//! (`128 × 16,384 F32 elements`) inside a `tempfile::TempDir` and
+//! writes it to disk; the `TempDir` stays alive for the bench fn's
+//! scope so `criterion`'s `iter` loop can re-open the file each pass.
+//! Peak resident per bench fn is ~16 `MiB` (file + parse result),
+//! dropped when the fn returns. The `PTH` bench reuses the existing
+//! ~2 `KiB` `algzoo_rnn_small.pth` test fixture instead, peaking at
+//! ~100 `KiB`.
 
 #![allow(
     clippy::panic,
@@ -65,9 +79,11 @@ const N_TENSORS: usize = 128;
 const ELEMENTS_PER_TENSOR: usize = 4096 * 4;
 
 // ---------------------------------------------------------------------------
-// Synthetic fixture builders (each returns a PathBuf inside a TempDir
-// the test owns; the TempDir is leaked deliberately so the path stays
-// valid for the criterion bench's entire runtime).
+// Synthetic fixture builders. Each returns `(TempDir, PathBuf)` so the
+// caller can bind the `TempDir` to a local that outlives the
+// `criterion::Bencher::iter` closure. The `TempDir` is **not** leaked —
+// scope-managed: it is dropped (and its directory deleted) when the
+// bench fn returns after `group.finish()`. Idiomatic `tempfile` usage.
 // ---------------------------------------------------------------------------
 
 /// Builds a synthetic safetensors file with `N_TENSORS` `F32`

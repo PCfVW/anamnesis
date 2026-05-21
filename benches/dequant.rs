@@ -24,6 +24,16 @@
 //!
 //! Reports land in `target/criterion/`; HTML index at
 //! `target/criterion/report/index.html`.
+//!
+//! # Memory
+//!
+//! The synthetic-layer dequant benches allocate ~25 `MiB` of input
+//! (packed weights + scales + zero-points) and ~90 `MiB` of `BF16`
+//! output per iteration, with `criterion` dropping both between
+//! iterations — peak resident is dominated by one snapshot of
+//! `(input + output)` ≈ 115 `MiB`. The `Ollama`-fixture bench peaks
+//! at ~200 `KiB` (the slice is 65 536 elements). Comfortable on any
+//! machine with > 256 `MiB` free RAM.
 
 #![allow(
     clippy::panic,
@@ -278,6 +288,10 @@ fn bench_bnb_nf4(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_bnb_int8(c: &mut Criterion) {
+    // BnB INT8 stores its weight as `[out_features, in_features]` — the
+    // opposite of the FFN-gate ordering used by GPTQ/AWQ/Q4_K above.
+    // Bench label below uses the same `<out>x<in>` form so the criterion
+    // report's shape annotation matches the on-disk byte layout.
     let out_features: usize = LAYER_COLS;
     let in_features: usize = LAYER_ROWS;
     // INT8 weight: out_features * in_features int8 bytes.
