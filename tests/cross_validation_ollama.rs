@@ -176,14 +176,14 @@ fn run_cross_validation(name: &str, data: &[u8], dtype: GgufType, max_ulp: u16) 
     );
 
     let (mismatches, max_diff) = compare_bf16(&actual, &fixture.expected_bf16, max_ulp);
-    let elapsed_us = elapsed.as_micros();
     eprintln!(
-        "{name}: {total} elements, anamnesis dequant = {elapsed_us} \u{00B5}s, \
-         mismatches = {mismatches}, max ULP diff = {max_diff}"
+        "{name}: {total} elements, {mismatches} mismatches, \
+         max ULP diff = {max_diff}, anamnesis = {:.1} \u{b5}s",
+        elapsed.as_secs_f64() * 1e6
     );
     assert_eq!(
         mismatches, 0,
-        "{name}: {mismatches} mismatched elements above {max_ulp} ULP threshold"
+        "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
     );
 }
 

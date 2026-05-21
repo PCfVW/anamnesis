@@ -166,7 +166,6 @@ fn ollama_models_root() -> PathBuf {
             return PathBuf::from(explicit);
         }
     }
-    #[allow(deprecated)]
     if let Some(home) = std::env::home_dir() {
         return home.join(".ollama").join("models");
     }
