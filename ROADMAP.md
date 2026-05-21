@@ -507,9 +507,9 @@ The same `# Source context` block (with format name swapped) should appear on `i
 
 **Runtime benchmarks (`benches/`):**
 
-- [ ] Dequantization throughput — one benchmark per kernel family (FP8, GPTQ 4-bit, AWQ 4-bit, BnB NF4, BnB INT8, GGUF Q4_K), reporting elements/sec on synthetic tensors sized like real model layers (e.g., 4096x11008) — **commit**
-- [ ] Dequantization throughput on the Ollama fixture — the kernel the cached Ollama blob exercises (Q8_0 for `llama3.2:1b`), reported alongside the synthetic baseline so the README can claim "validated and benchmarked on a real Ollama-distributed model" — **commit**
-- [ ] Parsing throughput — safetensors, NPZ, PTH, GGUF header parsing, reporting MB/s against raw `fs::read` baseline — **commit**
+- [x] Dequantization throughput — 7 synthetic-fixture bench groups in `benches/dequant.rs` (FP8 per-tensor + fine-grained, GPTQ INT4 g128, AWQ INT4 g128, BnB NF4 b64, BnB INT8, GGUF Q4_K), all on a transformer-layer-sized 4096×11008 fixture, reported as Gelem/s. Quick-sanity range on the dev machine: **657 Melem/s → 2.01 Gelem/s** — **commit `3c216fa`**
+- [x] Dequantization throughput on the Ollama fixture — bench group `dequant_gguf_q8_0_ollama` in `benches/dequant.rs` runs on the **same** 65,536-element Q8_0 slice the [`cross_validation_ollama`](tests/cross_validation_ollama.rs) suite validates byte-exactly against the `gguf-py` reference. Throughput number paired with a correctness guarantee on real Ollama distribution data: **3.92 Gelem/s** on the dev machine — **commit `3c216fa`**
+- [x] Parsing throughput — `benches/parsing.rs` with five bench groups: an `fs::read` baseline plus header-only parses for safetensors, NPZ, PTH (AlgZoo fixture), GGUF. Baseline + each parser report `Throughput::Bytes(fixture_size)` so the README can frame each parser as a multiplier over raw I/O. Dev-machine sanity: `fs::read` 4.30 GiB/s, `parse_safetensors_header` 193 µs, `inspect_npz` 1.56 ms, `inspect_pth` 167 µs, `inspect_gguf` 98 µs — **commit `a163327`**
 
 **Peak-memory validation (`tests/`):**
 
