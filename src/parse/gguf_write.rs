@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `GGUF` file writer — the format-symmetric inverse of [`parse_gguf`].
+//! `GGUF` file writer — the format-symmetric inverse of `parse_gguf`.
 //!
 //! Phase 6 ships only the unquantised passthrough scaffold: scalar dtypes
 //! (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`) round-trip through this writer
 //! byte-exactly. Quantised dtypes (`Q*`, `IQ*`, `TQ*`, `MXFP4`) are rejected
-//! with [`AnamnesisError::Unsupported`] — emitting those blocks requires the
+//! with `AnamnesisError::Unsupported` — emitting those blocks requires the
 //! encode kernels landing in Phase 7.5.
 //!
 //! # Spec reference
 //!
-//! Mirrors the parser at [`parse_gguf`](super::gguf::parse_gguf): the on-disk
-//! layout is header (24 B) + metadata `KV` table + tensor-info table + aligned
-//! tensor data. Every per-tensor offset is a multiple of `general.alignment`
-//! (default 32 B), and the alignment value itself is always written as
+//! Mirrors the parser `parse_gguf`: the on-disk layout is header (24 B) +
+//! metadata `KV` table + tensor-info table + aligned tensor data. Every
+//! per-tensor offset is a multiple of `general.alignment` (default 32 B),
+//! and the alignment value itself is always written as
 //! `general.alignment = U32(...)` so the produced file is fully
 //! self-describing.
 //!
@@ -21,11 +21,9 @@
 //!
 //! Metadata keys are serialised in lexicographic order so writing the same
 //! `(metadata, tensors)` pair yields the same bytes on every run, regardless
-//! of the calling [`HashMap`]'s iteration order. This is required by the
+//! of the calling `HashMap`'s iteration order. This is required by the
 //! cross-format round-trip tests in `tests/cross_validation_convert.rs`,
 //! which assert byte-exact `GGUF → safetensors → GGUF` cycles.
-//!
-//! [`parse_gguf`]: super::gguf::parse_gguf
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;

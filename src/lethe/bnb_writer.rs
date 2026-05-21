@@ -4,11 +4,10 @@
 //! `BF16 → BnB-NF4 safetensors file` path.
 //!
 //! Phase 5 shipped the low-level
-//! [`encode_bnb4_compute_absmax`](super::bnb::encode_bnb4_compute_absmax)
-//! kernel: takes a `BF16` slice, returns packed nibbles + per-block
-//! absmax. This module wraps that kernel into the on-disk safetensors
-//! companion-tensor layout that `bitsandbytes` and the
-//! [`remember::bnb`](crate::remember::bnb) decode path expect.
+//! [`encode_bnb4_compute_absmax`] kernel: takes a `BF16` slice, returns
+//! packed nibbles + per-block absmax. This module wraps that kernel into
+//! the on-disk safetensors companion-tensor layout that `bitsandbytes`
+//! and the [`remember::bnb`](crate::remember::bnb) decode path expect.
 //!
 //! For each eligible source tensor the writer emits **four** tensors:
 //!
@@ -81,15 +80,22 @@ fn codebook_bytes() -> Vec<u8> {
 /// reads.
 fn quant_state_json_bytes(shape: &[usize]) -> Vec<u8> {
     // We hand-build the JSON to keep the field order stable and avoid
-    // pulling in serde_json::to_string allocations for a fixed-shape blob.
+    // pulling in `serde_json::to_string` allocations for a fixed-shape
+    // blob. `blocksize` is sourced from [`NF4_BLOCK_SIZE`] so that any
+    // future change to the default block size flows through to the
+    // emitted `quant_state` blob.
     let mut s = String::new();
-    s.push_str(r#"{"quant_type":"nf4","blocksize":64,"shape":["#);
+    let _ = write!(
+        &mut s,
+        r#"{{"quant_type":"nf4","blocksize":{NF4_BLOCK_SIZE},"shape":["#
+    );
     for (i, dim) in shape.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        // `write!` on a `String` never fails — `usize`'s `Display` impl is
-        // infallible and `String`'s `fmt::Write` impl never returns `Err`.
+        // `write!` on a `String` never fails — `usize`'s `Display` impl
+        // is infallible and `String`'s `fmt::Write` impl never returns
+        // `Err`.
         let _ = write!(&mut s, "{dim}");
     }
     s.push_str(r#"],"nested":false}"#);
