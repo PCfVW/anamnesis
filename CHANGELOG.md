@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **GGUF output writer** (`write_gguf`, `write_gguf_to_writer`,
+  `GgufWriteTensor`) — the format-symmetric inverse of `parse_gguf`.
+  Phase 6 Step 1: emits scalar dtypes (`F32`, `F16`, `BF16`, `F64`,
+  `I8`–`I64`) plus the full metadata KV table; quantised dtypes
+  (`Q*`, `IQ*`, `TQ*`, `MXFP4`) are rejected with `Unsupported`
+  pending the Phase 7.5 encoders. Files round-trip byte-exactly
+  through `parse_gguf`. Behind the `gguf` feature flag.
+
 ## [0.5.0] - 2026-05-17
 
 **Lethe lands.** Phase 5 ships the encode-side inverse of `remember`:

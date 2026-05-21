@@ -195,8 +195,9 @@ pub use lethe::{
 pub use model::{parse, ParsedModel, TargetDtype};
 #[cfg(feature = "gguf")]
 pub use parse::{
-    inspect_gguf_from_reader, parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue,
-    GgufTensor, GgufTensorInfo, GgufType, ParsedGguf,
+    inspect_gguf_from_reader, parse_gguf, write_gguf, write_gguf_to_writer, GgufInspectInfo,
+    GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType, GgufWriteTensor,
+    ParsedGguf,
 };
 #[cfg(feature = "npz")]
 pub use parse::{

@@ -15,6 +15,11 @@ pub mod pth;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 
+/// `GGUF` file writing — the format-symmetric inverse of [`gguf`]. Scalar
+/// dtype passthrough only in Phase 6; quantised emit lands in Phase 7.5.
+#[cfg(feature = "gguf")]
+pub mod gguf_write;
+
 /// Shared parsing utilities (byte-swap, etc.) used by multiple format parsers.
 #[cfg(any(feature = "npz", feature = "pth"))]
 pub(crate) mod utils;
@@ -24,6 +29,8 @@ pub use gguf::{
     inspect_gguf_from_reader, parse_gguf, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue,
     GgufTensor, GgufTensorInfo, GgufType, ParsedGguf,
 };
+#[cfg(feature = "gguf")]
+pub use gguf_write::{write_gguf, write_gguf_to_writer, GgufWriteTensor};
 #[cfg(feature = "npz")]
 pub use npz::{
     inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor,

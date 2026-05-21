@@ -2157,7 +2157,11 @@ const fn metadata_type_name(value: &GgufMetadataValue) -> &'static str {
 ///
 /// `alignment` must be non-zero; the caller guarantees this by substituting
 /// `DEFAULT_ALIGNMENT` whenever the metadata key is absent or zero.
-fn align_up(offset: u64, alignment: u64) -> crate::Result<u64> {
+///
+/// `pub(crate)` so the sibling [`gguf_write`](super::gguf_write) module can
+/// reuse the same alignment helper the parser uses — keeping the read and
+/// write paths in lock-step on padding behaviour.
+pub(crate) fn align_up(offset: u64, alignment: u64) -> crate::Result<u64> {
     if alignment == 0 {
         return Err(AnamnesisError::Parse {
             reason: "GGUF: general.alignment must be non-zero".into(),
