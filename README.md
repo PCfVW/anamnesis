@@ -144,6 +144,25 @@ The inverse direction. Phase 5 ships the `lethe` namespace alongside `remember`:
 
 > **On the "slower than PyTorch" column:** The encode kernels are 4–6× slower than PyTorch's broadcast-vectorised quantize on `BnB4`, 32× slower on `INT8`. This is expected — PyTorch encode uses a single broadcast tensor op (`(blocks.unsqueeze(-1) - codebook).abs().argmin(dim=-1)`) that vectorises across the whole tensor; the Rust encode loop is currently scalar per element. **Phase 9 (CPU SIMD pass) is the natural target** — this table makes the gap visible. The same loop-fission + `target-cpu=native` infrastructure that gave the decode path its 18–54× wins is the candidate retrofit on the encode side.
 
+### Format Conversion Pipeline (Phase 6, v0.6.0)
+
+`amn convert <input> --to <target>` routes any v0.6.0-available format pair through a single dispatch. Targets at v0.6.0: `safetensors` (alias `bf16`), `gguf` (unquantised passthrough), `bnb-nf4`. Quantised GGUF targets (`gguf-q4km`, …) land in Phase 7.5 through the same dispatch.
+
+End-to-end runtime, **release build, `target-cpu=native`, single 4096×4096 tensor (32 MiB BF16 or 64 MiB F32) on CPU**, vs the closest Python equivalents (best-of-5 median, PyTorch 2.10.0 with the CPU device, NumPy 2.4, safetensors-py 0.7, gguf-py 0.18, bitsandbytes 0.49.1's CPU kernel):
+
+| Conversion | anamnesis | Python ecosystem default | PyTorch-CPU equivalent |
+|---|---:|---:|---:|
+| `npz → safetensors` | **11.2 ms** | 75.7 ms (numpy + safetensors-py) — **6.75× faster** | 92.5 ms (torch.from_numpy + safetensors.torch) — **8.24× faster** |
+| `pth → safetensors` | **5.7 ms** | — | 29.6 ms (torch.load + safetensors.torch) — **5.18× faster** |
+| `safetensors-BF16 → GGUF` | **13.6 ms** | 15.1 ms (gguf-py) — **1.11× faster** | 29.6 ms (safetensors.torch.load + gguf-py) — **2.17× faster** |
+| `safetensors-BF16 → BnB-NF4` | **141 ms** | 376.8 ms (bitsandbytes CPU) — **2.67× faster** | — *(bitsandbytes is the PyTorch-native path)* |
+
+> **What "PyTorch-CPU equivalent" means here:** the two non-PyTorch baselines (NPZ via NumPy, GGUF via gguf-py) get a second row that routes the data through `torch.from_numpy` / `safetensors.torch.load_file` before the writer step — the way Python practitioners typically pipeline these formats when they already work in PyTorch tensors. The PyTorch row is consistently 1.2–1.6× slower than the ecosystem default because the extra `torch.from_numpy` / `tensor.numpy()` hop is non-zero work, not because PyTorch is inefficient. We report both so the table is honest about Python's choice space, not just the fastest available Python path.
+
+> **Methodology:** Each row's number is the median of 5 release-mode runs at the same 4096×4096 shape both sides agree on, captured in the `tests/fixtures/convert_reference/*.timing.json` sidecars and re-validated by `t14_perf_vs_python_size_matched` in [`tests/cross_validation_convert.rs`](tests/cross_validation_convert.rs). Run `cargo test --release --all-features --test cross_validation_convert -- --ignored --nocapture t14` to reproduce on your own machine, and re-generate the sidecars via `tests/fixtures/convert_reference/generate_convert_timings.py`. The 13 byte-exact round-trip tests in the same file (default, not `--ignored`) exercise every conversion pair at small synthetic fixtures so the correctness suite stays fast.
+
+> **Limitations:** The single-tensor `O(input size)` shape of the perf measurement applies only to the convert primitive itself, not to whole-model conversion. Multi-shard models retain every dequantised tensor in heap until `safetensors::serialize_to_file` returns — same constraint as `ParsedModel::remember`, see the GGUF block-quant note below. Phase 10 (streaming output) is the planned remedy.
+
 ### GGUF Block-Quant Dequantization
 
 Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on **22 block-quant kernels** from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct) plus 3 synthetic fixtures (`TQ1_0` / `TQ2_0` / `MXFP4` — only ~15 BitNet-derivative GGUFs ship the `TQ*` types on HuggingFace, and mainstream `MXFP4` only ships inside the 11 GB `gpt-oss-20b` upload, so a deterministic random tensor is the practical fixture source). Bit-exact output (0 ULP difference). **All 22 of 22 GGUF block types now supported** — Phase 4.5 closed in step 6 (MXFP4). Feature-gated behind `gguf`.
