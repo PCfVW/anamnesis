@@ -487,9 +487,9 @@ The same `# Source context` block (with format name swapped) should appear on `i
 | safetensors BF16 | GGUF Q4_K_M | Quantize for local inference | **v0.7.5** (Phase 7.5) |
 | safetensors BF16 | GGUF IQ4_XS | Compact "small but accurate" GGUF for local inference | **v0.7.5** (Phase 7.5) |
 
-- [ ] GGUF output writer (header + tensor info + F32 / BF16 passthrough emit) — full quantized-block emit (K-quant / IQ / TQ / MXFP4) unlocks once Phase 7.5 encoders land and plug into the same writer scaffold — **commit**
-- [ ] `amn convert` CLI subcommand — `amn convert model.gguf --to safetensors -o model.safetensors` (and `--to bnb-nf4` from v0.6.0); `--to gguf-q4km` and other quantized targets light up at v0.7.5 via the same dispatch — **commit**
-- [ ] Cross-format round-trip validation — convert through every v0.6.0-available pair, then back, measure distortion — **commit** — **PUSH**
+- [x] GGUF output writer (header + tensor info + F32 / BF16 passthrough emit) — full quantized-block emit (K-quant / IQ / TQ / MXFP4) unlocks once Phase 7.5 encoders land and plug into the same writer scaffold — **commit `6768ee0`**
+- [x] `amn convert` CLI subcommand — `amn convert model.gguf --to safetensors -o model.safetensors` (and `--to bnb-nf4` from v0.6.0); `--to gguf-q4km` and other quantized targets light up at v0.7.5 via the same dispatch — **commit `f5cdee2`**
+- [x] Cross-format round-trip validation — 13 byte-exact integration tests in `tests/cross_validation_convert.rs` covering every v0.6.0-available format pair, both directions where reversible (NPZ→ST, PTH→ST, ST-BF16↔GGUF byte-exact loop, BnB-NF4 byte-exact vs Python `bitsandbytes` fixture, BnB-NF4 idempotency, multi-hop NPZ→ST→GGUF, mixed-dtype, multi-dim 1-D/3-D/4-D, non-default alignment, empty-GGUF). Plus a size-matched `t14_perf_vs_python_size_matched` (`#[ignore]`d) that reports rust µs against six checked-in Python sidecars (numpy / gguf-py / bitsandbytes / torch.load + safetensors.torch, plus PyTorch-CPU equivalents for the two non-PyTorch paths) at the same 4096×4096 shape — commits `eb030a9` + `2897344` + `d00435b` + `895e4bc`.
 
 **Deliverable:** `anamnesis` v0.6.0 — the convert primitive plus every decode-side conversion (any input → safetensors BF16) and the BnB encode path (any input → BnB safetensors). No Rust or Python tool offers this convert primitive today. The remaining encode-side rows complete in Phase 7.5. — **PUSH + tag `v0.6.0`**
 

@@ -45,6 +45,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `generate_convert_timings.py`) when one is available — silently
   skips the comparison line when not, so the suite has no Python
   runtime dependency.
+- **Size-matched performance comparison vs Python (CPU)** —
+  `t14_perf_vs_python_size_matched` in
+  `tests/cross_validation_convert.rs` (gated `#[ignore]`, opt-in via
+  `--ignored`) runs each forward conversion on the same 4096×4096
+  shape the Python sidecar generator uses (~32 MiB BF16 / 64 MiB F32),
+  so elapsed times compare apples-to-apples. Six Python sidecars
+  checked in (four ecosystem-default: numpy + safetensors-py,
+  torch.load + safetensors.torch, gguf-py, bitsandbytes CPU; plus two
+  PyTorch-CPU equivalents for the non-PyTorch paths:
+  `npz_to_st_torch`, `st_to_gguf_torch`). Headline ratios at CPU,
+  release build, `target-cpu=native`: `npz → safetensors` 6.75× vs
+  numpy / 8.24× vs torch; `pth → safetensors` 5.18× vs torch;
+  `safetensors-BF16 → GGUF` 1.11× vs gguf-py / 2.17× vs torch+gguf-py;
+  `safetensors-BF16 → BnB-NF4` 2.67× vs bitsandbytes CPU. Full table
+  in `README.md` under "Format Conversion Pipeline (Phase 6, v0.6.0)".
 
 ## [0.5.0] - 2026-05-17
 
