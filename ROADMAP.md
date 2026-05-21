@@ -495,13 +495,20 @@ The same `# Source context` block (with format name swapped) should appear on `i
 
 ### Phase 6.5: Benchmarking & Performance Validation
 
-**Goal:** Establish reproducible performance baselines before the Python bindings expose anamnesis to a much larger audience. Benchmark every dequantization kernel (throughput) and validate memory efficiency claims (peak heap). All benchmarking infrastructure is dev-only — zero impact on the published crate.
+**Goal:** Establish reproducible performance baselines before the Python bindings expose anamnesis to a much larger audience. Benchmark every dequantization kernel (throughput), validate memory efficiency claims (peak heap), and cross-validate against the dominant real-world GGUF distribution channel (Ollama) — not just bartowski/TheBloke quantisations. All benchmarking and validation infrastructure is dev-only — zero impact on the published crate.
 
-**Approach:** Use [criterion](https://github.com/bheisler/criterion.rs) for runtime throughput benchmarks (statistical rigor, regression detection, baselines). Use [dhat-rs](https://github.com/nnethercote/dhat-rs) for peak-heap assertions in integration tests. Both are `[dev-dependencies]` only — bench code in `benches/`, memory tests in `tests/`.
+**Approach:** Use [criterion](https://github.com/bheisler/criterion.rs) for runtime throughput benchmarks (statistical rigor, regression detection, baselines). Use [dhat-rs](https://github.com/nnethercote/dhat-rs) for peak-heap assertions in integration tests. Both are `[dev-dependencies]` only — bench code in `benches/`, memory tests in `tests/`. Ollama-pulled GGUF blobs become shared real-world fixtures consumed by both the criterion benches (one extra row alongside the synthetic 4096×11008 fixtures) and a new `tests/cross_validation_ollama.rs` cross-validation suite — same fixture serves double duty.
+
+**Real-world cross-validation (`tests/`) — Ollama track (begin here):** The dequant correctness claim has been validated against `gguf-py` reference on bartowski/TheBloke fixtures; extending the validation to a real Ollama-distributed blob proves it on the dominant local-LLM distribution channel. Ollama stays a test-time external tool (invoked via `Command::new` / pre-cached blobs); anamnesis itself takes on no Go dependency.
+
+- [ ] Pull a small Ollama model into `tests/fixtures/ollama_reference/` — candidate fixtures: `qwen2.5:0.5b` (~400 MB), `tinyllama` (~640 MB). Cache the resolved GGUF blob from `~/.ollama/models/blobs/sha256-<hash>` so CI does not depend on `ollama pull` being available at test time. Add a `generate_ollama_fixture.py` (or shell script) refresh tool alongside the blob, same pattern as `tests/fixtures/convert_reference/generate_convert_timings.py`. The fixture is large enough that `Cargo.toml`'s `include`/`exclude` rules must skip it from the published tarball (the existing `bnb_reference` / `gguf_reference` fixtures already establish that pattern) — **commit**
+- [ ] `cross_validation_ollama.rs` — cross-validate dequant byte-exact against `gguf-py` reference on the Ollama-pulled blob, mirroring `cross_validation_gguf.rs`'s shape. Validates that anamnesis correctly consumes real-world Ollama distribution channels, not just bartowski/TheBloke quantisations — **commit**
+- [ ] `resolve_ollama_model(name)` helper behind a new `ollama` feature flag — reads `~/.ollama/models/manifests/registry.ollama.ai/library/<name>/<tag>` JSON, follows the `application/vnd.ollama.image.model` layer's `digest` to `~/.ollama/models/blobs/sha256-<hash>`, returns the `PathBuf`. Wire into `detect_format` so `amn inspect ollama:qwen2.5:0.5b` works without manual blob-hash lookup. Pure path resolution, no network, no Go interop — **commit**
 
 **Runtime benchmarks (`benches/`):**
 
 - [ ] Dequantization throughput — one benchmark per kernel family (FP8, GPTQ 4-bit, AWQ 4-bit, BnB NF4, BnB INT8, GGUF Q4_K), reporting elements/sec on synthetic tensors sized like real model layers (e.g., 4096x11008) — **commit**
+- [ ] Dequantization throughput on the Ollama fixture — same kernel family the cached Ollama blob exercises (typically `Q4_K_M` for `qwen2.5:0.5b`), reported alongside the synthetic baseline so the README can claim "validated and benchmarked on a real Ollama-distributed model" — **commit**
 - [ ] Parsing throughput — safetensors, NPZ, PTH, GGUF header parsing, reporting MB/s against raw `fs::read` baseline — **commit**
 
 **Peak-memory validation (`tests/`):**
@@ -509,9 +516,14 @@ The same `# Source context` block (with format name swapped) should appear on `i
 - [ ] Peak-heap assertions for GPTQ/AWQ dequantization — verify lazy precomputation keeps peak heap within `output_size + O(out_features)`, not `output_size + O(num_groups × out_features)` — **commit**
 - [ ] Peak-heap assertions for BnB double-quant — verify no intermediate byte-serialization allocation — **commit** — **PUSH**
 
-**New dev-dependencies:** `criterion` (runtime), `dhat` (peak heap). Not compiled into the published crate.
+**New dev-dependencies:** `criterion` (runtime), `dhat` (peak heap). Not compiled into the published crate. `ollama` feature flag (for the path-resolution helper) is library-side and adds no third-party dependency — pure stdlib + `serde_json` (already a runtime dep).
 
-**Deliverable:** Baselines recorded, CI can detect regressions, performance claims in README are backed by reproducible numbers. No version bump — this is infrastructure, not a user-facing release.
+**Out of scope (deferred or never):**
+
+- **Making `amn convert --to gguf` produce inference-loadable Ollama models.** Requires Llama-architecture-specific KV metadata (`llama.context_length`, `llama.embedding_length`, the 32K-string `tokenizer.ggml.tokens` array, …). That is a model-packaging layer, not a tensor-format-conversion layer; it belongs in a downstream crate, not anamnesis.
+- **Ollama as a perf comparison column in the README.** `ollama create` is the full conversion pipeline (Go converter + llama.cpp quantize); it does not expose a "just the convert math" timer. Any timing comparison would mostly measure orchestration overhead, not the work anamnesis does. The cross-validation suite proves correctness; the synthetic-fixture criterion benches plus the Ollama-fixture criterion bench prove throughput.
+
+**Deliverable:** Baselines recorded, CI can detect regressions, performance claims in README are backed by reproducible numbers, dequant correctness validated against a real Ollama-distributed model. No version bump — this is infrastructure, not a user-facing release.
 
 ### Phase 7: Python Bindings (PyO3)
 
