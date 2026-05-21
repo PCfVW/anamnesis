@@ -1,14 +1,14 @@
 # Rust Ecosystem Comparison
 
-**Date surveyed:** 2026-05-17
-**anamnesis version at survey:** v0.4.6 + Phase 5 step 1a/1b/1c (commits `a5c452d` / `24cba42` / `ab4e735`, pending `v0.5.0` tag)
+**Date surveyed:** 2026-05-21
+**anamnesis version at survey:** v0.5.0 + Phase 6 complete (commits `6768ee0` / `f5cdee2` / `eb030a9` / `2897344` / `d00435b` / `895e4bc` / `25c492b` / `ddf7968`, pending `v0.6.0` tag)
 **Scope:** Rust crates and binaries only. Python tooling (`bitsandbytes`, `autogptq`, `autoawq`, `GPTQModel`, `llama.cpp quantize`, `safetensors` Python bindings) is out of scope by design — this matrix exists to help downstream Rust consumers (`candle`, `mistral.rs`, `burn`, `candle-mi`, plus any new HF-quantised-model loader) evaluate whether `anamnesis` covers what they need vs the alternatives in their own ecosystem.
 
 ---
 
 ## What anamnesis does (the comparison reference)
 
-`anamnesis` is a Rust library AND CLI binary for **parse-first tensor format work**: parse any HuggingFace-ecosystem tensor archive, inspect metadata without materialising weights, dequantise to `BF16` for downstream consumption, and (Phase 5+) encode `BF16` back into compact quantised formats. Framework-agnostic by design — produces raw bytes, not bound to a specific tensor library's types. The 14 capability areas used as comparison axes:
+`anamnesis` is a Rust library AND CLI binary for **parse-first tensor format work**: parse any HuggingFace-ecosystem tensor archive, inspect metadata without materialising weights, dequantise to `BF16` for downstream consumption, encode `BF16` back into compact quantised formats (Phase 5+), and dispatch any v0.6.0-available format pair through a single `convert` primitive (Phase 6). Framework-agnostic by design — produces raw bytes, not bound to a specific tensor library's types. The 15 capability areas used as comparison axes:
 
 | # | Header | Capability |
 |---|---|---|
@@ -23,9 +23,10 @@
 | 9 | **DQ-BnB** | `BitsAndBytes` `NF4`/`FP4`/`INT8` dequant including double-quant; 18–54× vs PyTorch CPU for 4-bit |
 | 10 | **DQ-GGUF** | `GGUF` dequant: legacy block (`Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_0`/`Q8_1`), K-quants (`Q2_K`–`Q8_K`), `IQ` family (`IQ1_S`/`IQ1_M`/`IQ2_*`/`IQ3_*`/`IQ4_NL`/`IQ4_XS`), `TQ1_0`/`TQ2_0`, `MXFP4` |
 | 11 | **EncBnB** | `BitsAndBytes` **encode** — `NF4`/`FP4`/`INT8` plain **and** double-quant, plus sign-of-zero preservation rule; shipped in Phase 5 commits `a5c452d` / `24cba42` / `ab4e735` |
-| 12 | **Convert** | lossless format conversion — `.pth` → `.safetensors` (one-shot CLI subcommand) |
-| 13 | **Lib** | embeddable Rust library API |
-| 14 | **CLI** | CLI binary (`anamnesis` + alias `amn`) |
+| 12 | **GGUFWrite** | `.gguf` **writing** — the format-symmetric inverse of `parse_gguf`: emits 24-byte header + metadata KV table + tensor-info table + aligned tensor data. Scalar dtypes only (`F32`/`F16`/`BF16`/`F64`/`I8`–`I64`); quantised emit (`Q*`/`IQ*`/`TQ*`/`MXFP4`) reserved for Phase 7.5 through the same writer scaffold. Phase 6, commit `6768ee0` |
+| 13 | **Convert** | multi-format conversion dispatch via `amn convert <input> --to <target>` — v0.6.0 targets: `safetensors` (alias `bf16`), `gguf` (unquantised passthrough), `bnb-nf4`. Routes every v0.6.0-available input × target pair through a single CLI subcommand; combinations outside the matrix return clear `Unsupported` rather than silent fall-through. Measured **1.11×–6.75× faster than the closest Python ecosystem default** (numpy / gguf-py / bitsandbytes CPU) at 4096×4096, release, CPU; **2.17×–8.24× faster than PyTorch-CPU equivalents** for the two non-PyTorch paths. Phase 6, commit `f5cdee2` |
+| 14 | **Lib** | embeddable Rust library API |
+| 15 | **CLI** | CLI binary (`anamnesis` + alias `amn`) |
 
 Quality properties shared across every kernel (not table columns — would otherwise mark all-✓ for anamnesis trivially): **bit-exact** (0 ULP) validation against PyTorch reference on real model fixtures; `#![deny(unsafe_code)]` at the crate root with a documented, tightly-scoped opt-in for `memmap2::Mmap::map` only.
 
@@ -35,7 +36,7 @@ Quality properties shared across every kernel (not table columns — would other
 
 ### A. Direct competitors (multi-family Rust dequantisation libraries)
 
-**None known.** No other Rust crate exposes dequantisation across multiple families (`FP8` + `GPTQ` + `AWQ` + `BnB` + `GGUF`) as a standalone primitive. Dequant in the current Rust ecosystem lives **inside** inference frameworks (see category C), tightly coupled to those frameworks' tensor types and loading paths. `anamnesis` is the first crate to make dequant a framework-agnostic library that produces raw `BF16` bytes any downstream tensor system can consume. Phase 5 extends this to the encode side: **no other Rust crate ships `BnB` encode kernels at all** — quantisation in Rust today means "call `bitsandbytes` from Python via PyO3" or "use `mistral.rs quantize` and accept its custom UQFF format".
+**None known.** No other Rust crate exposes dequantisation across multiple families (`FP8` + `GPTQ` + `AWQ` + `BnB` + `GGUF`) as a standalone primitive. Dequant in the current Rust ecosystem lives **inside** inference frameworks (see category C), tightly coupled to those frameworks' tensor types and loading paths. `anamnesis` is the first crate to make dequant a framework-agnostic library that produces raw `BF16` bytes any downstream tensor system can consume. Phase 5 extends this to the encode side: **no other Rust crate ships `BnB` encode kernels at all** — quantisation in Rust today means "call `bitsandbytes` from Python via PyO3" or "use `mistral.rs quantize` and accept its custom UQFF format". Phase 6 extends further to **standalone GGUF writing** (scalar dtypes today, quantised types at Phase 7.5 through the same scaffold) and a **multi-format convert dispatch** — `amn convert any.safetensors --to bnb-nf4` / `amn convert weights.npz --to gguf` / `amn convert model.pth --to gguf` are one-CLI-call conversions with no analog elsewhere in Rust. The only adjacent Rust convert primitive, `apr-cli convert --quantize q4_k`, is lossy by construction (it cannot pass through `BF16` unchanged) and is tightly bound to the GGUF target.
 
 ### B. Tensor format parsers / inspectors (single-format or narrow scope)
 
@@ -100,22 +101,22 @@ Rust bindings for `libtorch`. Loads `.pth` natively because it ships the full Py
 
 Cells: ✓ = present · ◐ = partial / framework-coupled / narrow · — = absent.
 
-| Tool | STParse | NPZParse | PTHParse | GGUFParse | Inspect | DQ-FP8 | DQ-GPTQ | DQ-AWQ | DQ-BnB | DQ-GGUF | EncBnB | Convert | Lib | CLI |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **anamnesis v0.5.0** *(reference)* | ✓ path + reader | ✓ | ✓ pickle-VM | ✓ | ✓ all 4 fmts | ✓ E4M3 3 modes | ✓ INT4/INT8 + g_idx | ✓ INT4 | ✓ NF4/FP4/INT8 + DQ | ✓ block/K/IQ/TQ/MXFP4 | ✓ NF4/FP4/INT8 + DQ | ✓ .pth→.safetensors | ✓ | ✓ `anamnesis`/`amn` |
-| safetensors 0.7.x | ✓ lib only | — | — | — | — no CLI | — | — | — | — | — | — | — | ✓ | — |
-| safetensors_explorer 0.2.0 | ◐ inspect TUI | — | — | ◐ inspect TUI | ✓ ST + GGUF metadata | — | — | — | — | — | — | — | — bin only | ✓ TUI |
-| safetensors-cli 0.1.0 | ◐ minimal | — | — | — | ◐ minimal local | — | — | — | — | — | — | — | — | ✓ |
-| gguf-rs 0.2.5 | — | — | — | ✓ | ◐ GGUF only | — | — | — | — | — | — | — | ✓ | ✓ `gguf-cli` |
-| inspector-gguf 0.3.1 | — | — | — | ✓ | ◐ GGUF only, GUI+CLI | — | — | — | — | — | — | — | ✓ | ✓ |
-| npyz | — | ✓ slower 1× | — | — | ◐ NPY metadata | — | — | — | — | — | — | — | ✓ | — |
-| ndarray-npy | — | ◐ `ndarray`-bound | — | — | — | — | — | — | — | — | — | — | ✓ | — |
-| serde-pickle | — | — | ◐ generic pickle, no `.pth` opcode allowlist or zero-copy tensor extraction | — | — | — | — | — | — | — | — | — | ✓ | — |
-| candle 0.x | ✓ via `candle-core` | — | ◐ via `tch` bridge | ✓ via `candle-quantized` | ◐ in-code only | — | ◐ model-specific glue | ◐ model-specific glue | ◐ model-specific glue | ◐ Q\*\_\* + K-quants | — | — | ✓ framework | — no central CLI |
-| mistral.rs 0.8.x | ✓ for inference | — | — | ✓ for inference | ◐ via `doctor` | — | ◐ for inference, tensor-coupled | ◐ for inference, tensor-coupled | ◐ for inference, tensor-coupled | ◐ for inference, tensor-coupled | ◐ UQFF only, not BnB | ◐ UQFF target | ✓ | ✓ `mistralrs` |
-| burn | ◐ via importer | — | ◐ via importer | — | — | — | — | — | — | — | — | — | ✓ framework | — |
-| apr-cli 0.33.0 | ✓ read for inference | — | — | ✓ read + write | ◐ APR-centric | — | — | — | — | — | — bound to GGUF Q4\_K | ◐ ST→GGUF Q4\_K (lossy) | — bin only | ✓ |
-| tch | — | — | ✓ via `libtorch` | — | — | — | — | — | — | — | — | — | ✓ | — |
+| Tool | STParse | NPZParse | PTHParse | GGUFParse | Inspect | DQ-FP8 | DQ-GPTQ | DQ-AWQ | DQ-BnB | DQ-GGUF | EncBnB | GGUFWrite | Convert | Lib | CLI |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **anamnesis v0.5.0 + Phase 6** *(reference, pending v0.6.0 tag)* | ✓ path + reader | ✓ | ✓ pickle-VM | ✓ | ✓ all 4 fmts | ✓ E4M3 3 modes | ✓ INT4/INT8 + g_idx | ✓ INT4 | ✓ NF4/FP4/INT8 + DQ | ✓ block/K/IQ/TQ/MXFP4 | ✓ NF4/FP4/INT8 + DQ | ✓ scalar dtypes (Phase 7.5: quantised) | ✓ multi-format dispatch (`amn convert`) | ✓ | ✓ `anamnesis`/`amn` |
+| safetensors 0.7.x | ✓ lib only | — | — | — | — no CLI | — | — | — | — | — | — | — | — | ✓ | — |
+| safetensors_explorer 0.2.0 | ◐ inspect TUI | — | — | ◐ inspect TUI | ✓ ST + GGUF metadata | — | — | — | — | — | — | — | — | — bin only | ✓ TUI |
+| safetensors-cli 0.1.0 | ◐ minimal | — | — | — | ◐ minimal local | — | — | — | — | — | — | — | — | — | ✓ |
+| gguf-rs 0.2.5 | — | — | — | ✓ | ◐ GGUF only | — | — | — | — | — | — | ◐ via `gguf-rs-lib` (parsing-focused; write surface limited) | — | ✓ | ✓ `gguf-cli` |
+| inspector-gguf 0.3.1 | — | — | — | ✓ | ◐ GGUF only, GUI+CLI | — | — | — | — | — | — | — | — | ✓ | ✓ |
+| npyz | — | ✓ slower 1× | — | — | ◐ NPY metadata | — | — | — | — | — | — | — | — | ✓ | — |
+| ndarray-npy | — | ◐ `ndarray`-bound | — | — | — | — | — | — | — | — | — | — | — | ✓ | — |
+| serde-pickle | — | — | ◐ generic pickle, no `.pth` opcode allowlist or zero-copy tensor extraction | — | — | — | — | — | — | — | — | — | — | ✓ | — |
+| candle 0.x | ✓ via `candle-core` | — | ◐ via `tch` bridge | ✓ via `candle-quantized` | ◐ in-code only | — | ◐ model-specific glue | ◐ model-specific glue | ◐ model-specific glue | ◐ Q\*\_\* + K-quants | — | — | — | ✓ framework | — no central CLI |
+| mistral.rs 0.8.x | ✓ for inference | — | — | ✓ for inference | ◐ via `doctor` | — | ◐ for inference, tensor-coupled | ◐ for inference, tensor-coupled | ◐ for inference, tensor-coupled | ◐ for inference, tensor-coupled | ◐ UQFF only, not BnB | — | ◐ UQFF target | ✓ | ✓ `mistralrs` |
+| burn | ◐ via importer | — | ◐ via importer | — | — | — | — | — | — | — | — | — | — | ✓ framework | — |
+| apr-cli 0.33.0 | ✓ read for inference | — | — | ✓ read + write | ◐ APR-centric | — | — | — | — | — | — bound to GGUF Q4\_K | ◐ Q4\_K / Q4\_0 only (lossy by construction) | ◐ ST→GGUF Q4\_K (lossy) | — bin only | ✓ |
+| tch | — | — | ✓ via `libtorch` | — | — | — | — | — | — | — | — | — | — | ✓ | — |
 
 ---
 
@@ -124,6 +125,7 @@ Cells: ✓ = present · ◐ = partial / framework-coupled / narrow · — = abse
 - **Multi-format parser**: anamnesis is the only Rust crate covering all four of `.safetensors` / `.npz` / `.pth` / `.gguf` in one library with a unified `inspect` story.
 - **Multi-family dequant**: anamnesis is the only Rust crate exposing dequantisation across **all five** of `FP8` / `GPTQ` / `AWQ` / `BnB` / `GGUF` as standalone, framework-agnostic primitives that produce raw `BF16` bytes. Every other tool in the matrix either covers one family (gguf-rs) or covers many families but tightly coupled to a specific tensor library's loader path (candle, mistral.rs).
 - **Encode side (Phase 5)**: anamnesis is **the first** Rust crate to ship `BnB` encode kernels at all. The closest adjacent is `mistral.rs quantize` which targets its own UQFF format, not the `BnB` on-disk layout.
+- **GGUF write + multi-format convert (Phase 6)**: anamnesis is **the first** Rust crate to ship a standalone GGUF writer (scalar dtypes today, quantised dtypes at Phase 7.5 through the same scaffold) AND a multi-format conversion dispatch (`amn convert <input> --to <target>` covering `safetensors` / `gguf` / `bnb-nf4` from any of `.safetensors` / `.npz` / `.pth` / `.gguf`). The closest adjacent is `apr-cli convert`, which is lossy-by-construction (always quantises to GGUF Q4\_K/Q4\_0) and only handles `.safetensors → .gguf`. anamnesis's convert primitive is measured **1.11×–6.75× faster than the closest Python ecosystem default** (numpy / gguf-py / bitsandbytes CPU) at 4096×4096, release, CPU, and **2.17×–8.24× faster than PyTorch-CPU equivalents** for the two non-PyTorch baselines — see `tests/cross_validation_convert.rs::t14_perf_vs_python_size_matched`.
 - **`.pth` loading without `libtorch`**: anamnesis's pickle-VM-with-security-allowlist is the only pure-Rust safe `.pth` loader; the alternatives are (a) `tch` (pulls in ~250 MB of native `libtorch`) or (b) `serde-pickle` (general pickle, no `.pth`-specific opcode allowlist, no zero-copy tensor extraction, no security model for `GLOBAL` references).
 - **CLI + Lib parity**: anamnesis ships both, mirroring `hf-fm`'s pattern. `safetensors_explorer` / `safetensors-cli` / `gguf-cli` are bin-only; `safetensors` / `tch` / `burn` are lib-only; `candle` has no central CLI for parse/inspect work.
 
@@ -131,9 +133,10 @@ Cells: ✓ = present · ◐ = partial / framework-coupled / narrow · — = abse
 
 The closest competitor coverage requires a **union of four or five tools**: `safetensors` (parse only) + `safetensors_explorer` (inspect TUI, ST+GGUF) + `gguf-rs` (GGUF parse + CLI inspect) + `mistral.rs` (inference-coupled BnB/GPTQ/AWQ/GGUF dequant + UQFF encode) + optionally `apr-cli` (SafeTensors → GGUF Q4_K quantise + convert). Even that union still does not cover:
 
-- Cross-format **lossless** conversion (anamnesis: `.pth` → `.safetensors` is one CLI call; apr-cli's `convert` is always lossy via quantize)
+- Cross-format **lossless** conversion across **all** v0.6.0 pairs (anamnesis: `.pth` → `.safetensors`, `.npz` → `.safetensors`, `.npz` → `.gguf`, `.pth` → `.gguf`, `.safetensors` → `.gguf`, `.safetensors` → `.bnb-nf4` are all single CLI calls; apr-cli's `convert` is always lossy via quantize and only handles `.safetensors` → `.gguf Q4_K/Q4_0`)
 - Standalone dequant primitives (mistral.rs dequant is bound to its inference graph; apr-cli explicitly doesn't expose dequant)
 - `BnB` encode in `BnB`'s on-disk layout (mistral.rs encodes to UQFF, apr-cli to GGUF Q4_K — neither produces BnB)
+- Standalone GGUF writer (apr-cli writes GGUF but only as the output of its quantize pipeline; anamnesis's `write_gguf` accepts any caller-supplied `(name, shape, dtype, data)` tensors and writes a self-describing GGUF v3, with quantised dtypes reserved for the Phase 7.5 scaffold extension)
 - `.pth` loading without a `libtorch` dependency
 - Reader-generic header parsing (HTTP-range remote inspect over any `Read + Seek` substrate)
 - Library API for embedders (`apr-cli` / `safetensors_explorer` / `gguf-cli` are bin-only; embedders cannot reuse the orchestration)
@@ -144,15 +147,15 @@ The closest competitor coverage requires a **union of four or five tools**: `saf
 
 The parse + quantise pipeline is being solved *somewhere* in every active local-LLM ecosystem:
 
-| Ecosystem | Tool | Quantise output |
-|---|---|---|
-| Python | `bitsandbytes` + `autogptq` + `autoawq` + `llama.cpp quantize` | BnB, GPTQ, AWQ, GGUF (each via separate tool) |
-| Go | `ollama convert` (+ llama.cpp) | GGUF only |
-| Rust | `apr-cli` quantize | GGUF Q4_K / Q4_0 only |
-| Rust | `mistral.rs quantize` | UQFF only |
-| Rust | `anamnesis` (Phase 5+) | BnB plain + DQ now; FP8 + GGUF families at Phase 7.5 |
+| Ecosystem | Tool | Quantise output | Convert / write |
+|---|---|---|---|
+| Python | `bitsandbytes` + `autogptq` + `autoawq` + `llama.cpp quantize` | BnB, GPTQ, AWQ, GGUF (each via separate tool) | NPZ↔ST via `safetensors-py`; PTH→ST via `safetensors.torch`; ST→GGUF via `gguf-py` |
+| Go | `ollama convert` (+ llama.cpp) | GGUF only | ST/PTH → GGUF (bundled with inference, no standalone primitive) |
+| Rust | `apr-cli` quantize | GGUF Q4_K / Q4_0 only | ST → GGUF Q4_K (lossy by construction) |
+| Rust | `mistral.rs quantize` | UQFF only | ST/PTH/GGUF → UQFF (inference-coupled) |
+| Rust | `anamnesis` (Phase 5+6) | BnB plain + DQ (Phase 5); GGUF scalar passthrough (Phase 6); FP8 + GGUF block families at Phase 7.5 | **`amn convert <input> --to <target>` multi-format dispatch** covering ST/NPZ/PTH/GGUF → ST/GGUF/BnB-NF4 (lossless where the pipeline permits) |
 
-What's distinctive about `anamnesis` isn't *that* it exists — it's the **library-first + framework-agnostic + multi-family-dequant** shape. None of the cross-language analogs ship dequant as a reusable primitive consumable from outside their own inference path.
+What's distinctive about `anamnesis` isn't *that* it exists — it's the **library-first + framework-agnostic + multi-family-dequant + standalone convert dispatch** shape. None of the cross-language analogs ship dequant as a reusable primitive consumable from outside their own inference path, and none ship a unified convert primitive that routes any of four input formats through any of three target formats via a single CLI subcommand.
 
 ---
 
@@ -177,9 +180,9 @@ What's distinctive about `anamnesis` isn't *that* it exists — it's the **libra
 
 ## Next steps (not done — flagging for your call)
 
-This first cut leans on my own knowledge of the ecosystem for version numbers and capability claims. To bring it up to `hf-fm`'s level of precision (specific release dates, star counts, recent activity verification, version-pin accuracy), the table cells should be cross-checked via `WebFetch` against each crate's `crates.io` / GitHub page. Worth doing before any wider circulation; happy to do that pass if you want the doc shippable as-is. Other open questions you might want to direct:
+This survey leans on the author's knowledge of the ecosystem for version numbers and capability claims. To bring it up to `hf-fm`'s level of precision (specific release dates, star counts, recent activity verification, version-pin accuracy), the table cells should be cross-checked via `WebFetch` against each crate's `crates.io` / GitHub page. Worth doing before any wider circulation. Other open questions:
 
 - **NoUnsafe** and **BitExact** as table columns? Currently relegated to the "quality properties" paragraph since they're properties rather than capabilities, but a "rigour" column would be a real differentiator vs e.g. unsafe-heavy framework loaders.
-- Per-tool detail length: kept brief (~1–3 sentences each) for this first cut; happy to expand each tool's section to `hf-fm`'s level (4–8 lines each with versions / star counts / reverse-dep notes) once we've agreed on the tool set.
-- **Adjacent CLI tools** I haven't surveyed but that might be worth a row: `apr-cli` (has a `quantize` subcommand for its own APR format), `llmserve` (cache discovery), `ollama` (out of scope — Go, not Rust).
-- Should the doc also include a `Phase 7.5` forward-looking column for the deferred `FP8`/`GGUF`/`IQ`/`TQ`/`MXFP4` encode kernels, analogous to the `VRAMFit` planned-feature column in `hf-fm`'s doc?
+- Per-tool detail length: kept brief (~1–3 sentences each) for this survey; could expand each tool's section to `hf-fm`'s level (4–8 lines each with versions / star counts / reverse-dep notes) if needed for wider circulation.
+- **Adjacent CLI tools** not surveyed but possibly worth a row: `llmserve` (cache discovery), `ollama` (out of scope — Go, not Rust; mentioned in the "Beyond Rust" footer instead).
+- Phase 7.5 forward-looking coverage is now visible through the **GGUFWrite** column (cell flags "scalar dtypes (Phase 7.5: quantised)" for anamnesis). A separate forward-looking column for the deferred `FP8`/`IQ`/`TQ`/`MXFP4` encode kernels would be redundant once Phase 7.5 lands — they will appear in **EncBnB** generalised to a multi-family **Enc-\*** column at that point.
