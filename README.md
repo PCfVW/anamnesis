@@ -28,6 +28,7 @@
 - [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
+- [Performance validation (Phase 6.5)](#performance-validation-phase-65)
 - [Used by](#used-by)
 - [License](#license)
 - [Development](#development)
@@ -52,6 +53,20 @@ Installs both `anamnesis` and `amn` (short alias). Feature flags: `gptq`, `awq`,
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`.
 
 Format detection is automatic: `.safetensors` files go through the dequantization pipeline, `.pth`/`.pt` files go through the pickle parser, `.npz` files go through the header-only NPZ inspector, `.gguf` files go through the GGUF parser. `.bin` files are probed for ZIP/GGUF magic to distinguish PyTorch, GGUF, and safetensors. `amn convert` reuses the same detector and dispatches to the appropriate (input × target) pair; combinations not in the v0.6.0 matrix (e.g. `pth → bnb-nf4`) return a clear `Unsupported` error rather than silently falling through.
+
+Build with `cargo install anamnesis --features cli,pth,gguf,ollama` to also enable the **`ollama:` URL scheme** — every subcommand resolves `ollama:<model>:<tag>` to the local Ollama cache's GGUF blob:
+
+```
+$ amn inspect ollama:llama3.2:1b
+Format:      GGUF v3
+Arch:        llama
+Tensors:     147
+Total size:  1.22 GB
+Dtypes:      F32, Q8_0
+Alignment:   32 bytes
+```
+
+The resolver reads the Ollama manifest at `~/.ollama/models/manifests/registry.ollama.ai/library/<name>/<tag>` and returns the blob path under `~/.ollama/models/blobs/sha256-<hash>` — pure path arithmetic plus a single JSON read, no `ollama` CLI shell-out, no Go interop. Honours the `OLLAMA_MODELS` environment variable for non-default cache locations.
 
 ```
 $ amn parse model.pth
@@ -256,6 +271,14 @@ Measured across the **full 6 960-file [AlgZoo](https://github.com/alignment-rese
 PyTorch has no separate inspect-only primitive — `torch.load(weights_only=True)` is the closest comparable; it fully materialises every tensor before the caller can iterate the `state_dict` for summary stats, so the speedup is a **lower bound** that grows by orders of magnitude on larger models (the reader path stays bounded by `data.pkl` size while `torch.load` scales linearly in total tensor-data size). Per-family breakdown and the full method are in [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6.
 
 `Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
+
+### Performance validation (Phase 6.5)
+
+Three dev-only validation tracks ship alongside v0.6.0 — none of them affect the published crate (excluded from the tarball by Cargo's defaults). Each is a regression detector that catches drift before it reaches a release:
+
+- **[Criterion runtime benchmarks](benches/README.md)** — `benches/dequant.rs` covers 7 synthetic-layer-sized kernel groups (FP8, GPTQ, AWQ, BnB NF4, BnB INT8, GGUF Q4_K, plus FP8 fine-grained) at `4096 × 11008`, reporting **657 Melem/s → 2.01 Gelem/s** on the dev machine. `benches/parsing.rs` covers header-only parses for all four formats vs an `fs::read` baseline. Plus a real-world group on the Ollama-cached `llama3.2:1b` `Q8_0` slice (**3.92 Gelem/s**). Run with `cargo bench --features gptq,awq,bnb,gguf,npz,pth`.
+- **[`dhat-rs` peak-heap assertions](tests/peak_heap_README.md)** — three `#[ignore]`d test binaries that wrap the global allocator and assert observed peak heap stays within the documented ceiling. **Every kernel's observed scratch matches the documented `# Memory` claim to the byte**: GPTQ/AWQ at `3 × out_features × 4`, BnB-DQ at `num_blocks × 4 + block_size × 4`. Run with `cargo test --release --features gptq --test peak_heap_gptq -- --ignored --nocapture` (and similarly for `awq` / `bnb_dq`).
+- **[Ollama cross-validation](tests/cross_validation_ollama.rs)** — bit-exact `Q8_0` dequant against the `gguf-py` reference on a slice extracted from the local Ollama cache's `llama3.2:1b` blob. Same kernel anamnesis already validates against bartowski / `TheBloke` quantisations, now on the dominant local-LLM distribution channel too. Result: **0 ULP mismatches**.
 
 ## Used by
 
