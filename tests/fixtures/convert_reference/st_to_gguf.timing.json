@@ -1,0 +1,9 @@
+{
+  "path_label": "st_to_gguf",
+  "py_seconds": 0.015074800001457334,
+  "py_library": "gguf 0.18.0",
+  "shape": [
+    4096,
+    4096
+  ]
+}

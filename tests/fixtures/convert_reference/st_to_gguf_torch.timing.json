@@ -1,0 +1,9 @@
+{
+  "path_label": "st_to_gguf_torch",
+  "py_seconds": 0.029618199972901493,
+  "py_library": "torch 2.10.0+cu130 + gguf 0.18.0",
+  "shape": [
+    4096,
+    4096
+  ]
+}

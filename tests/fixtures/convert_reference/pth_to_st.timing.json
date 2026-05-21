@@ -1,0 +1,9 @@
+{
+  "path_label": "pth_to_st",
+  "py_seconds": 0.029562699957750738,
+  "py_library": "torch 2.10.0+cu130",
+  "shape": [
+    4096,
+    4096
+  ]
+}

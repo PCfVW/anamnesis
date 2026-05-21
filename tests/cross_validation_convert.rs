@@ -118,14 +118,20 @@ fn timed<F: FnOnce() -> R, R>(label: &str, f: F) -> (R, f64) {
     (result, elapsed_us)
 }
 
-/// Reads a Python-timing sidecar if present. Returns elapsed µs.
+/// Python-timing sidecar payload.
 ///
 /// Sidecar JSON shape:
 /// ```json
 /// {"path_label": "st_to_gguf", "py_seconds": 0.0234,
 ///  "py_library": "gguf 0.10.0", "shape": [4096, 4096]}
 /// ```
-fn read_python_sidecar(label: &str) -> Option<f64> {
+struct PythonSidecar {
+    elapsed_us: f64,
+    shape: Vec<i64>,
+    library: String,
+}
+
+fn read_python_sidecar(label: &str) -> Option<PythonSidecar> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
@@ -134,16 +140,54 @@ fn read_python_sidecar(label: &str) -> Option<f64> {
     let bytes = std::fs::read(&p).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let seconds = v.get("py_seconds")?.as_f64()?;
-    Some(seconds * 1_000_000.0)
+    let shape = v
+        .get("shape")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(serde_json::Value::as_i64).collect())
+        .unwrap_or_default();
+    let library = v
+        .get("py_library")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    Some(PythonSidecar {
+        elapsed_us: seconds * 1_000_000.0,
+        shape,
+        library,
+    })
 }
 
-fn report_vs_python(label: &str, rust_us: f64) {
+/// Reports the rust-side wall time alongside the Python sidecar.
+///
+/// `rust_shape` is what the Rust test actually measured at — printed
+/// next to Python's `shape` so the reader sees if the comparison is
+/// apples-to-apples or overhead-vs-throughput. A pure-ratio line only
+/// makes sense when the shapes match; otherwise the line is informative
+/// but the bare multiplier is suppressed.
+fn report_vs_python(label: &str, rust_us: f64, rust_shape: &[usize]) {
     match read_python_sidecar(label) {
-        Some(py_us) => {
-            let ratio = py_us / rust_us.max(f64::MIN_POSITIVE);
-            eprintln!(
-                "  [{label}] rust={rust_us:.1} \u{00B5}s, python={py_us:.1} \u{00B5}s ({ratio:.2}x)"
-            );
+        Some(sidecar) => {
+            let shapes_match = sidecar.shape.len() == rust_shape.len()
+                && sidecar
+                    .shape
+                    .iter()
+                    .zip(rust_shape.iter())
+                    .all(|(a, b)| i64::try_from(*b).is_ok_and(|c| c == *a));
+            if shapes_match {
+                let ratio = sidecar.elapsed_us / rust_us.max(f64::MIN_POSITIVE);
+                eprintln!(
+                    "  [{label}] rust={rust_us:.1} \u{00B5}s, python={:.1} \u{00B5}s \
+                     ({ratio:.2}\u{00D7}, shape={:?}, {})",
+                    sidecar.elapsed_us, sidecar.shape, sidecar.library
+                );
+            } else {
+                eprintln!(
+                    "  [{label}] rust={rust_us:.1} \u{00B5}s @ {rust_shape:?}, \
+                     python={:.1} \u{00B5}s @ {:?} ({}) — \
+                     shapes differ; size-matched ratio printed by t14_perf_vs_python",
+                    sidecar.elapsed_us, sidecar.shape, sidecar.library
+                );
+            }
         }
         None => {
             eprintln!("  [{label}] rust={rust_us:.1} \u{00B5}s (no Python sidecar)");
@@ -214,7 +258,7 @@ fn t1_npz_to_safetensors_bytes_exact() {
     let (st_bytes, _us) = timed("npz->st (forward)", || {
         npz_to_safetensors_bytes(&map).unwrap()
     });
-    report_vs_python("npz_to_st", _us);
+    report_vs_python("npz_to_st", _us, &[2, 3]);
 
     let parsed = safetensors::SafeTensors::deserialize(&st_bytes).unwrap();
     let w = parsed.tensor("w").unwrap();
@@ -249,7 +293,8 @@ fn t2_pth_via_existing_fixture_to_safetensors_bytes_exact() {
     let (st_bytes, _us) = timed("pth->st (forward)", || {
         pth_to_safetensors_bytes(&pth_tensors).unwrap()
     });
-    report_vs_python("pth_to_st", _us);
+    // Shape varies with the AlgZoo fixture — sidecar always disagrees.
+    report_vs_python("pth_to_st", _us, &[0]);
 
     let reread = safetensors::SafeTensors::deserialize(&st_bytes).unwrap();
     assert_eq!(reread.names().len(), pth_tensors.len());
@@ -301,7 +346,7 @@ fn t3_st_bf16_to_gguf_bytes_exact() {
     let (_, us) = timed("st->gguf (forward)", || {
         write_gguf(&gguf_path, &write_inputs, &HashMap::new()).unwrap();
     });
-    report_vs_python("st_to_gguf", us);
+    report_vs_python("st_to_gguf", us, &[4, 2]);
 
     let parsed_gguf = parse_gguf(&gguf_path).unwrap();
     let collected: Vec<_> = parsed_gguf.tensors().collect();
@@ -431,7 +476,10 @@ fn t5_bnb_nf4_byte_exact_vs_python_reference() {
     let (st_bytes, us) = timed("st->bnb-nf4 (forward)", || {
         write_bnb_nf4_safetensors_bytes(&inputs).unwrap()
     });
-    report_vs_python("st_to_bnb_nf4", us);
+    // The bnb_reference fixture is 1-D total_elements; sidecar uses 2-D
+    // so shapes always disagree by construction. t14 emits the
+    // size-matched ratio.
+    report_vs_python("st_to_bnb_nf4", us, &[0]);
 
     let parsed = safetensors::SafeTensors::deserialize(&st_bytes).unwrap();
     let weight = parsed.tensor("weight.weight").unwrap();
@@ -786,4 +834,110 @@ fn t13_classify_inputs_agrees_with_writer_emission() {
         .find(|t| t.name == "b")
         .expect("passthrough `b` missing");
     assert_eq!(b_entry.dtype.to_string(), "BF16");
+}
+
+// ===========================================================================
+// Size-matched performance comparison vs Python (CPU only)
+// ===========================================================================
+//
+// The other 13 tests use 4-to-64-byte synthetic fixtures to keep the
+// correctness suite fast and deterministic. At those sizes Rust's
+// per-call overhead dominates, so any "vs Python" ratio printed from
+// them is misleading. This test runs each conversion on the **same
+// 4096x4096 shape** the Python sidecar generator uses (~32 MiB BF16),
+// so the elapsed times compare apples-to-apples.
+//
+// Gated `#[ignore]` so default `cargo test` stays fast; opt in with
+// `cargo test --all-features --test cross_validation_convert -- --ignored --nocapture`.
+
+const PERF_SHAPE: (usize, usize) = (4096, 4096);
+
+fn synth_bf16_perf() -> Vec<u8> {
+    let n = PERF_SHAPE.0 * PERF_SHAPE.1;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let v = (i as f32 - (n as f32) * 0.5) / (n as f32);
+        let bits = (v.to_bits() >> 16) as u16;
+        out.extend_from_slice(&bits.to_le_bytes());
+    }
+    out
+}
+
+fn synth_f32_perf() -> Vec<u8> {
+    let n = PERF_SHAPE.0 * PERF_SHAPE.1;
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let v = (i as f32 - (n as f32) * 0.5) / (n as f32);
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+#[ignore = "perf comparison vs Python; run with --ignored"]
+fn t14_perf_vs_python_size_matched() {
+    eprintln!("--- t14_perf_vs_python_size_matched (shape={PERF_SHAPE:?}) ---");
+    eprintln!(
+        "  Each Rust measurement is reported against ALL applicable Python sidecars: \
+         the ecosystem-default baseline (numpy / gguf-py / bitsandbytes) and, where \
+         it differs, the PyTorch-CPU equivalent (npz_to_st_torch / st_to_gguf_torch)."
+    );
+
+    // 1. NPZ -> safetensors at 4096x4096 F32.
+    let f32_buf = synth_f32_perf();
+    let mut map: HashMap<String, NpzTensor> = HashMap::new();
+    map.insert(
+        "w".into(),
+        make_npz_tensor(
+            "w",
+            NpzDtype::F32,
+            vec![PERF_SHAPE.0, PERF_SHAPE.1],
+            f32_buf.clone(),
+        ),
+    );
+    let (_, npz_us) = timed("npz->st @ perf", || npz_to_safetensors_bytes(&map).unwrap());
+    report_vs_python("npz_to_st", npz_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
+    report_vs_python("npz_to_st_torch", npz_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
+
+    // 2. safetensors-BF16 -> GGUF at 4096x4096 BF16.
+    let bf16_buf = synth_bf16_perf();
+    let (_dir, _st_path) = write_temp(&[], "safetensors");
+    let gguf_path = _st_path.with_file_name("perf.gguf");
+    let inputs = vec![GgufWriteTensor {
+        name: "w",
+        shape: &[PERF_SHAPE.1, PERF_SHAPE.0], // GGUF MSB-first
+        dtype: GgufType::BF16,
+        data: &bf16_buf,
+    }];
+    let (_, gguf_us) = timed("st->gguf @ perf", || {
+        write_gguf(&gguf_path, &inputs, &HashMap::new()).unwrap();
+    });
+    report_vs_python("st_to_gguf", gguf_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
+    report_vs_python("st_to_gguf_torch", gguf_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
+
+    // 3. safetensors-BF16 -> BnB-NF4 at 4096x4096 BF16.
+    let bnb_inputs = vec![BnbWriteInput {
+        name: "w",
+        shape: &[PERF_SHAPE.0, PERF_SHAPE.1],
+        bf16_data: &bf16_buf,
+    }];
+    let (_, bnb_us) = timed("st->bnb-nf4 @ perf", || {
+        write_bnb_nf4_safetensors_bytes(&bnb_inputs).unwrap()
+    });
+    report_vs_python("st_to_bnb_nf4", bnb_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
+
+    // 4. PTH -> safetensors: synthesise an in-memory PthTensor list
+    //    matching the perf shape. PthTensor is owned, so we can build it
+    //    inline without a file round-trip.
+    use std::borrow::Cow;
+    let pth_tensors = vec![anamnesis::PthTensor {
+        name: "w".into(),
+        shape: vec![PERF_SHAPE.0, PERF_SHAPE.1],
+        dtype: anamnesis::PthDtype::BF16,
+        data: Cow::Borrowed(&bf16_buf),
+    }];
+    let (_, pth_us) = timed("pth->st @ perf", || {
+        pth_to_safetensors_bytes(&pth_tensors).unwrap()
+    });
+    report_vs_python("pth_to_st", pth_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
 }

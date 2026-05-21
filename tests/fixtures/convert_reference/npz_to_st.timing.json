@@ -1,0 +1,9 @@
+{
+  "path_label": "npz_to_st",
+  "py_seconds": 0.07573149999370798,
+  "py_library": "safetensors safetensors.numpy",
+  "shape": [
+    4096,
+    4096
+  ]
+}

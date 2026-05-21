@@ -1,0 +1,9 @@
+{
+  "path_label": "st_to_bnb_nf4",
+  "py_seconds": 0.3767614000244066,
+  "py_library": "bitsandbytes 0.49.1",
+  "shape": [
+    4096,
+    4096
+  ]
+}
