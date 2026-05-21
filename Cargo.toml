@@ -70,6 +70,12 @@ required-features = ["cli"]
 # feature is left at its default — Criterion's reports live in
 # `target/criterion/` and are never published.
 criterion = "0.5"
+# Phase 6.5 dev-only peak-heap profiler. Wraps the global allocator
+# in the `tests/peak_heap_*.rs` binaries (and only there) to record
+# `max_bytes` for ratio-form heap regression assertions. Every dhat
+# test is `#[ignore]`d so default `cargo test` skips them; the dhat
+# allocator only fires when the user opts in via `--ignored`.
+dhat = "0.3"
 tempfile = "3"
 
 # Phase 6.5: dequantisation throughput benchmarks (decode side).
