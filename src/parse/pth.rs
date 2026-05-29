@@ -610,6 +610,35 @@ fn is_ordered_dict_constructor(callable: &PickleValue, args: &PickleValue) -> bo
     false
 }
 
+/// Per-opcode soft cap on a single pickle string/bytes payload (64 MiB).
+///
+/// The 4-byte-length opcodes (`BINUNICODE`, `BINSTRING`, `BINBYTES`) declare a
+/// `u32` length, and each materialises an owned `String`/`Vec<u8>` clone of
+/// that length. [`MAX_PKL_SIZE`] already bounds the whole stream, but a single
+/// 99 MiB string inside an otherwise-legitimate 100 MiB pickle would still
+/// allocate in one shot. Capping each payload at 64 MiB — far above any
+/// realistic `state_dict` key, storage-class name, or `byteorder` string —
+/// hardens against that without affecting real files. Defence in depth.
+const MAX_PICKLE_PAYLOAD: usize = 64 * 1024 * 1024;
+
+/// Rejects a single pickle string/bytes payload whose declared length exceeds
+/// [`MAX_PICKLE_PAYLOAD`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`].
+fn enforce_pickle_payload_cap(len: usize, opcode: &str) -> crate::Result<()> {
+    if len > MAX_PICKLE_PAYLOAD {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "pickle {opcode} length {len} bytes exceeds the \
+                 {MAX_PICKLE_PAYLOAD}-byte cap"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Minimal pickle VM state.
 struct PickleVm<'a> {
     /// Raw pickle bytes.
@@ -824,6 +853,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINUNICODE length overflow".into(),
                     })?;
+                    enforce_pickle_payload_cap(len, "BINUNICODE")?;
                     let bytes = self.read_bytes(len)?;
                     let s = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
                         reason: format!("non-UTF-8 pickle string: {e}"),
@@ -856,6 +886,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINSTRING length overflow".into(),
                     })?;
+                    enforce_pickle_payload_cap(len, "BINSTRING")?;
                     let bytes = self.read_bytes(len)?;
                     match std::str::from_utf8(bytes) {
                         // BORROW: .to_owned() converts &str to owned String
@@ -873,6 +904,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINBYTES length overflow".into(),
                     })?;
+                    enforce_pickle_payload_cap(len, "BINBYTES")?;
                     let bytes = self.read_bytes(len)?;
                     // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
                     self.stack.push(PickleValue::Bytes(bytes.to_vec()));
