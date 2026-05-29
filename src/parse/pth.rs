@@ -3407,4 +3407,91 @@ mod tests {
             "expected byteorder cap violation, got: {msg}"
         );
     }
+
+    // -- DoS hardening (Phase 6.6) -------------------------------------------
+
+    /// Builds a minimal `.pth` ZIP whose single `archive/data.pkl` entry holds
+    /// `pkl` verbatim (STORED, so the central directory reports its true size).
+    fn build_pth_with_pkl(pkl: &[u8]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(pkl).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// `enforce_pkl_size_cap` accepts a declared size exactly at the cap and
+    /// rejects one byte over it (Phase 6.6 Step 1). The bound is `>`, not `>=`,
+    /// and both entry points route through this one helper.
+    #[test]
+    fn pkl_size_cap_boundary() {
+        assert!(enforce_pkl_size_cap(MAX_PKL_SIZE, "data.pkl").is_ok());
+        let err = enforce_pkl_size_cap(MAX_PKL_SIZE + 1, "data.pkl").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data.pkl") && msg.contains("cap"),
+            "expected pkl-size cap error, got: {msg}"
+        );
+    }
+
+    /// An oversized `BINBYTES` payload length is rejected by the pickle VM
+    /// before the clone (Phase 6.6 Step 4), exercised end-to-end through the
+    /// `parse_pth` mmap path with a 7-byte crafted pickle. Mirrors candle
+    /// #3533's "tiny malicious input → expect `Err`" shape.
+    #[test]
+    fn pickle_payload_cap_rejects_binbytes_mmap() {
+        let bytes = build_pth_with_pkl(&[0x80, 0x02, b'B', 0xFF, 0xFF, 0xFF, 0xFF]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let err = parse_pth(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BINBYTES") && msg.contains("cap"),
+            "expected BINBYTES payload cap error, got: {msg}"
+        );
+    }
+
+    /// Same guard via the reader path with an oversized `BINUNICODE` length.
+    #[test]
+    fn pickle_payload_cap_rejects_binunicode_reader() {
+        let bytes = build_pth_with_pkl(&[0x80, 0x02, b'X', 0xFF, 0xFF, 0xFF, 0xFF]);
+        let err = inspect_pth_from_reader(std::io::Cursor::new(&bytes)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BINUNICODE") && msg.contains("cap"),
+            "expected BINUNICODE payload cap error, got: {msg}"
+        );
+    }
+
+    /// Faithful large-file `PoC` for the mmap-path `MAX_PKL_SIZE` guard (Phase
+    /// 6.6 Step 1). `build_entry_index` validates the declared entry size
+    /// against the file length, so the cap is reachable only for a genuinely
+    /// over-cap `data.pkl` — which means writing a >100 MiB archive. `#[ignore]`d
+    /// to keep default `cargo test` fast, matching the repo's heavy-fixture
+    /// convention (`tests/peak_heap_*.rs`). Run with `--ignored`.
+    #[test]
+    #[ignore = "writes a >100 MiB temp archive; run with --ignored"]
+    fn pkl_size_cap_rejects_oversized_mmap_poc() {
+        let cap = usize::try_from(MAX_PKL_SIZE).unwrap();
+        let mut payload = vec![0u8; cap + 1];
+        // A valid pickle prefix so the failure is unambiguously the size cap,
+        // not a VM parse error (the cap fires before the VM runs).
+        payload[0] = 0x80;
+        payload[1] = 0x02;
+        let bytes = build_pth_with_pkl(&payload);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let err = parse_pth(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data.pkl") && msg.contains("cap"),
+            "expected pkl-size cap error, got: {msg}"
+        );
+    }
 }

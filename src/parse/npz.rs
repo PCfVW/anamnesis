@@ -1334,4 +1334,76 @@ mod tests {
             "expected Fortran-order error, got: {msg}"
         );
     }
+
+    // -- DoS hardening (Phase 6.6) -------------------------------------------
+
+    /// A v2 `NPY` header declaring `header_len = u32::MAX` is rejected before
+    /// the `vec![0u8; header_len]` allocation (Phase 6.6 Step 2). Mirrors the
+    /// candle #3533 "tiny malicious header → expect `Err`" pattern: the input
+    /// is 12 bytes yet would otherwise drive a 4 GiB allocation.
+    #[test]
+    fn header_len_cap_rejects_oversized_v2_header() {
+        let mut npy = Vec::new();
+        npy.extend_from_slice(NPY_MAGIC);
+        npy.push(2); // major 2 → u32 header length
+        npy.push(0); // minor
+        npy.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut reader = std::io::Cursor::new(&npy);
+        let Err(err) = parse_npy_header(&mut reader) else {
+            panic!("expected error for oversized header length");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("header length") && msg.contains("cap"),
+            "expected header-length cap error, got: {msg}"
+        );
+    }
+
+    /// A header just at the cap is accepted past the length gate (it then fails
+    /// later on the truncated body), confirming the bound is `>` not `>=`.
+    #[test]
+    fn header_len_cap_accepts_boundary() {
+        // header_len == NPY_MAX_HEADER_BYTES must pass the gate; we supply no
+        // body, so the subsequent read_exact fails — but NOT with a cap error.
+        let mut npy = Vec::new();
+        npy.extend_from_slice(NPY_MAGIC);
+        npy.push(2);
+        npy.push(0);
+        // CAST: usize → u32, NPY_MAX_HEADER_BYTES (1 MiB) fits in u32
+        npy.extend_from_slice(&(NPY_MAX_HEADER_BYTES as u32).to_le_bytes());
+
+        let mut reader = std::io::Cursor::new(&npy);
+        let Err(err) = parse_npy_header(&mut reader) else {
+            panic!("expected truncated-body error past the cap gate");
+        };
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("cap"),
+            "boundary value must pass the cap gate, got cap error: {msg}"
+        );
+    }
+
+    /// An array whose declared shape product × element size exceeds the
+    /// `NPZ_MAX_ARRAY_BYTES` cap is rejected before `vec![0u8; data_bytes]`
+    /// (Phase 6.6 Step 3). On 64-bit the cap fires; on 32-bit the existing
+    /// `checked_mul` overflow guard fires first — both reject without
+    /// allocating or panicking.
+    #[test]
+    fn array_bytes_cap_rejects_oversized_shape() {
+        let header = NpyHeader {
+            dtype: NpzDtype::F32,
+            big_endian: false,
+            fortran_order: false,
+            // 3e9 elements × 4 bytes = 12 GiB > 8 GiB cap (and overflows a
+            // 32-bit usize at the byte-count multiply).
+            shape: vec![3_000_000_000usize],
+        };
+        let mut empty = std::io::Cursor::new(Vec::new());
+        let result = read_array_data(&mut empty, &header);
+        assert!(
+            result.is_err(),
+            "oversized declared array must be rejected, got Ok"
+        );
+    }
 }
