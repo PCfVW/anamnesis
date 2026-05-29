@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Hardened all parsers against unguarded-allocation DoS (Phase 6.6,
+  triggered by the [`candle #3533`](https://github.com/huggingface/candle/issues/3533)
+  audit; CWE-770 / CWE-1284 / CWE-400).** Legitimate files are unaffected;
+  malformed or malicious inputs now fail fast with an `AnamnesisError::Parse`
+  instead of driving multi-GiB allocations. No public API change.
+  - **PTH mmap path** now enforces the existing `MAX_PKL_SIZE` (100 MiB) cap
+    on `data.pkl` before slicing the mmap and running the pickle VM — it was
+    previously bounded only by file size, while the reader path already
+    capped. Both paths now route through a shared `enforce_pkl_size_cap`
+    helper, and the mmap slice end is computed with `checked_add`.
+  - **NPZ `header_len`** (NPY v2/v3 `u32`, reachable up to 4 GiB) is rejected
+    against a new `NPY_MAX_HEADER_BYTES` (1 MiB) cap before allocating the
+    header buffer.
+  - **Defence in depth:** an `NPZ_MAX_ARRAY_BYTES` (8 GiB) cap makes oversized
+    declared array shapes fail deterministically below the `usize`-overflow
+    boundary, and a `MAX_PICKLE_PAYLOAD` (64 MiB) per-opcode cap bounds the
+    `BINUNICODE` / `BINSTRING` / `BINBYTES` clones in both pickle entry points.
+  - Regression tests pin each guard (malicious-fixture → `Err`), including an
+    `#[ignore]`d >100 MiB end-to-end PoC for the PTH mmap cap.
+
 ## [0.6.0] - 2026-05-21
 
 **Phase 6 lands — the format conversion matrix.** v0.6.0 ships a
