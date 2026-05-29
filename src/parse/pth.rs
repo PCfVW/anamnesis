@@ -29,14 +29,20 @@ use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::parse::utils::byteswap_inplace;
 
-/// Maximum declared size for a `.pth` archive's `data.pkl` entry that
-/// [`inspect_pth_from_reader`] will materialise.
+/// Maximum declared size for a `.pth` archive's `data.pkl` entry that the
+/// parsers will materialise or interpret.
+///
+/// Enforced on both entry points via [`enforce_pkl_size_cap`]: the mmap-based
+/// [`parse_pth`] checks it before slicing `data.pkl` out of the mapped file
+/// and running the pickle VM over it, and the reader-based
+/// [`inspect_pth_from_reader`] checks it before reading the entry into memory.
 ///
 /// Real `data.pkl` is typically <100 KiB even on torchvision-class 300 MB
 /// models; 100 MiB is roughly three orders of magnitude above realistic.
 /// The cap defends against an adversarial central directory that claims a
-/// multi-GiB pickle: we reject before allocating, so `Vec::with_capacity`
-/// cannot be coaxed into an OOM on attacker-controlled input.
+/// multi-GiB pickle: we reject before allocating or interpreting, so neither
+/// `Vec::with_capacity` nor the pickle VM can be coaxed into multi-GiB work on
+/// attacker-controlled input.
 const MAX_PKL_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Maximum declared size for a `.pth` archive's `byteorder` entry.
@@ -45,6 +51,27 @@ const MAX_PKL_SIZE: u64 = 100 * 1024 * 1024;
 /// generous head-room; anything beyond that signals a malformed or
 /// adversarial archive.
 const MAX_BYTEORDER_SIZE: u64 = 64;
+
+/// Rejects a `data.pkl` ZIP entry whose declared size exceeds [`MAX_PKL_SIZE`].
+///
+/// Shared by the mmap path ([`parse_pth`]) and the reader path
+/// ([`inspect_pth_from_reader`]) so the bound is identical by construction:
+/// any future change to the cap or its wording applies to both entry points.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `declared` exceeds [`MAX_PKL_SIZE`].
+fn enforce_pkl_size_cap(declared: u64, entry_name: &str) -> crate::Result<()> {
+    if declared > MAX_PKL_SIZE {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "ZIP entry `{entry_name}`: declared size {declared} bytes exceeds \
+                 the {MAX_PKL_SIZE}-byte cap"
+            ),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // PthDtype
@@ -1726,11 +1753,24 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: "ZIP entry `data.pkl` not found".into(),
             })?;
-    let pkl_data =
-        raw.get(pkl_start..pkl_start + pkl_len)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "data.pkl slice out of bounds".into(),
-            })?;
+    // Bound the pickle stream before slicing/interpreting it. `build_entry_index`
+    // already guarantees `pkl_start + pkl_len <= raw.len()`, so this fires only
+    // for files genuinely larger than the cap — closing the multi-GiB-`data.pkl`
+    // case the reader path already guards against.
+    let pkl_len_u64 = u64::try_from(pkl_len).map_err(|_| AnamnesisError::Parse {
+        reason: format!("ZIP entry `data.pkl`: declared size {pkl_len} overflows u64"),
+    })?;
+    enforce_pkl_size_cap(pkl_len_u64, "data.pkl")?;
+    let pkl_end = pkl_start
+        .checked_add(pkl_len)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "data.pkl slice end offset overflow".into(),
+        })?;
+    let pkl_data = raw
+        .get(pkl_start..pkl_end)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "data.pkl slice out of bounds".into(),
+        })?;
     let meta = interpret_pickle_to_meta(pkl_data)?;
 
     Ok(ParsedPth {
@@ -2057,14 +2097,7 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<
     let (pkl_name, pkl_size, byteorder_name, byteorder_size) =
         locate_inspect_entries(&mut archive)?;
 
-    if pkl_size > MAX_PKL_SIZE {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "ZIP entry `{pkl_name}`: declared size {pkl_size} bytes exceeds \
-                 the {MAX_PKL_SIZE}-byte inspect cap"
-            ),
-        });
-    }
+    enforce_pkl_size_cap(pkl_size, &pkl_name)?;
 
     let big_endian = match byteorder_name {
         Some(name) => {
