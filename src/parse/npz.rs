@@ -43,6 +43,17 @@ const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
 /// the 4 GiB declared-header window before allocating.
 const NPY_MAX_HEADER_BYTES: usize = 1 << 20;
 
+/// Upper bound on a single `NPY`/`NPZ` array's raw byte length (8 GiB).
+///
+/// The element-count and byte-count `checked_mul`s in [`read_array_data`]
+/// already reject the `usize`-overflow case, but rejection there only happens
+/// at the arithmetic-overflow boundary. This cap makes rejection deterministic
+/// well below overflow: 8 GiB matches the largest real tensors on consumer GPUs
+/// while rejecting absurd declared shapes. Mirrors the bounded-array-element
+/// pattern recommended in `candle #3533`. A `u64` so the literal compiles on
+/// 32-bit targets, where `1usize << 33` would overflow.
+const NPZ_MAX_ARRAY_BYTES: u64 = 1 << 33;
+
 // ---------------------------------------------------------------------------
 // NpzDtype
 // ---------------------------------------------------------------------------
@@ -470,6 +481,18 @@ fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "data byte count overflow".into(),
         })?;
+
+    // CAST: usize → u64, lossless widening on all supported targets
+    #[allow(clippy::as_conversions)]
+    let data_bytes_u64 = data_bytes as u64;
+    if data_bytes_u64 > NPZ_MAX_ARRAY_BYTES {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "NPY array size {data_bytes} bytes exceeds the \
+                 {NPZ_MAX_ARRAY_BYTES}-byte cap"
+            ),
+        });
+    }
 
     let mut buf = vec![0u8; data_bytes];
     reader
