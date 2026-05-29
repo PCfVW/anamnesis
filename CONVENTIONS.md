@@ -428,6 +428,39 @@ wrapping on a header-derived size is a parser bug, not a recovery strategy.
 Use `saturating_sub` only for non-security display computations (e.g., a
 byte count that can legitimately be zero).
 
+### Cap declared sizes before allocating
+
+Checked arithmetic stops an *overflow*; it does not stop a *plausible but
+enormous* size. A header field that decodes to 3 GiB does not overflow
+`usize` on a 64-bit target — `vec![0u8; n]` simply tries to commit 3 GiB.
+This is the [`candle #3533`](https://github.com/huggingface/candle/issues/3533)
+DoS class (CWE-770 / CWE-1284 / CWE-400): a length / count / size read from
+the input and fed to `vec![T; n]`, `Vec::with_capacity(n)`, `for _ in 0..n`,
+or a per-element clone without an upper-bound check. Every such site must
+compare the declared value against an explicit module-level cap and reject
+it with `AnamnesisError::Parse` **before** the allocation.
+
+Rules:
+- Name the cap `<FORMAT>_MAX_<THING>` (`NPY_MAX_HEADER_BYTES`, `MAX_PKL_SIZE`,
+  `MAX_STRING_LEN`, `MAX_PICKLE_PAYLOAD`, …) and document the realistic-vs-cap
+  head-room in its doc comment.
+- Choose the cap generously above any legitimate file (real `NPY` headers are
+  <1 KiB → 1 MiB cap; real `.pth` `data.pkl` is <100 KiB → 100 MiB cap), so
+  the gate is invisible to honest inputs and rejects only absurd ones.
+- Type the constant `u64` when the literal would overflow `usize` on a 32-bit
+  target (`NPZ_MAX_ARRAY_BYTES: u64 = 1 << 33`) and compare with a lossless
+  widening cast (`// CAST: usize → u64, lossless widening`).
+- When two entry points share a cap (e.g., an mmap path and a reader path),
+  factor the check into one helper (`enforce_pkl_size_cap`) so the bound
+  cannot drift between them.
+
+The sibling `safetensors` crate caps its header with `MAX_HEADER_SIZE`; every
+anamnesis parser mirrors the pattern (`GGUF` `MAX_*`, the safetensors header
+cap, the `NPZ`/`.pth` caps above). Pre-allocation hints derived from a
+file-declared count get the additional `PREALLOC_SOFT_CAP` clamp (see
+`src/parse/gguf.rs`) so a header that *passes* the hard cap still cannot drive
+an eager multi-hundred-MB `with_capacity`.
+
 ### Magic-byte plus minimum-size guard
 
 Format detection must read the magic bytes via `.get(..N)` (not direct

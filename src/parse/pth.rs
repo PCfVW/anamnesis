@@ -18,6 +18,15 @@
 //! code**. Only allowlisted `GLOBAL` references (`torch._utils`,
 //! `torch.*Storage`, `collections.OrderedDict`) are accepted. Unrecognized
 //! globals produce `AnamnesisError::Parse`.
+//!
+//! The parser is also hardened against unguarded-allocation denial of service
+//! (the [`candle #3533`](https://github.com/huggingface/candle/issues/3533)
+//! class). The declared `data.pkl` size is capped at `MAX_PKL_SIZE` on both
+//! the mmap and reader entry points before the pickle VM runs, and each
+//! 4-byte-length pickle payload (`BINUNICODE`, `BINSTRING`, `BINBYTES`) is
+//! capped at `MAX_PICKLE_PAYLOAD` before its clone. A malformed or malicious
+//! archive fails fast with `AnamnesisError::Parse` instead of driving a
+//! multi-GiB allocation.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1695,6 +1704,13 @@ fn copy_to_contiguous(
 /// The pickle interpreter uses an explicit `GLOBAL` allowlist. Non-`PyTorch`
 /// callables (e.g., `os.system`, `subprocess.Popen`) are rejected with
 /// [`AnamnesisError::Parse`], preventing arbitrary code execution.
+///
+/// Against unguarded-allocation denial of service, the declared `data.pkl`
+/// size is capped at `MAX_PKL_SIZE` before the entry is sliced from the mmap
+/// and interpreted (shared with [`inspect_pth_from_reader`] via
+/// `enforce_pkl_size_cap`), and every 4-byte-length pickle payload is bounded
+/// by `MAX_PICKLE_PAYLOAD`. Oversized declarations return
+/// [`AnamnesisError::Parse`] rather than allocating.
 ///
 /// # Errors
 ///
