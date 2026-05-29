@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-29
+
 ### Security
 
 - **Hardened all parsers against unguarded-allocation DoS (Phase 6.6,
