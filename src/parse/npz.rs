@@ -34,6 +34,15 @@ use crate::parse::utils::byteswap_inplace;
 /// `NPY` magic bytes: `\x93NUMPY`.
 const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
 
+/// Upper bound on an `NPY` header's declared length, in bytes (1 MiB).
+///
+/// `NPY` v1 stores `header_len` as a `u16` (≤64 KiB — already safe by datatype),
+/// but v2/v3 store it as a `u32`, which an adversarial file can set up to 4 GiB
+/// to drive a `vec![0u8; header_len]` allocation. Real `NPY` headers are <1 KiB;
+/// 1 MiB is generous head-room for any plausible legitimate file while rejecting
+/// the 4 GiB declared-header window before allocating.
+const NPY_MAX_HEADER_BYTES: usize = 1 << 20;
+
 // ---------------------------------------------------------------------------
 // NpzDtype
 // ---------------------------------------------------------------------------
@@ -214,6 +223,17 @@ fn parse_npy_header(reader: &mut impl Read) -> crate::Result<NpyHeader> {
             });
         }
     };
+
+    // Reject an adversarial declared header length before allocating. The
+    // v2/v3 `u32` length can reach 4 GiB; legitimate headers are <1 KiB.
+    if header_len > NPY_MAX_HEADER_BYTES {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "NPY header length {header_len} bytes exceeds the \
+                 {NPY_MAX_HEADER_BYTES}-byte cap"
+            ),
+        });
+    }
 
     // Read header string.
     let mut header_buf = vec![0u8; header_len];
