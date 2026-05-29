@@ -28,6 +28,7 @@
 - [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
+- [Parser robustness (Phase 6.6, v0.6.1)](#parser-robustness-phase-66-v061)
 - [Performance validation (Phase 6.5)](#performance-validation-phase-65)
 - [Used by](#used-by)
 - [License](#license)
@@ -271,6 +272,10 @@ Measured across the **full 6 960-file [AlgZoo](https://github.com/alignment-rese
 PyTorch has no separate inspect-only primitive — `torch.load(weights_only=True)` is the closest comparable; it fully materialises every tensor before the caller can iterate the `state_dict` for summary stats, so the speedup is a **lower bound** that grows by orders of magnitude on larger models (the reader path stays bounded by `data.pkl` size while `torch.load` scales linearly in total tensor-data size). Per-family breakdown and the full method are in [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 6.
 
 `Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
+
+### Parser robustness (Phase 6.6, v0.6.1)
+
+Every parser bounds its header-derived allocations against the [`candle #3533`](https://github.com/huggingface/candle/issues/3533) unguarded-allocation DoS class (CWE-770 / CWE-1284 / CWE-400): a length / count / dimension field read from a file header is validated against an explicit cap *before* it reaches `vec!` / `Vec::with_capacity` / the pickle VM. GGUF and safetensors were already capped; v0.6.1 closes the NPZ `header_len` window (NPY v2/v3 decode it as a `u32`, reachable to 4 GiB) and the PyTorch `.pth` mmap-path `data.pkl` size gate (previously bounded only by file size), and adds NPZ array-byte and per-opcode pickle payload caps as defence in depth. Malformed or malicious inputs fail fast with a clear `AnamnesisError::Parse`; legitimate files are unaffected, and there is no API change. This matters because remote header inspection over an `HTTP`-range adapter parses bytes from arbitrary, untrusted repositories.
 
 ### Performance validation (Phase 6.5)
 
