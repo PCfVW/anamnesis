@@ -252,13 +252,16 @@ impl ParsedModel {
                 let cols = shape.last().copied().ok_or_else(|| AnamnesisError::Parse {
                     reason: "shape has no last dimension".into(),
                 })?;
-                let rows: usize = shape
+                let leading = shape
                     .get(..shape.len() - 1)
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: "shape slice out of bounds".into(),
-                    })?
-                    .iter()
-                    .product();
+                    })?;
+                let rows = crate::parse::utils::checked_num_elements(leading).ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: "shape row-count product overflows usize".into(),
+                    }
+                })?;
                 Ok((rows, cols))
             }
         }

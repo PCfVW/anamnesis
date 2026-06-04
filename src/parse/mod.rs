@@ -26,8 +26,10 @@ pub mod gguf_write;
 #[cfg(feature = "ollama")]
 pub mod ollama;
 
-/// Shared parsing utilities (byte-swap, etc.) used by multiple format parsers.
-#[cfg(any(feature = "npz", feature = "pth"))]
+/// Shared parsing utilities (byte-swap, checked shape-product, etc.) used by
+/// multiple format parsers and the dequant/encode layers. Always compiled —
+/// `checked_num_elements` is used by the always-on `ParsedModel`; the
+/// byte-swap helper inside is itself `npz`/`pth`-gated.
 pub(crate) mod utils;
 
 #[cfg(feature = "gguf")]
