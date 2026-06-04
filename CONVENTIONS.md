@@ -461,6 +461,31 @@ file-declared count get the additional `PREALLOC_SOFT_CAP` clamp (see
 `src/parse/gguf.rs`) so a header that *passes* the hard cap still cannot drive
 an eager multi-hundred-MB `with_capacity`.
 
+### Validate a declared size against the container's stated size
+
+A constant cap bounds the *worst case*; it does not catch a value that is
+absurd *relative to the input at hand*. When the container already states how
+many bytes a region holds — a `ZIP` entry's uncompressed `size()`, the
+remaining bytes in a length-prefixed stream, a block-format's
+`n_blocks × type_size` — cross-check the size you *derived* from other header
+fields (a shape product, an element count) against it, and reject the mismatch
+**before** allocating or decompressing. This is a third, independent defence:
+checked arithmetic stops overflow, the constant cap stops the absurd-in-absolute
+case, and this stops the absurd-relative-to-this-file case (and, for compressed
+containers, bounds decompression to the entry's honest declared size).
+
+Exemplars in this crate:
+- `GGUF` dequant: `validate_dequant_input` rejects unless
+  `data.len() == n_blocks × type_size` (`src/remember/gguf.rs`).
+- `GGUF` reader: every variable read is gated by `ensure_remaining(n)` against
+  the captured `file_len` **before** the buffer is allocated (`src/parse/gguf.rs`).
+- `NPZ`: `read_array_data` rejects a shape-derived `data_bytes` exceeding the
+  `ZIP` entry's declared `size()` before the `vec!` (`src/parse/npz.rs`).
+
+When the same bound guards two entry points (an mmap path and a reader path),
+factor it into one helper so the two cannot drift — as `enforce_pkl_size_cap`
+does for the `.pth` parser.
+
 ### Magic-byte plus minimum-size guard
 
 Format detection must read the magic bytes via `.get(..N)` (not direct
