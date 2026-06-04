@@ -9,6 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# Path-based targets materialise the fuzz input to a temp file so the
+# data-extraction parsers (`parse_npz`, `parse_pth`) can be reached.
+tempfile = "3"
 
 [dependencies.anamnesis]
 path = ".."
@@ -45,6 +48,20 @@ bench = false
 [[bin]]
 name = "fuzz_pth"
 path = "fuzz_targets/fuzz_pth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_npz_parse"
+path = "fuzz_targets/fuzz_npz_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pth_parse"
+path = "fuzz_targets/fuzz_pth_parse.rs"
 test = false
 doc = false
 bench = false

@@ -12,12 +12,18 @@ tests *pin* them, and fuzzing *searches* for inputs we didn't think of.
 
 ## Targets
 
+Two flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
+inspection surface) and **path/parse** targets (the full data-extraction path,
+materialising the input to a temp file).
+
 | Target | Entry point | What it exercises |
 |---|---|---|
 | `fuzz_safetensors` | `parse_safetensors_header_from_reader` | safetensors header parse + cap |
 | `fuzz_npz` | `inspect_npz_from_reader` | ZIP central-directory walk + NPY header parser (`NPY_MAX_HEADER_BYTES`) |
 | `fuzz_gguf` | `inspect_gguf_from_reader` | metadata KV / typed-array readers + `read_bytes`/`ensure_remaining` |
 | `fuzz_pth` | `inspect_pth_from_reader` | **ZIP walk + the pickle VM** (opcodes, `GLOBAL` allowlist, memo/mark stacks, recursion) — the highest-value target |
+| `fuzz_npz_parse` | `parse_npz` (via temp file) | the **data-extraction path**: `read_array_data` + the `entry.size()` cross-check |
+| `fuzz_pth_parse` | `parse_pth` + `tensors()` (via temp file) | the **mmap path + tensor extraction**: `build_entry_index`, the `MAX_PKL_SIZE` mmap guard, stride/offset resolution |
 
 ## Prerequisites — Linux / macOS / WSL (not Windows-MSVC)
 
@@ -77,9 +83,11 @@ it and it never ships to crates.io.
 ## Status
 
 Authored and run under WSL2 Ubuntu (nightly `rustc` + `cargo-fuzz` 0.13,
-libFuzzer). Smoke campaigns (Phase 6.7): each target ~20 s unseeded
-(~0.2–0.8 M runs each), plus a 62 s seeded `fuzz_pth` campaign (213 k runs,
-coverage 1412 / features 5372, corpus 675 inputs, RSS steady ~489 MB) — **zero
-crashes** across all four. Not yet wired into CI; a scheduled Linux fuzz job is
-a candidate follow-up (it needs nightly + `cargo-fuzz` install in the runner,
-so it is intentionally kept out of the stable-only push/PR matrix).
+libFuzzer). Smoke campaigns (Phase 6.7): the four reader targets ~20 s unseeded
+(~0.2–0.8 M runs each) plus a 62 s seeded `fuzz_pth` campaign (213 k runs,
+coverage 1412 / features 5372, corpus 675 inputs, RSS steady ~489 MB); the two
+path targets 30 s seeded each (`fuzz_npz_parse` 102 k runs, `fuzz_pth_parse`
+103 k runs) — **zero crashes** across all six. Not yet wired into CI; a
+scheduled Linux fuzz job is a candidate follow-up (it needs nightly +
+`cargo-fuzz` install in the runner, so it is intentionally kept out of the
+stable-only push/PR matrix).
