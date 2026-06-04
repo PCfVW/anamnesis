@@ -463,11 +463,25 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 /// correct in-memory representation — zero per-element processing. For
 /// big-endian data, a byte-swap pass is applied in-place after the bulk read.
 ///
+/// `entry_size` is the ZIP entry's declared uncompressed size. The
+/// shape-derived `data_bytes` is rejected if it exceeds `entry_size`
+/// **before** any allocation: an entry cannot hold (or decompress to) more
+/// than it declares, so a small entry claiming an enormous shape — or a
+/// `DEFLATE` entry whose declared shape would balloon the allocation — fails
+/// fast instead of driving a multi-`GiB` `vec!`. This mirrors the
+/// `data.len() == n_blocks × type_size` cross-check the `GGUF` dequant path
+/// performs, and complements the absolute `NPZ_MAX_ARRAY_BYTES` cap.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the element count or byte count
-/// overflows `usize`, or if the read fails.
-fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<Vec<u8>> {
+/// overflows `usize`, if `data_bytes` exceeds the entry's declared size or
+/// the `NPZ_MAX_ARRAY_BYTES` cap, or if the read fails.
+fn read_array_data(
+    reader: &mut impl Read,
+    header: &NpyHeader,
+    entry_size: u64,
+) -> crate::Result<Vec<u8>> {
     let n_elements: usize = header
         .shape
         .iter()
@@ -485,6 +499,17 @@ fn read_array_data(reader: &mut impl Read, header: &NpyHeader) -> crate::Result<
     // CAST: usize → u64, lossless widening on all supported targets
     #[allow(clippy::as_conversions)]
     let data_bytes_u64 = data_bytes as u64;
+    // Reject before allocating: the declared shape cannot require more bytes
+    // than the ZIP entry holds (bounds the alloc to the entry's honest size
+    // and any DEFLATE expansion to it).
+    if data_bytes_u64 > entry_size {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "NPY array size {data_bytes} bytes exceeds the declared ZIP \
+                 entry size {entry_size} bytes"
+            ),
+        });
+    }
     if data_bytes_u64 > NPZ_MAX_ARRAY_BYTES {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -790,7 +815,8 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
             });
         }
 
-        let data = read_array_data(&mut entry, &header)?;
+        let entry_size = entry.size();
+        let data = read_array_data(&mut entry, &header, entry_size)?;
 
         result.insert(
             name.clone(),
@@ -1033,7 +1059,9 @@ mod tests {
         assert!(!header.fortran_order);
         assert_eq!(header.shape, vec![2, 2]);
 
-        let result = read_array_data(&mut reader, &header).unwrap();
+        // u64::MAX entry size: this test exercises the read/byteswap path, not
+        // the entry-size guard (covered by its own test below).
+        let result = read_array_data(&mut reader, &header, u64::MAX).unwrap();
         assert_eq!(result, data);
     }
 
@@ -1051,7 +1079,7 @@ mod tests {
         let header = parse_npy_header(&mut reader).unwrap();
         assert!(header.big_endian);
 
-        let result = read_array_data(&mut reader, &header).unwrap();
+        let result = read_array_data(&mut reader, &header, u64::MAX).unwrap();
         // After byteswap: [00, 00, 80, 3F] = 1.0 in LE
         assert_eq!(result, vec![0x00, 0x00, 0x80, 0x3F]);
         let val = f32::from_le_bytes([result[0], result[1], result[2], result[3]]);
@@ -1084,7 +1112,7 @@ mod tests {
         assert_eq!(header.dtype, NpzDtype::F64);
         assert_eq!(header.shape, vec![1]);
 
-        let result = read_array_data(&mut reader, &header).unwrap();
+        let result = read_array_data(&mut reader, &header, u64::MAX).unwrap();
         assert_eq!(result, 42.5_f64.to_le_bytes());
     }
 
@@ -1399,11 +1427,36 @@ mod tests {
             // 32-bit usize at the byte-count multiply).
             shape: vec![3_000_000_000usize],
         };
+        // u64::MAX entry size so the absolute cap (not the entry-size guard)
+        // is what rejects this shape.
         let mut empty = std::io::Cursor::new(Vec::new());
-        let result = read_array_data(&mut empty, &header);
+        let result = read_array_data(&mut empty, &header, u64::MAX);
         assert!(
             result.is_err(),
             "oversized declared array must be rejected, got Ok"
+        );
+    }
+
+    /// A declared shape requiring more bytes than the ZIP entry holds is
+    /// rejected before any allocation (Phase 6.7 Step 1) — the entry-size
+    /// cross-check, mirroring the `GGUF` dequant path. Here a 16-byte entry is
+    /// handed a header declaring 1000 `F32` elements (4000 bytes).
+    #[test]
+    fn array_bytes_rejected_above_entry_size() {
+        let header = NpyHeader {
+            dtype: NpzDtype::F32,
+            big_endian: false,
+            fortran_order: false,
+            shape: vec![1000],
+        };
+        let mut empty = std::io::Cursor::new(Vec::new());
+        let Err(err) = read_array_data(&mut empty, &header, 16) else {
+            panic!("over-declared shape vs entry size must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declared ZIP entry size"),
+            "expected entry-size rejection, got: {msg}"
         );
     }
 }
