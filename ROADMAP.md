@@ -33,6 +33,8 @@
   - [Phase 5: Quantization (Lethe)](#phase-5-quantization-lethe)
   - [Phase 6: Format Conversion Matrix](#phase-6-format-conversion-matrix)
   - [Phase 6.5: Benchmarking & Performance Validation](#phase-65-benchmarking--performance-validation)
+  - [Phase 6.6: Security Hardening — Unguarded Allocations](#phase-66-security-hardening--unguarded-allocations)
+  - [Phase 6.7: Security Audit Hardening + Fuzzing](#phase-67-security-audit-hardening--fuzzing)
   - [Phase 7: Python Bindings (PyO3)](#phase-7-python-bindings-pyo3)
   - [Phase 7.5: Lethe Encode Completion](#phase-75-lethe-encode-completion)
   - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
@@ -559,6 +561,33 @@ A hf-fm-side audit (2026-05-19) cross-checked all four anamnesis parsers against
 - **General `cargo fuzz` harness.** A fuzz campaign over each parser would catch more bug classes than the targeted regression tests in Step 5, but is a larger investment and belongs in a dedicated phase, not v0.6.1. Earmark for a future Phase 6.7 if downstream demand surfaces.
 
 **Deliverable:** `anamnesis` v0.6.1 — patch-level security hardening triggered by the candle #3533 audit. Two unguarded-allocation findings closed (Steps 1–2), two defence-in-depth caps optionally added (Steps 3–4), regression tests pinning each fix (Step 5). No user-facing behaviour change for legitimate files; no API breakage. — **PUSH + tag `v0.6.1`**
+
+### Phase 6.7: Security Audit Hardening + Fuzzing
+
+**Goal:** Before exposing anamnesis to the Python ecosystem in [Phase 7](#phase-7-python-bindings-pyo3) — which multiplies the audience ~100× and adds an FFI trust boundary — run a full security audit of every parser and transform layer, close what it surfaces, and stand up a `cargo fuzz` harness for ongoing coverage. Patch-level release (`v0.6.2`): no new public API, no behaviour change for legitimate files.
+
+**Origin — `candle #3556` and the pre-Phase-7 audit:** Re-reading the fix PR for [`candle #3533`](https://github.com/huggingface/candle/issues/3533), [`PR #3556`](https://github.com/huggingface/candle/pull/3556), showed its substantive addition beyond constant caps is a **remaining-bytes check** — capture the stream length once, reject any declared length exceeding the bytes physically left. anamnesis's `GGUF` reader already had this (`read_into` threads `file_len`); the audit asked where the *rest* of the codebase stands against the same bug class (CWE-770 / CWE-1284 / CWE-400) ahead of `pip install anamnesis`.
+
+**Audit method (recorded because it shaped the result):** three parallel read-only agents for breadth, then **solo verification of every claim against the source**. The agents were a useful candidate generator but unreliable as arbiters — two of three "HIGH" findings were false positives that collapsed when the cited lines were read (`remember/bnb.rs` guards `block_size == 0` and `nested_block_size == 0`; `remember/fp8.rs` bounds its edge block via `.get_mut(...).ok_or_else`). The `remember/gguf.rs` coverage gap the agents left (only spot-checked) was closed by a solo read: that file is clean — its `validate_dequant_input` gate cross-checks `data.len() == n_blocks × type_size` (the very pattern PR #3556 champions) and all seven `IQ`-grid indices are bit-mask-bounded to their exact grid lengths (256 / 512 / 1024 / 2048). **Net: no high-severity / memory-unsafety bug; three verified low-to-medium findings, all hardening/consistency.**
+
+**Sequencing — three fixes + harness, one patch version (`v0.6.2`):**
+
+- [x] **Step 1 — Finding A (NPZ array bytes vs ZIP entry size):** `read_array_data` now takes the ZIP entry's declared uncompressed `size()` and rejects a shape-derived `data_bytes` exceeding it **before** `vec![0u8; data_bytes]`. Previously the only bound was the 8 GiB `NPZ_MAX_ARRAY_BYTES` cap, so a tiny entry declaring an enormous shape — or a `DEFLATE` entry whose declared shape would balloon the allocation — could drive a multi-GiB transient alloc / decompression before `read_exact` failed. This adopts the `data.len() == expected` cross-check the `GGUF` dequant path already performs. `PTH` is immune on the mmap path (the `build_entry_index` `Stored`-only filter) and bounded to 100 MiB on the reader path (`enforce_pkl_size_cap` before `read_to_end`). — **commit `798450a`**
+- [x] **Step 2 — Finding B (GGUF `read_bytes` ordering):** factor the remaining-bytes check out of `read_into` into `ensure_remaining(n)` and call it at the top of `read_bytes`, before `vec![0u8; n]`. A tiny file declaring a string up to the type cap (`MAX_STRING_LEN` = 16 MiB) no longer allocates before the EOF check — the candle #3556 ordering. — **commit `c562027`**
+- [ ] **Step 3 — Finding C (unchecked `shape.iter().product()`):** add a shared `checked_num_elements(shape) -> Option<usize>` helper and route the two production sites ([src/model.rs](src/model.rs) `shape_to_rows_cols`, [src/lethe/bnb_writer.rs](src/lethe/bnb_writer.rs) `is_eligible_for_nf4`) through it. Both currently bypass the guarded `TensorEntry::num_elements()`, risking a debug-panic / release-wrap on an adversarial shape. — **commit**
+- [ ] **Step 4 — CONVENTIONS invariant:** document **"validate a declared payload size against the container's own stated size"** under "When Parsing Untrusted Input" — a third defence distinct from constant caps and checked arithmetic, with `GGUF`'s `data.len() == n_blocks × type_size` and NPZ's new `entry.size()` check as the exemplars. — **commit**
+- [ ] **Step 5 — `cargo fuzz` harness:** a `fuzz/` workspace member (excluded from the published crate; nightly-only, not in the stable CI matrix) with one libFuzzer target per parser (`safetensors` / `gguf` / `npz` / `pth`), seeded from the existing checked-in fixtures. **Split rule:** if corpus management / triage / CI integration balloons, this moves to a follow-up `v0.6.3`; the `v0.6.2` floor is Steps 1–4 + 6. — **commit**
+- [ ] **Step 6 — Regression tests + docs:** in-module malicious-fixture tests (NPZ over-declared shape vs entry size — landed with Step 1; `GGUF` oversize-string reject-before-alloc; `checked_num_elements` overflow), `CHANGELOG` `### Security` entry, and this section checked off with commit hashes. — **commit** — **PUSH + tag `v0.6.2`**
+
+**Verified safe (no change required):** `remember/bnb.rs` divisor guards; `remember/fp8.rs` edge index; `remember/` output allocations (`checked_mul(2)`); the whole of `remember/gguf.rs` (validation gate + mask-bounded `IQ` grids); the `safetensors` slice/reader header caps from Phase 4.8 / 6.6.
+
+**Out of scope (deferred or never):**
+
+- **NPZ compression-ratio cap / lowering the 8 GiB budget.** The `entry.size()` cross-check (Step 1) is the precise fix; a ratio cap is extra defence-in-depth to revisit if a concrete need surfaces.
+- **`type_size` single-source-of-truth in `remember/gguf.rs`.** The per-kernel hard-coded `type_size` duplicates `dtype.type_size()`; test-covered and not attacker-controllable, so informational only.
+- **CLI `convert` file re-read inside the tensor loop.** A performance inefficiency, not a memory-safety issue.
+
+**Deliverable:** `anamnesis` v0.6.2 — pre-Phase-7 security-audit hardening. Three audit findings closed (NPZ entry-size cross-check, `GGUF` reject-before-allocate, checked shape-product), the cross-check discipline codified in `CONVENTIONS.md`, and a `cargo fuzz` harness for ongoing coverage. No user-facing behaviour change for legitimate files; no API breakage. — **PUSH + tag `v0.6.2`**
 
 ### Phase 7: Python Bindings (PyO3)
 
