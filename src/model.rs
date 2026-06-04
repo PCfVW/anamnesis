@@ -19,6 +19,7 @@ use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
     parse_safetensors_header, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
 };
+use crate::parse::utils::checked_num_elements;
 #[cfg(feature = "awq")]
 use crate::remember::awq::dequantize_awq_to_bf16;
 #[cfg(feature = "bnb")]
@@ -258,10 +259,8 @@ impl ParsedModel {
                         .ok_or_else(|| AnamnesisError::Parse {
                             reason: "shape slice out of bounds".into(),
                         })?;
-                let rows = crate::parse::utils::checked_num_elements(leading).ok_or_else(|| {
-                    AnamnesisError::Parse {
-                        reason: "shape row-count product overflows usize".into(),
-                    }
+                let rows = checked_num_elements(leading).ok_or_else(|| AnamnesisError::Parse {
+                    reason: "shape row-count product overflows usize".into(),
                 })?;
                 Ok((rows, cols))
             }

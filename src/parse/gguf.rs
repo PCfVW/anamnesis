@@ -1231,19 +1231,20 @@ impl<R: Read + Seek> GgufReader<R> {
         })
     }
 
-    /// Reads exactly `buf.len()` bytes into `buf`, advancing the cursor.
-    ///
-    /// Pre-validates the request against `file_len` so an adversarial header
-    /// that claims a length past EOF produces a deterministic
-    /// `AnamnesisError::Parse` (matching the slice-based cursor's behaviour)
-    /// rather than relying on the underlying reader's `UnexpectedEof`
-    /// kind-mapping.
     /// Validates that `n` more bytes are available from the current position
     /// without running past `file_len`, returning the resulting end offset.
     ///
     /// Pulled out of [`read_into`](Self::read_into) so it can also gate
     /// [`read_bytes`](Self::read_bytes) **before** it allocates — an
-    /// adversarial declared length is rejected without committing any heap.
+    /// adversarial declared length is rejected without committing any heap,
+    /// producing a deterministic `AnamnesisError::Parse` (matching the
+    /// slice-based cursor's behaviour) rather than relying on the underlying
+    /// reader's `UnexpectedEof` kind-mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if `self.pos + n` overflows `u64` or
+    /// exceeds `file_len`.
     fn ensure_remaining(&self, n: u64) -> crate::Result<u64> {
         let end = self
             .pos
@@ -1263,6 +1264,11 @@ impl<R: Read + Seek> GgufReader<R> {
         Ok(end)
     }
 
+    /// Reads exactly `buf.len()` bytes into `buf`, advancing the cursor.
+    ///
+    /// Validates the request via [`ensure_remaining`](Self::ensure_remaining)
+    /// before reading, so an adversarial header claiming a length past EOF
+    /// produces a deterministic `AnamnesisError::Parse`.
     fn read_into(&mut self, buf: &mut [u8]) -> crate::Result<()> {
         // CAST: usize → u64, length of a borrowed buffer always fits in u64
         // on every supported target (64-bit and 32-bit).

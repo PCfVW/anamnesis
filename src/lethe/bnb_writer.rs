@@ -35,6 +35,7 @@ use std::path::Path;
 
 use crate::error::AnamnesisError;
 use crate::lethe::bnb::{encode_bnb4_compute_absmax, NF4_CODEBOOK};
+use crate::parse::utils::checked_num_elements;
 
 /// `bitsandbytes`-default block size for `NF4` encoding.
 pub const NF4_BLOCK_SIZE: usize = 64;
@@ -68,7 +69,7 @@ pub fn is_eligible_for_nf4(shape: &[usize]) -> bool {
     // Checked product: an adversarial shape whose element count overflows
     // `usize` is treated as not eligible (pass-through) rather than panicking
     // in debug / wrapping in release.
-    let Some(total) = crate::parse::utils::checked_num_elements(shape) else {
+    let Some(total) = checked_num_elements(shape) else {
         return false;
     };
     total >= NF4_BLOCK_SIZE && total.is_multiple_of(NF4_BLOCK_SIZE)
