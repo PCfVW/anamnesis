@@ -11,6 +11,9 @@ documentation = "https://docs.rs/anamnesis"
 keywords = ["safetensors", "dequantization", "pytorch", "gptq", "machine-learning"]
 categories = ["science", "parser-implementations"]
 default-run = "anamnesis"
+# The `fuzz/` cargo-fuzz harness is dev-only (nightly + libFuzzer) and must
+# never ship in the published crate or affect the build for ordinary users.
+exclude = ["/fuzz"]
 
 # `[package.metadata.docs.rs]` accepts only docs.rs-specific build keys
 # (features, targets, all-features, no-default-features). Other Cargo

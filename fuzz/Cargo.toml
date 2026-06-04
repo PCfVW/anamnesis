@@ -1,0 +1,50 @@
+[package]
+name = "anamnesis-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.anamnesis]
+path = ".."
+features = ["npz", "pth", "gguf"]
+
+# Own workspace so it is not absorbed into the parent; the published
+# `anamnesis` crate excludes `/fuzz` entirely (see the root `Cargo.toml`).
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_safetensors"
+path = "fuzz_targets/fuzz_safetensors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_npz"
+path = "fuzz_targets/fuzz_npz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_gguf"
+path = "fuzz_targets/fuzz_gguf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pth"
+path = "fuzz_targets/fuzz_pth.rs"
+test = false
+doc = false
+bench = false
