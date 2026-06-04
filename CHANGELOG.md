@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-04
+
 ### Security
 
 - **Pre-Phase-7 security audit hardening (Phase 6.7).** A full audit of every
