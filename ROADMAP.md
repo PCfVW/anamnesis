@@ -35,6 +35,7 @@
   - [Phase 6.5: Benchmarking & Performance Validation](#phase-65-benchmarking--performance-validation)
   - [Phase 6.6: Security Hardening — Unguarded Allocations](#phase-66-security-hardening--unguarded-allocations)
   - [Phase 6.7: Security Audit Hardening + Fuzzing](#phase-67-security-audit-hardening--fuzzing)
+  - [Phase 6.8: Untrusted-Input Resource Governance](#phase-68-untrusted-input-resource-governance)
   - [Phase 7: Python Bindings (PyO3)](#phase-7-python-bindings-pyo3)
   - [Phase 7.5: Lethe Encode Completion](#phase-75-lethe-encode-completion)
   - [Phase 8: Emerging Quantization Formats](#phase-8-emerging-quantization-formats)
@@ -589,6 +590,25 @@ A hf-fm-side audit (2026-05-19) cross-checked all four anamnesis parsers against
 
 **Deliverable:** `anamnesis` v0.6.2 — pre-Phase-7 security-audit hardening. Three audit findings closed (NPZ entry-size cross-check, `GGUF` reject-before-allocate, checked shape-product), the cross-check discipline codified in `CONVENTIONS.md`, and a `cargo fuzz` harness for ongoing coverage. No user-facing behaviour change for legitimate files; no API breakage. — **PUSH + tag `v0.6.2`**
 
+### Phase 6.8: Untrusted-Input Resource Governance
+
+**Goal:** Give callers a way to bound parser resource use to *their* environment, before [Phase 7](#phase-7-python-bindings-pyo3) multiplies the audience ~100× and makes "parse an untrusted, user-uploaded file" the normal operating mode. Phases 6.6–6.7 closed the *unbounded* DoS class; the fixed caps that remain are tuned for server / GPU hosts and still exceed what a memory-constrained edge device (a drone companion computer, an MCU-class board) or a per-worker slot in a multi-tenant model-serving / fine-tuning backend can absorb. This phase makes the limits *caller-configurable* and adds the two governance pieces a multi-tenant host needs — an aggregate budget and a decompression-ratio cap — plus documents the parse-first policy-gate pattern. Library-side and language-agnostic (it benefits every consumer, not only the Python bindings); ships as `v0.6.3` and lands **before** Phase 7 so the bindings expose an already-governed parser.
+
+**Threat model — why fixed caps are not enough for these hosts:** the per-item caps (`NPZ_MAX_ARRAY_BYTES` 8 GiB, `MAX_PKL_SIZE` 100 MiB, `MAX_STRING_LEN` 16 MiB, the GGUF `MAX_*` family) are (a) **per-item, not aggregate** — a file declaring 50 000 tensors each just under a cap blows up in total while every individual check passes; (b) **fixed at server scale** — a 2 GB worker or edge board `OOM`s on a file that is well under the 8 GiB array cap; and (c) **silent on amplification** — the `entry.size()` cross-check (6.7) bounds a `DEFLATE` array to its *honestly declared* uncompressed size, but a few-KB compressed entry can honestly declare gigabytes. On a server an `OOM` kills one worker (DoS for co-tenants; cheap amplification → cloud-bill / outage); on an edge host it is a dead process (with `panic = "abort"`, any panic aborts instantly). Both want to *reject early with a clean `Err`* against a budget they choose.
+
+**Sequencing — three library pieces + docs, one patch version (`v0.6.3`):**
+
+- [ ] **Step 1 — `ParseLimits` (caller-supplied budget):** a `ParseLimits` value (max single allocation, max *aggregate* declared bytes, max total tensor / array / KV count) threaded through every parser entry point and enforced fail-fast with `AnamnesisError::Parse` *before* allocation. The existing fixed caps become the permissive defaults (`ParseLimits::default()` == today's behaviour → no breaking change); callers tighten them to their environment (a drone sets MB-scale ceilings; an MLaaS worker sets per-slot-RAM ceilings). Subsumes the edge-deployment idea formerly in Future Directions — edge and MLaaS are the same feature at different numbers. — **commit**
+- [ ] **Step 2 — Aggregate accounting:** track a running total of declared bytes / counts across the whole file and reject when it crosses the `ParseLimits` aggregate budget, closing the many-small-items blow-up the per-item caps miss. — **commit**
+- [ ] **Step 3 — Decompression-ratio cap (`NPZ` / zip `DEFLATE`):** reject an entry whose uncompressed-to-compressed ratio exceeds a configurable bound, killing the cheap-amplification economics of a zip bomb. Promoted from the 6.7 "review-again" list — the multi-tenant track is the concrete need. — **commit**
+- [ ] **Step 4 — Document the inspect-before-parse policy gate + tests:** the parse-first payoff — the bounded, header-only `inspect_*_from_reader` paths (already shipped) report total declared bytes / tensor count, so a host should `inspect` → check against policy → only then `parse`. Make this the documented, front-of-README pattern, ensure each inspect path surfaces the totals a gate needs, and add regression + `cargo fuzz` coverage for the `ParseLimits`, aggregate, and ratio paths. — **commit** — **PUSH + tag `v0.6.3`**
+
+**Complement, not duplication:** bounding *peak* heap regardless of model size is [Phase 10 (Streaming Output)](#phase-10-streaming-output)'s job (stream blocks to disk instead of materialising); 6.8 bounds what a parser will *accept* before it starts, Phase 10 bounds what it *holds* while running. Together they let an untrusted-input host reject hostile declarations early **and** cap honest-but-large work.
+
+**Out of scope:** model authenticity / signing (detecting the injected file in the first place) and process / resource isolation (`rlimit`, cgroup, sandboxed subprocess) are the caller's links of the defence-in-depth chain — anamnesis owns only defensive parsing and the clean `Err` the host fails safe on.
+
+**Deliverable:** `anamnesis` v0.6.3 — caller-configurable `ParseLimits` (per-item + aggregate), a decompression-ratio cap, and the documented inspect-before-parse policy gate. Default behaviour unchanged; no breaking change. Lands before Phase 7 so `pip install anamnesis` exposes an already-governed parser. — **PUSH + tag `v0.6.3`**
+
 ### Phase 7: Python Bindings (PyO3)
 
 **Goal:** Expose anamnesis to the Python ecosystem via `pip install anamnesis`. Phases 1–6 give anamnesis the fastest dequantization (2.7–54× vs PyTorch), the fastest NPZ parser (17.7× vs npyz), PyTorch `.pth` parsing, GGUF support, BnB encoding, and the `convert()` pipeline scaffold — all in pure Rust. Python bindings multiply the audience by ~100×, replacing ad-hoc dequantization scripts across the ML community. By shipping after the format conversion scaffold, `pip install anamnesis` exposes `convert()` from day one; the remaining encode-side targets (GGUF / FP8 / IQ / TQ / MXFP4) light up at v0.7.5 / Phase 7.5 through the same Python API once those kernels land.
@@ -599,6 +619,7 @@ A hf-fm-side audit (2026-05-19) cross-checked all four anamnesis parsers against
 - [ ] `parse_npz()` binding — returns `dict[str, NpzTensor]` with NumPy-compatible arrays — **commit**
 - [ ] Safetensors `parse()` + `inspect()` bindings — **commit**
 - [ ] `remember()` / `forget()` / `convert()` bindings — dequantize, quantize, and convert from Python — **commit**
+- [ ] **Hardening for untrusted input (binding-specific):** every parser error surfaces as a **catchable Python exception**, never a process `abort` — so a multi-tenant backend maps a hostile upload to a `400`, not a dead worker; expose `inspect()` prominently as the recommended *first* call (the Phase 6.8 inspect-before-parse policy gate) and surface `ParseLimits` to Python callers; **release the GIL** during large `parse`/`remember`/`convert` so one tenant's parse does not stall others; add a binding-level fuzz/smoke test asserting *malformed bytes → Python exception, never a process exit*. — **commit**
 - [ ] `maturin` build config, PyPI packaging, CI workflow — **commit**
 - [ ] Python test suite — validate against PyTorch reference on the same fixtures — **commit** — **PUSH**
 
@@ -724,7 +745,6 @@ The following are potential extensions beyond Phase 10, listed for context. They
 - **Quantization quality analysis** — per-layer distortion reports, optimal mixed-precision selection, diff two quantized versions of the same model
 - **WASM target** — compile anamnesis to WASM for browser-based model inspection (drop a safetensors file, see tensor layout and quantization scheme instantly)
 - **GPU-accelerated dequantization** — compute shader (wgpu/Vulkan) kernels for dequantization hot loops, for cases where the Phase 9 CPU SIMD pass is still insufficient (e.g., bulk 70 B-parameter conversions on a workstation with an idle GPU)
-- **Configurable allocation limits for edge / embedded deployment** — the parser caps (`NPZ_MAX_ARRAY_BYTES` 8 GiB, `MAX_PKL_SIZE` 100 MiB, `MAX_STRING_LEN` 16 MiB, the GGUF `MAX_*` family) are tuned for server / GPU hosts: they close the *unbounded* DoS class (Phases 6.6–6.7), but a file declaring a size *under* the cap can still exceed the RAM of a memory-constrained device. On a safety-critical edge host — a drone companion computer, an MCU-class board — an `OOM` is not a dropped request but a dead process (and with `panic = "abort"`, any panic aborts instantly). Expose the caps as a caller-supplied budget (a `ParseLimits` struct or builder) so such hosts can set device-appropriate ceilings and get a clean `Err` to fail safe on, rather than an `OOM`. This is the *defensive-parsing* link only; it pairs with model signing (authenticity — detect the injected file) and process / resource isolation (`rlimit` / cgroup, parse-before-arm) upstream, which are out of anamnesis's scope. Promote to a full phase if edge deployment becomes a concrete target.
 
 ---
 
