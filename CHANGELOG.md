@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Pre-Phase-7 security audit hardening (Phase 6.7).** A full audit of every
+  parser and transform layer against the [`candle #3533`](https://github.com/huggingface/candle/issues/3533)
+  /[`#3556`](https://github.com/huggingface/candle/pull/3556) DoS class, ahead
+  of the Python bindings. No high-severity bug; three low-to-medium findings
+  closed. No public API change, no behaviour change for legitimate files.
+  - **NPZ** `read_array_data` now rejects a shape-derived `data_bytes` that
+    exceeds the ZIP entry's declared uncompressed `size()` **before**
+    allocating — bounding both over-declared shapes and `DEFLATE` expansion to
+    the entry's honest size (the absolute `NPZ_MAX_ARRAY_BYTES` cap remains the
+    secondary bound).
+  - **GGUF** `read_bytes` validates the declared length against the remaining
+    file bytes (`ensure_remaining`) **before** the allocation, so a tiny file
+    declaring a string up to `MAX_STRING_LEN` (16 MiB) can no longer drive an
+    eager allocation.
+  - **Checked shape-products:** a shared `checked_num_elements` helper replaces
+    the unchecked `shape.iter().product()` at the two production sites
+    (`shape_to_rows_cols`, `is_eligible_for_nf4`), removing a debug-panic /
+    release-wrap on adversarial shapes.
+  - Added a `cargo fuzz` harness (`fuzz/`, dev-only, excluded from the
+    published crate) with a libFuzzer target per parser; authored and run under
+    WSL2 with zero crashes across ~1.5 M+ executions.
+
 ## [0.6.1] - 2026-05-29
 
 ### Security

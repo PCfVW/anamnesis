@@ -2342,6 +2342,34 @@ mod tests {
         f
     }
 
+    /// A metadata string that declares a length **under** `MAX_STRING_LEN` (so
+    /// it passes the constant cap) but **larger than the bytes remaining** in
+    /// the file is rejected by `ensure_remaining` *before* `read_bytes`
+    /// allocates (Phase 6.7 Step 2). The declared 1 MiB sails past the 16 MiB
+    /// cap, so this exercises the remaining-bytes guard specifically — a tiny
+    /// (~30-byte) file can no longer drive an eager 1 MiB allocation.
+    #[test]
+    fn oversized_string_rejected_before_alloc() {
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3); // version
+        b.push_u64(0); // tensor_count
+        b.push_u64(1); // kv_count
+        // One KV: key "k", value type 8 (string), declared length 1 MiB, no body.
+        b.push_u64(1);
+        b.push_bytes(b"k");
+        b.push_u32(8); // GGUF string value type
+        b.push_u64(1 << 20); // 1 MiB < MAX_STRING_LEN (16 MiB) → passes the cap
+        let bytes = b.finish();
+
+        let err = inspect_gguf_from_reader(std::io::Cursor::new(bytes)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("EOF") || msg.contains("wanted"),
+            "expected a remaining-bytes (EOF) rejection, got: {msg}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Happy-path tests
     // -----------------------------------------------------------------
