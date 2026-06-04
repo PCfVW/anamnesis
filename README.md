@@ -28,7 +28,7 @@
 - [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
-- [Parser robustness (Phase 6.6, v0.6.1)](#parser-robustness-phase-66-v061)
+- [Parser robustness (Phases 6.6–6.7, v0.6.1–v0.6.2)](#parser-robustness-phases-6667-v061v062)
 - [Performance validation (Phase 6.5)](#performance-validation-phase-65)
 - [Used by](#used-by)
 - [License](#license)
@@ -273,9 +273,11 @@ PyTorch has no separate inspect-only primitive — `torch.load(weights_only=True
 
 `Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
 
-### Parser robustness (Phase 6.6, v0.6.1)
+### Parser robustness (Phases 6.6–6.7, v0.6.1–v0.6.2)
 
 Every parser bounds its header-derived allocations against the [`candle #3533`](https://github.com/huggingface/candle/issues/3533) unguarded-allocation DoS class (CWE-770 / CWE-1284 / CWE-400): a length / count / dimension field read from a file header is validated against an explicit cap *before* it reaches `vec!` / `Vec::with_capacity` / the pickle VM. GGUF and safetensors were already capped; v0.6.1 closes the NPZ `header_len` window (NPY v2/v3 decode it as a `u32`, reachable to 4 GiB) and the PyTorch `.pth` mmap-path `data.pkl` size gate (previously bounded only by file size), and adds NPZ array-byte and per-opcode pickle payload caps as defence in depth. Malformed or malicious inputs fail fast with a clear `AnamnesisError::Parse`; legitimate files are unaffected, and there is no API change. This matters because remote header inspection over an `HTTP`-range adapter parses bytes from arbitrary, untrusted repositories.
+
+**v0.6.2** follows up with a full pre-Phase-7 security audit (all four parsers plus the dequant/encode layers) and adds a *container-size cross-check* — a third defence beyond constant caps and checked arithmetic. NPZ rejects a declared array size larger than the ZIP entry's own uncompressed `size()` before allocating, and the GGUF reader validates each variable-length read against the bytes physically remaining before allocating, so a tiny file can no longer drive an eager allocation up to a type cap. A shared checked shape-product helper removes a debug-panic / release-wrap on adversarial shapes. Backing the audit is a coverage-guided [`cargo fuzz`](fuzz/README.md) harness — one libFuzzer target per parser, dev-only and excluded from the published crate, focused on the pickle VM (the deepest state machine) — run with zero crashes across the parser surface.
 
 ### Performance validation (Phase 6.5)
 
