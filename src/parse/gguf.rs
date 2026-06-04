@@ -2355,7 +2355,7 @@ mod tests {
         b.push_u32(3); // version
         b.push_u64(0); // tensor_count
         b.push_u64(1); // kv_count
-        // One KV: key "k", value type 8 (string), declared length 1 MiB, no body.
+                       // One KV: key "k", value type 8 (string), declared length 1 MiB, no body.
         b.push_u64(1);
         b.push_bytes(b"k");
         b.push_u32(8); // GGUF string value type
