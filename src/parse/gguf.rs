@@ -1238,26 +1238,37 @@ impl<R: Read + Seek> GgufReader<R> {
     /// `AnamnesisError::Parse` (matching the slice-based cursor's behaviour)
     /// rather than relying on the underlying reader's `UnexpectedEof`
     /// kind-mapping.
-    fn read_into(&mut self, buf: &mut [u8]) -> crate::Result<()> {
-        // CAST: usize → u64, length of a borrowed buffer always fits in u64
-        // on every supported target (64-bit and 32-bit).
-        #[allow(clippy::as_conversions)]
-        let n_u64 = buf.len() as u64;
+    /// Validates that `n` more bytes are available from the current position
+    /// without running past `file_len`, returning the resulting end offset.
+    ///
+    /// Pulled out of [`read_into`](Self::read_into) so it can also gate
+    /// [`read_bytes`](Self::read_bytes) **before** it allocates — an
+    /// adversarial declared length is rejected without committing any heap.
+    fn ensure_remaining(&self, n: u64) -> crate::Result<u64> {
         let end = self
             .pos
-            .checked_add(n_u64)
+            .checked_add(n)
             .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("GGUF: cursor overflow at pos {} + {n_u64}", self.pos),
+                reason: format!("GGUF: cursor overflow at pos {} + {n}", self.pos),
             })?;
         if end > self.file_len {
             return Err(AnamnesisError::Parse {
                 reason: format!(
-                    "GGUF: unexpected EOF at pos {} (wanted {n_u64} bytes, have {})",
+                    "GGUF: unexpected EOF at pos {} (wanted {n} bytes, have {})",
                     self.pos,
                     self.file_len.saturating_sub(self.pos)
                 ),
             });
         }
+        Ok(end)
+    }
+
+    fn read_into(&mut self, buf: &mut [u8]) -> crate::Result<()> {
+        // CAST: usize → u64, length of a borrowed buffer always fits in u64
+        // on every supported target (64-bit and 32-bit).
+        #[allow(clippy::as_conversions)]
+        let n_u64 = buf.len() as u64;
+        let end = self.ensure_remaining(n_u64)?;
         self.reader.read_exact(buf).map_err(AnamnesisError::Io)?;
         self.pos = end;
         Ok(())
@@ -1267,7 +1278,17 @@ impl<R: Read + Seek> GgufReader<R> {
     ///
     /// Used for variable-length payloads (e.g. `gguf_string_t`). Fixed-size
     /// primitives use [`read_into`](Self::read_into) with a stack array.
+    ///
+    /// The declared length is validated against the remaining file bytes
+    /// **before** the allocation, so a tiny file that declares a length up to
+    /// the type cap (e.g. `MAX_STRING_LEN` = 16 MiB) cannot drive an eager
+    /// `vec!` — it is rejected first. [`read_into`](Self::read_into) re-checks
+    /// (a cheap confirm) for the stack-buffer callers that bypass this path.
     fn read_bytes(&mut self, n: usize) -> crate::Result<Vec<u8>> {
+        // CAST: usize → u64, lossless widening on all supported targets.
+        #[allow(clippy::as_conversions)]
+        let n_u64 = n as u64;
+        self.ensure_remaining(n_u64)?;
         let mut buf = vec![0u8; n];
         self.read_into(&mut buf)?;
         Ok(buf)
