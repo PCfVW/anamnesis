@@ -5,6 +5,7 @@ use std::fmt;
 use std::io::Read;
 
 use crate::error::AnamnesisError;
+use crate::ParseLimits;
 
 /// Sanity cap on the safetensors header length declared by the 8-byte
 /// little-endian prefix.
@@ -15,6 +16,35 @@ use crate::error::AnamnesisError;
 /// beyond any real header (a 100 k-tensor shard ships well under 1 MiB of
 /// `JSON`).
 const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Validates a declared safetensors header length against the permanent
+/// [`MAX_SAFETENSORS_HEADER_BYTES`] cap and the caller's `limits`, **before**
+/// the header is parsed or allocated.
+///
+/// Shared by the slice-based [`parse_safetensors_header_with_limits`] and the
+/// reader-based [`parse_safetensors_header_from_reader_with_limits`] so the
+/// bound is identical by construction and applied pre-allocation on both
+/// paths (the slice path reads the same 8-byte prefix that
+/// `safetensors::SafeTensors::read_metadata` consumes, so it can reject an
+/// over-budget header before the upstream parser allocates the metadata).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `header_len` exceeds the cap or the
+/// caller's `ParseLimits` single-allocation budget.
+fn enforce_safetensors_header_cap(header_len: u64, limits: &ParseLimits) -> crate::Result<()> {
+    if header_len > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "safetensors header length {header_len} exceeds \
+                 {MAX_SAFETENSORS_HEADER_BYTES}-byte cap"
+            ),
+        });
+    }
+    // Caller-supplied ceiling, layered on top of the permanent cap above.
+    limits.check_alloc(header_len, "safetensors header")?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Dtype
@@ -934,6 +964,45 @@ fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
 /// Allocates a `Vec<TensorEntry>` proportional to the number of tensors in the
 /// header (typically hundreds). No tensor data is copied or read.
 pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeader> {
+    parse_safetensors_header_with_limits(buffer, &ParseLimits::default())
+}
+
+/// Parses a safetensors header under a caller-supplied [`ParseLimits`] budget.
+///
+/// Identical to [`parse_safetensors_header`] but enforces `limits` — the
+/// declared header size is checked against the caller's single-allocation
+/// budget. The built-in `100 MiB` header cap still applies; `limits` can only
+/// tighten it. [`parse_safetensors_header`] is the `ParseLimits::default()`
+/// (unbounded) special case.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the buffer is too small for the 8-byte
+/// length prefix, the safetensors header is malformed, or its declared size
+/// exceeds the cap or `limits`.
+///
+/// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognized dtype.
+///
+/// # Memory
+///
+/// Allocates a `Vec<TensorEntry>` proportional to the number of tensors in the
+/// header (typically hundreds). No tensor data is copied or read.
+pub fn parse_safetensors_header_with_limits(
+    buffer: &[u8],
+    limits: &ParseLimits,
+) -> crate::Result<SafetensorsHeader> {
+    // Bound the declared header length *before* `read_metadata` parses (and
+    // allocates) the metadata. The 8-byte little-endian prefix is the same one
+    // `read_metadata` consumes, so checking it here rejects an over-budget
+    // header pre-allocation — matching the reader path.
+    let prefix: [u8; 8] = buffer
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "safetensors buffer too small for 8-byte header length prefix".into(),
+        })?;
+    enforce_safetensors_header_cap(u64::from_le_bytes(prefix), limits)?;
+
     let (header_size, metadata) =
         safetensors::SafeTensors::read_metadata(buffer).map_err(AnamnesisError::from)?;
     build_header_from_metadata(header_size, &metadata)
@@ -1060,21 +1129,48 @@ fn build_header_from_metadata(
 /// length is capped at 100 MiB to bound the worst-case allocation an
 /// adversarial source can trigger.
 pub fn parse_safetensors_header_from_reader<R: Read>(
+    reader: R,
+) -> crate::Result<SafetensorsHeader> {
+    parse_safetensors_header_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses a safetensors header from a reader under a caller-supplied
+/// [`ParseLimits`] budget.
+///
+/// Identical to [`parse_safetensors_header_from_reader`] but enforces `limits`
+/// — the declared header length is checked against the caller's
+/// single-allocation budget **before** the `JSON` buffer is allocated. The
+/// built-in `100 MiB` header cap still applies; `limits` can only tighten it.
+/// [`parse_safetensors_header_from_reader`] is the `ParseLimits::default()`
+/// (unbounded) special case.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails to produce the
+/// requested bytes (8-byte length prefix or `length` bytes of `JSON`).
+///
+/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed, the
+/// declared length exceeds the 100 MiB sanity cap, or it exceeds `limits`.
+///
+/// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognised
+/// dtype.
+///
+/// # Memory
+///
+/// Allocates `8 + header_size` bytes for the prefix + `JSON` buffer plus a
+/// `Vec<TensorEntry>` proportional to the number of tensors. No tensor data
+/// is read. The declared header length is bounded by both the 100 MiB cap and
+/// the caller's `limits` before allocation.
+pub fn parse_safetensors_header_from_reader_with_limits<R: Read>(
     mut reader: R,
+    limits: &ParseLimits,
 ) -> crate::Result<SafetensorsHeader> {
     // Read the 8-byte little-endian length prefix.
     let mut prefix = [0u8; 8];
     reader.read_exact(&mut prefix)?;
     let header_len_u64 = u64::from_le_bytes(prefix);
 
-    if header_len_u64 > MAX_SAFETENSORS_HEADER_BYTES {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "safetensors header length {header_len_u64} exceeds \
-                 {MAX_SAFETENSORS_HEADER_BYTES}-byte cap"
-            ),
-        });
-    }
+    enforce_safetensors_header_cap(header_len_u64, limits)?;
     let header_len = usize::try_from(header_len_u64).map_err(|_| AnamnesisError::Parse {
         reason: format!("safetensors header length {header_len_u64} does not fit in usize"),
     })?;
@@ -1444,6 +1540,59 @@ mod tests {
         assert_eq!(header.tensors[0].shape, vec![2]);
         assert_eq!(header.tensors[0].role, TensorRole::Passthrough);
         assert_eq!(header.scheme, QuantScheme::Unquantized);
+    }
+
+    /// Phase 6.8 Step 1: a tightened `ParseLimits` rejects a header that the
+    /// unbounded default accepts, on both the slice and reader entry points.
+    #[test]
+    fn safetensors_header_respects_parse_limits() {
+        use safetensors::tensor::{serialize, TensorView};
+
+        let data: Vec<u8> = vec![0; 4];
+        let tensors = vec![(
+            "t",
+            TensorView::new(safetensors::Dtype::BF16, vec![2], &data)
+                .unwrap_or_else(|e| panic!("TensorView: {e}")),
+        )];
+        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+
+        // Default (unbounded) parses on both the slice and reader paths.
+        assert!(parse_safetensors_header_with_limits(&buffer, &ParseLimits::default()).is_ok());
+        assert!(parse_safetensors_header_from_reader_with_limits(
+            std::io::Cursor::new(&buffer),
+            &ParseLimits::default()
+        )
+        .is_ok());
+
+        // A 1-byte single-allocation ceiling rejects the dozens-of-bytes header.
+        let tight = ParseLimits::default().with_max_single_alloc(1);
+        let Err(err) = parse_safetensors_header_with_limits(&buffer, &tight) else {
+            panic!("expected slice limit rejection");
+        };
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            "expected slice limit error, got: {err}"
+        );
+        let Err(err) =
+            parse_safetensors_header_from_reader_with_limits(std::io::Cursor::new(&buffer), &tight)
+        else {
+            panic!("expected reader limit rejection");
+        };
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            "expected reader limit error, got: {err}"
+        );
+
+        // The slice path rejects pre-allocation: a buffer too small for even
+        // the 8-byte length prefix is a clean `Parse` error, not a panic.
+        let Err(err) = parse_safetensors_header_with_limits(&[0u8; 4], &ParseLimits::default())
+        else {
+            panic!("expected too-small-buffer rejection");
+        };
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("8-byte")),
+            "expected too-small-prefix error, got: {err}"
+        );
     }
 
     #[test]

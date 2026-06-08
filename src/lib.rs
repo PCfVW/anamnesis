@@ -306,6 +306,7 @@ pub mod cli;
 pub mod error;
 pub mod inspect;
 pub mod lethe;
+pub mod limits;
 pub mod model;
 pub mod parse;
 pub mod remember;
@@ -319,29 +320,31 @@ pub use lethe::{
     write_bnb_nf4_safetensors_bytes, BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE,
     NF4_CODEBOOK,
 };
-pub use model::{parse, ParsedModel, TargetDtype};
+pub use limits::ParseLimits;
+pub use model::{parse, parse_with_limits, ParsedModel, TargetDtype};
 #[cfg(feature = "ollama")]
 pub use parse::resolve_ollama_model;
 #[cfg(feature = "gguf")]
 pub use parse::{
-    inspect_gguf_from_reader, parse_gguf, write_gguf, write_gguf_to_writer, GgufInspectInfo,
-    GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType, GgufWriteTensor,
-    ParsedGguf,
+    inspect_gguf_from_reader, parse_gguf, parse_gguf_with_limits, write_gguf, write_gguf_to_writer,
+    GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType,
+    GgufWriteTensor, ParsedGguf,
 };
 #[cfg(feature = "npz")]
 pub use parse::{
-    inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype, NpzInspectInfo, NpzTensor,
-    NpzTensorInfo,
+    inspect_npz, inspect_npz_from_reader, parse_npz, parse_npz_with_limits, NpzDtype,
+    NpzInspectInfo, NpzTensor, NpzTensorInfo,
 };
 #[cfg(feature = "pth")]
 pub use parse::{
-    inspect_pth_from_reader, parse_pth, ParsedPth, PthDtype, PthInspectInfo, PthTensor,
-    PthTensorInfo,
+    inspect_pth_from_reader, parse_pth, parse_pth_with_limits, ParsedPth, PthDtype, PthInspectInfo,
+    PthTensor, PthTensorInfo,
 };
 pub use parse::{
-    parse_safetensors_header, parse_safetensors_header_from_reader, AwqCompanions, AwqConfig,
-    Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig, QuantScheme, SafetensorsHeader,
-    TensorEntry, TensorRole,
+    parse_safetensors_header, parse_safetensors_header_from_reader,
+    parse_safetensors_header_from_reader_with_limits, parse_safetensors_header_with_limits,
+    AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
+    QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
 };
 #[cfg(feature = "awq")]
 pub use remember::dequantize_awq_to_bf16;

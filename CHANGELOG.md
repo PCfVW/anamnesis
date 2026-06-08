@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Caller-configurable `ParseLimits` (Phase 6.8 Step 1).** A new
+  `ParseLimits` budget lets a caller tighten the parsers' resource use to its
+  own environment (an edge board, a per-slot MLaaS worker) below the built-in,
+  server-scale constant caps. Two axes ship in this step: `max_single_alloc`
+  (largest single header-declared buffer) and `max_item_count` (declared
+  tensor / array / KV / archive-entry count). Each is enforced fail-fast, with
+  `AnamnesisError::Parse`, **before** allocation, layered on top of the
+  permanent per-format caps (`min(constant, limit)` — the limit can only
+  tighten, never weaken the existing floor). New entry points
+  `parse_with_limits`, `parse_gguf_with_limits`, `parse_npz_with_limits`,
+  `parse_pth_with_limits`, `parse_safetensors_header_with_limits`, and
+  `parse_safetensors_header_from_reader_with_limits`; the existing limit-free
+  functions delegate with `ParseLimits::default()` (unbounded), so default
+  behaviour is byte-for-byte unchanged — no breaking change.
+
 ## [0.6.2] - 2026-06-04
 
 ### Security

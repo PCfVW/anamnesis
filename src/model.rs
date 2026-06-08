@@ -17,7 +17,7 @@ use std::str::FromStr;
 use crate::error::AnamnesisError;
 use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
-    parse_safetensors_header, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
+    parse_safetensors_header_with_limits, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
 };
 use crate::parse::utils::checked_num_elements;
 #[cfg(feature = "awq")]
@@ -31,6 +31,7 @@ use crate::remember::fp8::{
 };
 #[cfg(feature = "gptq")]
 use crate::remember::gptq::dequantize_gptq_to_bf16;
+use crate::ParseLimits;
 
 /// Target dtype for dequantization output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,8 +113,32 @@ pub struct ParsedModel {
 /// `parse()` + `inspect()` only touches the header (~1 MiB), so the
 /// resident-set growth on inspect-only workflows is bounded by the
 /// header size, not the file size.
-#[allow(unsafe_code)]
 pub fn parse(path: impl AsRef<Path>) -> crate::Result<ParsedModel> {
+    parse_with_limits(path, &ParseLimits::default())
+}
+
+/// Parses a `.safetensors` file under a caller-supplied [`ParseLimits`] budget.
+///
+/// Identical to [`parse`] but enforces `limits` — the declared header size is
+/// checked against the caller's single-allocation budget. The built-in 100 MiB
+/// header cap still applies; `limits` can only tighten it. [`parse`] is the
+/// `ParseLimits::default()` (unbounded) special case.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the file cannot be opened or mapped.
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed or
+/// its declared size exceeds `limits`.
+///
+/// # Memory
+///
+/// Uses `memmap2::Mmap` so the file's bytes do not occupy heap; `parse()` +
+/// `inspect()` only touches the header. See [`parse`] for the full rationale.
+#[allow(unsafe_code)]
+pub fn parse_with_limits(
+    path: impl AsRef<Path>,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedModel> {
     let file = std::fs::File::open(path.as_ref())?;
     // SAFETY: `memmap2::Mmap` requires `unsafe` because the OS could
     // modify the mapped region if another process writes to the
@@ -123,7 +148,7 @@ pub fn parse(path: impl AsRef<Path>) -> crate::Result<ParsedModel> {
     // crate's mmap path rely on. The mapping is released when the
     // returned `ParsedModel` is dropped.
     let buffer = unsafe { memmap2::Mmap::map(&file) }.map_err(AnamnesisError::Io)?;
-    let header = parse_safetensors_header(&buffer)?;
+    let header = parse_safetensors_header_with_limits(&buffer, limits)?;
     Ok(ParsedModel { header, buffer })
 }
 

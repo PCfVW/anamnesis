@@ -37,6 +37,7 @@ use std::path::Path;
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::parse::utils::byteswap_inplace;
+use crate::ParseLimits;
 
 /// Maximum declared size for a `.pth` archive's `data.pkl` entry that the
 /// parsers will materialise or interpret.
@@ -69,8 +70,13 @@ const MAX_BYTEORDER_SIZE: u64 = 64;
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `declared` exceeds [`MAX_PKL_SIZE`].
-fn enforce_pkl_size_cap(declared: u64, entry_name: &str) -> crate::Result<()> {
+/// Returns [`AnamnesisError::Parse`] if `declared` exceeds [`MAX_PKL_SIZE`] or
+/// the caller's `ParseLimits` single-allocation budget.
+fn enforce_pkl_size_cap(
+    declared: u64,
+    entry_name: &str,
+    limits: &ParseLimits,
+) -> crate::Result<()> {
     if declared > MAX_PKL_SIZE {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -79,6 +85,8 @@ fn enforce_pkl_size_cap(declared: u64, entry_name: &str) -> crate::Result<()> {
             ),
         });
     }
+    // Caller-supplied ceiling, layered on top of the permanent cap above.
+    limits.check_alloc(declared, "PTH data.pkl entry")?;
     Ok(())
 }
 
@@ -635,8 +643,9 @@ const MAX_PICKLE_PAYLOAD: usize = 64 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`].
-fn enforce_pickle_payload_cap(len: usize, opcode: &str) -> crate::Result<()> {
+/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`] or
+/// the caller's `ParseLimits` single-allocation budget.
+fn enforce_pickle_payload_cap(len: usize, opcode: &str, limits: &ParseLimits) -> crate::Result<()> {
     if len > MAX_PICKLE_PAYLOAD {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -645,6 +654,10 @@ fn enforce_pickle_payload_cap(len: usize, opcode: &str) -> crate::Result<()> {
             ),
         });
     }
+    // Caller-supplied ceiling, layered on top of the permanent cap above.
+    // CAST: usize → u64, lossless widening on all supported targets
+    #[allow(clippy::as_conversions)]
+    limits.check_alloc(len as u64, "PTH pickle payload")?;
     Ok(())
 }
 
@@ -662,10 +675,12 @@ struct PickleVm<'a> {
     memo: HashMap<u32, PickleValue>,
     /// Auto-incrementing memo key for `MEMOIZE` opcode.
     next_memo_id: u32,
+    /// Caller-supplied allocation budget, enforced on each pickle payload.
+    limits: &'a ParseLimits,
 }
 
 impl<'a> PickleVm<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], limits: &'a ParseLimits) -> Self {
         Self {
             data,
             pos: 0,
@@ -673,6 +688,7 @@ impl<'a> PickleVm<'a> {
             mark_stack: Vec::new(),
             memo: HashMap::new(),
             next_memo_id: 0,
+            limits,
         }
     }
 
@@ -862,7 +878,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINUNICODE length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINUNICODE")?;
+                    enforce_pickle_payload_cap(len, "BINUNICODE", self.limits)?;
                     let bytes = self.read_bytes(len)?;
                     let s = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
                         reason: format!("non-UTF-8 pickle string: {e}"),
@@ -895,7 +911,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINSTRING length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINSTRING")?;
+                    enforce_pickle_payload_cap(len, "BINSTRING", self.limits)?;
                     let bytes = self.read_bytes(len)?;
                     match std::str::from_utf8(bytes) {
                         // BORROW: .to_owned() converts &str to owned String
@@ -913,7 +929,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINBYTES length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINBYTES")?;
+                    enforce_pickle_payload_cap(len, "BINBYTES", self.limits)?;
                     let bytes = self.read_bytes(len)?;
                     // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
                     self.stack.push(PickleValue::Bytes(bytes.to_vec()));
@@ -1731,8 +1747,42 @@ fn copy_to_contiguous(
 /// which is >99% of real files). Peak memory during parsing ≈ file size
 /// (mapped, not heap-allocated) + ~1 KB metadata per tensor. The mmap is
 /// released when the returned `ParsedPth` is dropped.
-#[allow(unsafe_code)]
 pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
+    parse_pth_with_limits(path, &ParseLimits::default())
+}
+
+/// Parses a `.pth` archive under a caller-supplied [`ParseLimits`] budget.
+///
+/// Identical to [`parse_pth`] but enforces `limits` — the declared `data.pkl`
+/// entry size and each 4-byte-length pickle payload are checked against the
+/// caller's single-allocation budget, fail-fast, before allocation. The
+/// built-in `MAX_PKL_SIZE` / `MAX_PICKLE_PAYLOAD` caps still apply; `limits`
+/// can only tighten them. [`parse_pth`] is the `ParseLimits::default()`
+/// (unbounded) special case.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch`
+/// ZIP archive, uses unsupported pickle opcodes, contains non-allowlisted
+/// globals, or a declared `data.pkl` / pickle payload exceeds `limits`.
+///
+/// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
+/// files that are raw pickle without ZIP wrapping.
+///
+/// Returns [`AnamnesisError::Io`] if the file cannot be read.
+///
+/// # Memory
+///
+/// Memory-maps the file with `memmap2` (page prefaulting). Tensor data
+/// is **not** copied during parsing — [`ParsedPth::tensors()`] slices
+/// directly from the mmap. Peak memory during parsing ≈ file size (mapped,
+/// not heap-allocated) + ~1 KB metadata per tensor. The mmap is released
+/// when the returned `ParsedPth` is dropped.
+#[allow(unsafe_code)]
+pub fn parse_pth_with_limits(
+    path: impl AsRef<Path>,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedPth> {
     let file = std::fs::File::open(path.as_ref())?;
     // SAFETY: memmap2::Mmap requires unsafe because the OS could modify the
     // mapped region if another process writes to the file concurrently.
@@ -1808,7 +1858,7 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
     let pkl_len_u64 = u64::try_from(pkl_len).map_err(|_| AnamnesisError::Parse {
         reason: format!("ZIP entry `data.pkl`: declared size {pkl_len} overflows u64"),
     })?;
-    enforce_pkl_size_cap(pkl_len_u64, "data.pkl")?;
+    enforce_pkl_size_cap(pkl_len_u64, "data.pkl", limits)?;
     let pkl_end = pkl_start
         .checked_add(pkl_len)
         .ok_or_else(|| AnamnesisError::Parse {
@@ -1819,7 +1869,7 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "data.pkl slice out of bounds".into(),
         })?;
-    let meta = interpret_pickle_to_meta(pkl_data)?;
+    let meta = interpret_pickle_to_meta(pkl_data, limits)?;
 
     Ok(ParsedPth {
         mmap: raw,
@@ -1850,8 +1900,11 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 /// underflow, disallowed `GLOBAL`, or invalid `_rebuild_tensor_v2` argument
 /// shape — same error surface as the pickle VM and tensor-reference
 /// extractors return on their own.
-fn interpret_pickle_to_meta(pkl_data: &[u8]) -> crate::Result<Vec<TensorMeta>> {
-    let mut vm = PickleVm::new(pkl_data);
+fn interpret_pickle_to_meta(
+    pkl_data: &[u8],
+    limits: &ParseLimits,
+) -> crate::Result<Vec<TensorMeta>> {
+    let mut vm = PickleVm::new(pkl_data, limits);
     let root = vm.execute()?;
 
     let dict_pairs = extract_dict_pairs(&root, 0)?;
@@ -2082,7 +2135,10 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// inspects with ~150 KiB peak heap.
 pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthInspectInfo> {
     let (big_endian, pkl_bytes) = read_pth_archive_for_inspect(reader)?;
-    let meta = interpret_pickle_to_meta(&pkl_bytes)?;
+    // The inspect path is header-only and not yet ParseLimits-aware (wired in
+    // Phase 6.8 Step 5 with the README policy-gate docs); use the unbounded
+    // default so behaviour is unchanged.
+    let meta = interpret_pickle_to_meta(&pkl_bytes, &ParseLimits::default())?;
     Ok(build_pth_inspect_info(&meta, big_endian))
 }
 
@@ -2145,7 +2201,9 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<
     let (pkl_name, pkl_size, byteorder_name, byteorder_size) =
         locate_inspect_entries(&mut archive)?;
 
-    enforce_pkl_size_cap(pkl_size, &pkl_name)?;
+    // Inspect path is not yet ParseLimits-aware (Phase 6.8 Step 5); unbounded
+    // default keeps the permanent MAX_PKL_SIZE cap as the only bound here.
+    enforce_pkl_size_cap(pkl_size, &pkl_name, &ParseLimits::default())?;
 
     let big_endian = match byteorder_name {
         Some(name) => {
@@ -2358,6 +2416,11 @@ mod tests {
 
     use super::*;
 
+    /// Unbounded limits for VM/helper tests that predate `ParseLimits`. A
+    /// `static` (not a temporary) so `&UNBOUNDED_LIMITS` outlives the borrowing
+    /// `PickleVm`. Equivalent to the old no-limits behaviour.
+    static UNBOUNDED_LIMITS: ParseLimits = ParseLimits::unbounded();
+
     // -- PthDtype ------------------------------------------------------------
 
     #[test]
@@ -2470,7 +2533,7 @@ mod tests {
     fn vm_simple_int() {
         // PROTO 2, BININT1 42, STOP
         let pkl = &[0x80, 0x02, b'K', 42, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::Int(42)));
     }
@@ -2479,7 +2542,7 @@ mod tests {
     fn vm_string() {
         // PROTO 2, SHORT_BINUNICODE "hi" (len=2), STOP
         let pkl = &[0x80, 0x02, 0x8c, 0x02, b'h', b'i', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::String(ref s) if s == "hi"));
     }
@@ -2488,7 +2551,7 @@ mod tests {
     fn vm_tuple2() {
         // PROTO 2, BININT1 1, BININT1 2, TUPLE2, STOP
         let pkl = &[0x80, 0x02, b'K', 1, b'K', 2, 0x86, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert_eq!(items.len(), 2);
@@ -2501,7 +2564,7 @@ mod tests {
     fn vm_empty_dict() {
         // PROTO 2, EMPTY_DICT, STOP
         let pkl = &[0x80, 0x02, b'}', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::Dict(ref d) if d.is_empty()));
     }
@@ -2510,7 +2573,7 @@ mod tests {
     fn vm_dict_with_setitem() {
         // PROTO 2, EMPTY_DICT, SHORT_BINUNICODE "k" (len=1), BININT1 7, SETITEM, STOP
         let pkl = &[0x80, 0x02, b'}', 0x8c, 1, b'k', b'K', 7, b's', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Dict(pairs) = result {
             assert_eq!(pairs.len(), 1);
@@ -2533,7 +2596,7 @@ mod tests {
             0x86, // TUPLE2
             b'.', // STOP
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert_eq!(items.len(), 2);
@@ -2548,7 +2611,7 @@ mod tests {
     fn vm_rejects_disallowed_global() {
         // PROTO 2, GLOBAL "os\nsystem\n", STOP
         let pkl = b"\x80\x02cos\nsystem\n.";
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let err = vm.execute().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("disallowed pickle global"), "got: {msg}");
@@ -2559,7 +2622,7 @@ mod tests {
     fn vm_rejects_unknown_opcode() {
         // PROTO 2, unknown opcode 0xFF, STOP
         let pkl = &[0x80, 0x02, 0xFF, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let err = vm.execute().unwrap_err();
         assert!(err.to_string().contains("unsupported pickle opcode 0xff"));
     }
@@ -2568,7 +2631,7 @@ mod tests {
     fn vm_allows_torch_global() {
         // PROTO 2, GLOBAL "torch._utils\n_rebuild_tensor_v2\n", STOP
         let pkl = b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n.";
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(
             result,
@@ -2620,7 +2683,7 @@ mod tests {
             b'K', 42,   // BININT1
             b'.', // STOP
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::Int(42)));
     }
@@ -2629,7 +2692,7 @@ mod tests {
     #[test]
     fn vm_none() {
         let pkl: &[u8] = &[0x80, 0x02, b'N', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::None));
     }
@@ -2639,7 +2702,7 @@ mod tests {
     fn vm_newtrue_newfalse() {
         // PROTO 2, NEWTRUE, NEWFALSE, TUPLE2, STOP
         let pkl: &[u8] = &[0x80, 0x02, 0x88, 0x89, 0x86, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert!(matches!(items[0], PickleValue::Bool(true)));
@@ -2654,7 +2717,7 @@ mod tests {
     fn vm_binint() {
         // PROTO 2, BININT 0x01020304 (little-endian = 67305985), STOP
         let pkl: &[u8] = &[0x80, 0x02, b'J', 0x04, 0x03, 0x02, 0x01, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::Int(0x0102_0304)));
     }
@@ -2664,7 +2727,7 @@ mod tests {
     fn vm_binint_negative() {
         // PROTO 2, BININT -1 (0xFFFFFFFF LE), STOP
         let pkl: &[u8] = &[0x80, 0x02, b'J', 0xFF, 0xFF, 0xFF, 0xFF, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::Int(-1)));
     }
@@ -2674,7 +2737,7 @@ mod tests {
     fn vm_binint2() {
         // PROTO 2, BININT2 0x0100 (= 256 LE), STOP
         let pkl: &[u8] = &[0x80, 0x02, b'M', 0x00, 0x01, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(result, PickleValue::Int(256)));
     }
@@ -2686,7 +2749,7 @@ mod tests {
         let pkl: &[u8] = &[
             0x80, 0x02, b'X', 0x03, 0x00, 0x00, 0x00, b'a', b'b', b'c', b'.',
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::String(s) = result {
             assert_eq!(s, "abc");
@@ -2695,12 +2758,41 @@ mod tests {
         }
     }
 
+    /// Phase 6.8 Step 1: a tightened `ParseLimits` rejects a `data.pkl` entry
+    /// size and a pickle payload that the unbounded default accepts.
+    #[test]
+    fn pth_respects_parse_limits() {
+        // `data.pkl` entry-size threading via the shared helper: at the cap
+        // passes, one over fails.
+        let tight = ParseLimits::default().with_max_single_alloc(16);
+        assert!(enforce_pkl_size_cap(16, "data.pkl", &tight).is_ok());
+        let err = enforce_pkl_size_cap(17, "data.pkl", &tight).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            "expected pkl-size limit error, got: {err}"
+        );
+
+        // Pickle-payload threading via the VM: BINUNICODE "abc" (3 bytes).
+        let pkl: &[u8] = &[
+            0x80, 0x02, b'X', 0x03, 0x00, 0x00, 0x00, b'a', b'b', b'c', b'.',
+        ];
+        // Default (unbounded) executes.
+        assert!(PickleVm::new(pkl, &UNBOUNDED_LIMITS).execute().is_ok());
+        // A 1-byte single-allocation ceiling rejects the 3-byte payload.
+        let tight = ParseLimits::default().with_max_single_alloc(1);
+        let err = PickleVm::new(pkl, &tight).execute().unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            "expected pickle-payload limit error, got: {err}"
+        );
+    }
+
     // G7: SHORT_BINSTRING
     #[test]
     fn vm_short_binstring() {
         // PROTO 2, SHORT_BINSTRING "xy" (length=2), STOP
         let pkl: &[u8] = &[0x80, 0x02, b'U', 0x02, b'x', b'y', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::String(s) = result {
             assert_eq!(s, "xy");
@@ -2714,7 +2806,7 @@ mod tests {
     fn vm_short_binbytes() {
         // PROTO 2, SHORT_BINBYTES [0xDE, 0xAD] (length=2), STOP
         let pkl: &[u8] = &[0x80, 0x02, b'C', 0x02, 0xDE, 0xAD, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Bytes(b) = result {
             assert_eq!(b, vec![0xDE, 0xAD]);
@@ -2727,7 +2819,7 @@ mod tests {
     #[test]
     fn vm_empty_list() {
         let pkl: &[u8] = &[0x80, 0x02, b']', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::List(items) = result {
             assert!(items.is_empty());
@@ -2739,7 +2831,7 @@ mod tests {
     #[test]
     fn vm_empty_tuple() {
         let pkl: &[u8] = &[0x80, 0x02, b')', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert!(items.is_empty());
@@ -2753,7 +2845,7 @@ mod tests {
     fn vm_tuple1() {
         // PROTO 2, BININT1 7, TUPLE1, STOP
         let pkl: &[u8] = &[0x80, 0x02, b'K', 7, 0x85, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert_eq!(items.len(), 1);
@@ -2767,7 +2859,7 @@ mod tests {
     fn vm_tuple3() {
         // PROTO 2, BININT1 1, BININT1 2, BININT1 3, TUPLE3, STOP
         let pkl: &[u8] = &[0x80, 0x02, b'K', 1, b'K', 2, b'K', 3, 0x87, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert_eq!(items.len(), 3);
@@ -2788,7 +2880,7 @@ mod tests {
             0x80, 0x02, b'}', b'(', 0x8C, 0x01, b'a', b'K', 1, 0x8C, 0x01, b'b', b'K', 2, b'u',
             b'.',
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Dict(pairs) = result {
             assert_eq!(pairs.len(), 2);
@@ -2802,7 +2894,7 @@ mod tests {
     fn vm_append() {
         // PROTO 2, EMPTY_LIST, BININT1 42, APPEND, STOP
         let pkl: &[u8] = &[0x80, 0x02, b']', b'K', 42, b'a', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::List(items) = result {
             assert_eq!(items.len(), 1);
@@ -2816,7 +2908,7 @@ mod tests {
     fn vm_appends() {
         // PROTO 2, EMPTY_LIST, MARK, BININT1 1, BININT1 2, APPENDS, STOP
         let pkl: &[u8] = &[0x80, 0x02, b']', b'(', b'K', 1, b'K', 2, b'e', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::List(items) = result {
             assert_eq!(items.len(), 2);
@@ -2837,7 +2929,7 @@ mod tests {
             b'K', 0, b'j', 0x01, 0x00, 0x00, 0x00, // LONG_BINGET(1)
             0x86, b'.', // TUPLE2, STOP
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert_eq!(items.len(), 2);
@@ -2857,7 +2949,7 @@ mod tests {
             b'K', 0, b'h', 0x00, // BINGET(0)
             0x86, b'.', // TUPLE2, STOP
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Tuple(items) = result {
             assert_eq!(items.len(), 2);
@@ -2931,7 +3023,7 @@ mod tests {
     fn vm_binstring() {
         // PROTO 2, BINSTRING "ab" (length=2 as i32 LE), STOP
         let pkl: &[u8] = &[0x80, 0x02, b'T', 0x02, 0x00, 0x00, 0x00, b'a', b'b', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::String(s) = result {
             assert_eq!(s, "ab");
@@ -2945,7 +3037,7 @@ mod tests {
     fn vm_binbytes() {
         // PROTO 3, BINBYTES [0xCA, 0xFE] (length=2 as u32 LE), STOP
         let pkl: &[u8] = &[0x80, 0x03, b'B', 0x02, 0x00, 0x00, 0x00, 0xCA, 0xFE, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Bytes(b) = result {
             assert_eq!(b, vec![0xCA, 0xFE]);
@@ -2967,7 +3059,7 @@ mod tests {
             b'r', b'_', b'v', b'2', 0x93, // STACK_GLOBAL
             b'.',
         ];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(matches!(
             result,
@@ -2982,7 +3074,7 @@ mod tests {
         // PROTO 2, GLOBAL "torch._utils\n_rebuild_tensor_v2\n",
         //          EMPTY_TUPLE, REDUCE, STOP
         let pkl = b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n)R.";
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(
             matches!(result, PickleValue::Reduced { .. }),
@@ -2996,7 +3088,7 @@ mod tests {
         // PROTO 2, GLOBAL "torch._utils\n_rebuild_tensor_v2\n",
         //          EMPTY_TUPLE, NEWOBJ, STOP
         let pkl: &[u8] = b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n)\x81.";
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         assert!(
             matches!(result, PickleValue::Reduced { .. }),
@@ -3009,7 +3101,7 @@ mod tests {
     fn vm_build() {
         // PROTO 2, BININT1 1 (object), BININT1 2 (state), BUILD, STOP
         let pkl: &[u8] = &[0x80, 0x02, b'K', 1, b'K', 2, b'b', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::Built { obj, state } = result {
             assert!(matches!(*obj, PickleValue::Int(1)));
@@ -3024,7 +3116,7 @@ mod tests {
     fn vm_binpersid() {
         // PROTO 2, BININT1 42, BINPERSID, STOP
         let pkl: &[u8] = &[0x80, 0x02, b'K', 42, b'Q', b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         let result = vm.execute().unwrap();
         if let PickleValue::PersistentId(inner) = result {
             assert!(matches!(*inner, PickleValue::Int(42)));
@@ -3039,7 +3131,7 @@ mod tests {
         // PROTO 4, BININT1 0, MEMOIZE (will get key 0), STOP
         // — but we pre-set next_memo_id to u32::MAX so the +1 overflows
         let pkl: &[u8] = &[0x80, 0x04, b'K', 0, 0x94, b'.'];
-        let mut vm = PickleVm::new(pkl);
+        let mut vm = PickleVm::new(pkl, &UNBOUNDED_LIMITS);
         vm.next_memo_id = u32::MAX;
         let err = vm.execute().unwrap_err();
         assert!(
@@ -3447,8 +3539,9 @@ mod tests {
     /// and both entry points route through this one helper.
     #[test]
     fn pkl_size_cap_boundary() {
-        assert!(enforce_pkl_size_cap(MAX_PKL_SIZE, "data.pkl").is_ok());
-        let err = enforce_pkl_size_cap(MAX_PKL_SIZE + 1, "data.pkl").unwrap_err();
+        assert!(enforce_pkl_size_cap(MAX_PKL_SIZE, "data.pkl", &UNBOUNDED_LIMITS).is_ok());
+        let err =
+            enforce_pkl_size_cap(MAX_PKL_SIZE + 1, "data.pkl", &UNBOUNDED_LIMITS).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("data.pkl") && msg.contains("cap"),

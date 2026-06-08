@@ -45,6 +45,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
+use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1213,13 +1214,16 @@ struct GgufReader<R: Read + Seek> {
     reader: R,
     pos: u64,
     file_len: u64,
+    /// Caller-supplied allocation budget, enforced on each owned read.
+    limits: ParseLimits,
 }
 
 impl<R: Read + Seek> GgufReader<R> {
     /// Constructs a reader anchored at offset 0, capturing `file_len` for
     /// the bounds-check error messages and the post-tensor-info data-section
-    /// arithmetic.
-    fn new(mut reader: R) -> crate::Result<Self> {
+    /// arithmetic. `limits` is the caller's allocation budget, enforced on
+    /// every owned (variable-length) read.
+    fn new(mut reader: R, limits: &ParseLimits) -> crate::Result<Self> {
         let file_len = reader.seek(SeekFrom::End(0)).map_err(AnamnesisError::Io)?;
         reader
             .seek(SeekFrom::Start(0))
@@ -1228,6 +1232,7 @@ impl<R: Read + Seek> GgufReader<R> {
             reader,
             pos: 0,
             file_len,
+            limits: limits.clone(),
         })
     }
 
@@ -1295,6 +1300,10 @@ impl<R: Read + Seek> GgufReader<R> {
         #[allow(clippy::as_conversions)]
         let n_u64 = n as u64;
         self.ensure_remaining(n_u64)?;
+        // Caller-supplied ceiling, layered on top of the type cap the caller
+        // (e.g. `read_string` with `MAX_STRING_LEN`) already enforced.
+        self.limits
+            .check_alloc(n_u64, "GGUF variable-length read")?;
         let mut buf = vec![0u8; n];
         self.read_into(&mut buf)?;
         Ok(buf)
@@ -1623,8 +1632,42 @@ fn read_typed_array<R: Read + Seek>(
 /// Peak heap is `O(n_tensors + n_metadata_kv)` (a few dozen bytes per
 /// tensor info record plus the metadata map). The mmap is released when
 /// the returned `ParsedGguf` is dropped.
-#[allow(unsafe_code)]
 pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
+    parse_gguf_with_limits(path, &ParseLimits::default())
+}
+
+/// Parses a `GGUF` file under a caller-supplied [`ParseLimits`] budget.
+///
+/// Identical to [`parse_gguf`] but enforces `limits` — the declared tensor and
+/// metadata-KV counts and each variable-length (string) read are checked
+/// against the caller's budget, fail-fast, before allocation. The built-in
+/// `MAX_*` caps still apply; `limits` can only tighten them. [`parse_gguf`] is
+/// the `ParseLimits::default()` (unbounded) special case.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the file cannot be opened or mapped.
+///
+/// Returns [`AnamnesisError::Parse`] if the magic bytes are missing, the
+/// header fields are truncated or out of range, the metadata table contains
+/// an invalid value type, a tensor info entry is malformed, a tensor's
+/// resolved byte range falls outside the mapped file, or a declared count /
+/// allocation exceeds `limits`.
+///
+/// Returns [`AnamnesisError::Unsupported`] for `GGUF` v1 files, big-endian
+/// `GGUF` files, legacy pre-`GGUF` formats, and unrecognised tensor dtypes.
+///
+/// # Memory
+///
+/// Memory-maps the file with `memmap2::MmapOptions::populate()` to prefault
+/// pages. Tensor data is **not** copied during parsing. Peak heap is
+/// `O(n_tensors + n_metadata_kv)`. The mmap is released when the returned
+/// `ParsedGguf` is dropped.
+#[allow(unsafe_code)]
+pub fn parse_gguf_with_limits(
+    path: impl AsRef<Path>,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedGguf> {
     let file = std::fs::File::open(path.as_ref())?;
     // SAFETY: memmap2::Mmap requires `unsafe` because the OS could modify
     // the mapped region if another process writes to the underlying file
@@ -1639,7 +1682,7 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
     // `inspect_gguf_from_reader` uses. The mmap stays alive for the whole
     // `ParsedGguf` lifetime so that `ParsedGguf::tensors` can hand out
     // zero-copy `Cow::Borrowed` slices into it after parsing.
-    let parsed = parse_gguf_from_reader(std::io::Cursor::new(&raw[..]))?;
+    let parsed = parse_gguf_from_reader(std::io::Cursor::new(&raw[..]), limits)?;
 
     Ok(ParsedGguf {
         mmap: raw,
@@ -1664,8 +1707,11 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
 /// product, plus per-tensor alignment and end-of-data bounds checks against
 /// the stream's total length (captured via `seek(SeekFrom::End(0))` once at
 /// reader construction).
-fn parse_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<GgufFrontMatter> {
-    let mut cursor = GgufReader::new(reader)?;
+fn parse_gguf_from_reader<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<GgufFrontMatter> {
+    let mut cursor = GgufReader::new(reader, limits)?;
 
     // Magic check. Detect legacy GGML/GGJT/GGMF formats and byte-swapped
     // big-endian GGUF files for clearer error messages.
@@ -1732,6 +1778,9 @@ fn parse_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<GgufFrontM
             reason: format!("GGUF: metadata kv count {kv_count} exceeds cap {MAX_KV_COUNT}"),
         });
     }
+    // Caller-supplied ceilings, layered on top of the permanent caps above.
+    limits.check_item_count(tensor_count, "GGUF tensor count")?;
+    limits.check_item_count(kv_count, "GGUF metadata KV count")?;
     let tensor_count_usz = usize::try_from(tensor_count).map_err(|_| AnamnesisError::Parse {
         reason: format!("GGUF: tensor count {tensor_count} overflows usize"),
     })?;
@@ -2017,7 +2066,10 @@ pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<Gguf
     // `Cursor<&[u8]>` over the mmap, which is already zero-syscall). Adding
     // a `BufReader` there would only add a memcpy.
     let buffered = BufReader::with_capacity(READER_BUF_SIZE, reader);
-    let front = parse_gguf_from_reader(buffered)?;
+    // The inspect path is header-only and not yet ParseLimits-aware (wired in
+    // Phase 6.8 Step 5); unbounded default keeps the permanent GGUF caps as the
+    // only bound here.
+    let front = parse_gguf_from_reader(buffered, &ParseLimits::default())?;
     Ok(build_inspect_info(
         front.version,
         front.alignment,
@@ -2346,6 +2398,44 @@ mod tests {
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// Phase 6.8 Step 1: a tightened `ParseLimits` rejects a tensor / KV count
+    /// or string read that `ParseLimits::default()` accepts; the default is
+    /// equivalent to the limit-free `parse_gguf`.
+    #[test]
+    fn parse_gguf_respects_parse_limits() {
+        // build_minimal_gguf: 2 tensors, 3 KV entries, small string keys.
+        let f = write_temp_gguf(&build_minimal_gguf());
+
+        // Default (unbounded) parses, and matches the limit-free entry point.
+        let baseline = parse_gguf(f.path()).unwrap();
+        let with_default = parse_gguf_with_limits(f.path(), &ParseLimits::default()).unwrap();
+        assert_eq!(baseline.tensor_infos.len(), with_default.tensor_infos.len());
+        assert_eq!(with_default.tensor_infos.len(), 2);
+
+        // Item-count ceiling: tensor_count (2) rejected at 1; both counts fit
+        // at 3.
+        let err = parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_item_count(1))
+            .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_item_count")),
+            "expected item-count limit error, got: {err}"
+        );
+        assert!(
+            parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_item_count(3))
+                .is_ok()
+        );
+
+        // Single-allocation ceiling: the first metadata string read (20-byte
+        // key) is rejected at 1.
+        let err =
+            parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_single_alloc(1))
+                .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            "expected single-alloc limit error, got: {err}"
+        );
     }
 
     /// A metadata string that declares a length **under** `MAX_STRING_LEN` (so
