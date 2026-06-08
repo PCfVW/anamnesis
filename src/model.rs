@@ -119,9 +119,10 @@ pub fn parse(path: impl AsRef<Path>) -> crate::Result<ParsedModel> {
 
 /// Parses a `.safetensors` file under a caller-supplied [`ParseLimits`] budget.
 ///
-/// Identical to [`parse`] but enforces `limits` — the declared header size is
-/// checked against the caller's single-allocation budget. The built-in 100 MiB
-/// header cap still applies; `limits` can only tighten it. [`parse`] is the
+/// Identical to [`parse`] but enforces every applicable [`ParseLimits`] ceiling
+/// (the per-allocation and cumulative-byte budgets — see [`ParseLimits`] for the
+/// axes) fail-fast, before the header is allocated. The built-in 100 MiB header
+/// cap still applies; `limits` can only tighten it. [`parse`] is the
 /// `ParseLimits::default()` (unbounded) special case.
 ///
 /// # Errors

@@ -5,6 +5,7 @@ use std::fmt;
 use std::io::Read;
 
 use crate::error::AnamnesisError;
+use crate::limits::Budget;
 use crate::ParseLimits;
 
 /// Sanity cap on the safetensors header length declared by the 8-byte
@@ -18,7 +19,7 @@ use crate::ParseLimits;
 const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Validates a declared safetensors header length against the permanent
-/// [`MAX_SAFETENSORS_HEADER_BYTES`] cap and the caller's `limits`, **before**
+/// [`MAX_SAFETENSORS_HEADER_BYTES`] cap and the caller's `budget`, **before**
 /// the header is parsed or allocated.
 ///
 /// Shared by the slice-based [`parse_safetensors_header_with_limits`] and the
@@ -31,8 +32,8 @@ const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `header_len` exceeds the cap or the
-/// caller's `ParseLimits` single-allocation budget.
-fn enforce_safetensors_header_cap(header_len: u64, limits: &ParseLimits) -> crate::Result<()> {
+/// caller's `budget` (per-item single-allocation cap + cumulative aggregate).
+fn enforce_safetensors_header_cap(header_len: u64, budget: &mut Budget) -> crate::Result<()> {
     if header_len > MAX_SAFETENSORS_HEADER_BYTES {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -41,8 +42,9 @@ fn enforce_safetensors_header_cap(header_len: u64, limits: &ParseLimits) -> crat
             ),
         });
     }
-    // Caller-supplied ceiling, layered on top of the permanent cap above.
-    limits.check_alloc(header_len, "safetensors header")?;
+    // Caller-supplied ceiling (per-item single-alloc + cumulative aggregate),
+    // layered on top of the permanent cap above.
+    budget.charge_alloc(header_len, "safetensors header")?;
     Ok(())
 }
 
@@ -969,11 +971,11 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
 
 /// Parses a safetensors header under a caller-supplied [`ParseLimits`] budget.
 ///
-/// Identical to [`parse_safetensors_header`] but enforces `limits` — the
-/// declared header size is checked against the caller's single-allocation
-/// budget. The built-in `100 MiB` header cap still applies; `limits` can only
-/// tighten it. [`parse_safetensors_header`] is the `ParseLimits::default()`
-/// (unbounded) special case.
+/// Identical to [`parse_safetensors_header`] but enforces every applicable
+/// [`ParseLimits`] ceiling (the per-allocation and cumulative-byte budgets)
+/// against the declared header size. The built-in `100 MiB` header cap still
+/// applies; `limits` can only tighten it. [`parse_safetensors_header`] is the
+/// `ParseLimits::default()` (unbounded) special case.
 ///
 /// # Errors
 ///
@@ -1001,7 +1003,8 @@ pub fn parse_safetensors_header_with_limits(
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "safetensors buffer too small for 8-byte header length prefix".into(),
         })?;
-    enforce_safetensors_header_cap(u64::from_le_bytes(prefix), limits)?;
+    let mut budget = Budget::new(limits);
+    enforce_safetensors_header_cap(u64::from_le_bytes(prefix), &mut budget)?;
 
     let (header_size, metadata) =
         safetensors::SafeTensors::read_metadata(buffer).map_err(AnamnesisError::from)?;
@@ -1137,12 +1140,12 @@ pub fn parse_safetensors_header_from_reader<R: Read>(
 /// Parses a safetensors header from a reader under a caller-supplied
 /// [`ParseLimits`] budget.
 ///
-/// Identical to [`parse_safetensors_header_from_reader`] but enforces `limits`
-/// — the declared header length is checked against the caller's
-/// single-allocation budget **before** the `JSON` buffer is allocated. The
-/// built-in `100 MiB` header cap still applies; `limits` can only tighten it.
-/// [`parse_safetensors_header_from_reader`] is the `ParseLimits::default()`
-/// (unbounded) special case.
+/// Identical to [`parse_safetensors_header_from_reader`] but enforces every
+/// applicable [`ParseLimits`] ceiling (the per-allocation and cumulative-byte
+/// budgets) against the declared header length **before** the `JSON` buffer is
+/// allocated. The built-in `100 MiB` header cap still applies; `limits` can
+/// only tighten it. [`parse_safetensors_header_from_reader`] is the
+/// `ParseLimits::default()` (unbounded) special case.
 ///
 /// # Errors
 ///
@@ -1170,7 +1173,8 @@ pub fn parse_safetensors_header_from_reader_with_limits<R: Read>(
     reader.read_exact(&mut prefix)?;
     let header_len_u64 = u64::from_le_bytes(prefix);
 
-    enforce_safetensors_header_cap(header_len_u64, limits)?;
+    let mut budget = Budget::new(limits);
+    enforce_safetensors_header_cap(header_len_u64, &mut budget)?;
     let header_len = usize::try_from(header_len_u64).map_err(|_| AnamnesisError::Parse {
         reason: format!("safetensors header length {header_len_u64} does not fit in usize"),
     })?;
@@ -1592,6 +1596,18 @@ mod tests {
         assert!(
             matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("8-byte")),
             "expected too-small-prefix error, got: {err}"
+        );
+
+        // Aggregate axis (Step 2): the header alone exceeds a 1-byte
+        // max_total_bytes even though the per-item single-alloc cap is
+        // unbounded — rejected on the aggregate, not the single-alloc, axis.
+        let total = ParseLimits::default().with_max_total_bytes(1);
+        let Err(err) = parse_safetensors_header_with_limits(&buffer, &total) else {
+            panic!("expected aggregate rejection");
+        };
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected aggregate error, got: {err}"
         );
     }
 

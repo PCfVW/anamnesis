@@ -25,6 +25,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
+use crate::limits::Budget;
 use crate::parse::utils::byteswap_inplace;
 use crate::ParseLimits;
 
@@ -177,15 +178,16 @@ struct NpyHeader {
 /// Parses the `NPY` header from a reader, consuming the header bytes.
 ///
 /// Supports `NPY` format versions 1.0, 2.0, and 3.0. The declared header
-/// length is bounded by both `NPY_MAX_HEADER_BYTES` and the caller's `limits`
-/// before the header buffer is allocated.
+/// length is bounded by both `NPY_MAX_HEADER_BYTES` and the caller's `budget`
+/// (per-item single-allocation cap + cumulative aggregate) before the header
+/// buffer is allocated.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the magic bytes, version, or header
-/// dict are malformed, or the declared header length exceeds the cap or
-/// `limits`.
-fn parse_npy_header(reader: &mut impl Read, limits: &ParseLimits) -> crate::Result<NpyHeader> {
+/// dict are malformed, or the declared header length exceeds the cap or the
+/// `budget`.
+fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Result<NpyHeader> {
     // Read magic (6 bytes) + major (1) + minor (1) = 8 bytes.
     let mut preamble = [0u8; 8];
     reader
@@ -249,10 +251,11 @@ fn parse_npy_header(reader: &mut impl Read, limits: &ParseLimits) -> crate::Resu
             ),
         });
     }
-    // Caller-supplied ceiling, layered on top of the permanent cap above.
+    // Caller-supplied ceiling (per-item single-alloc + cumulative aggregate),
+    // layered on top of the permanent cap above.
     // CAST: usize → u64, lossless widening on all supported targets
     #[allow(clippy::as_conversions)]
-    limits.check_alloc(header_len as u64, "NPY header")?;
+    budget.charge_alloc(header_len as u64, "NPY header")?;
 
     // Read header string.
     let mut header_buf = vec![0u8; header_len];
@@ -484,13 +487,13 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 ///
 /// Returns [`AnamnesisError::Parse`] if the element count or byte count
 /// overflows `usize`, if `data_bytes` exceeds the entry's declared size, the
-/// `NPZ_MAX_ARRAY_BYTES` cap, or the caller's `ParseLimits` single-allocation
-/// budget, or if the read fails.
+/// `NPZ_MAX_ARRAY_BYTES` cap, or the caller's `budget` (per-item
+/// single-allocation cap + cumulative aggregate), or if the read fails.
 fn read_array_data(
     reader: &mut impl Read,
     header: &NpyHeader,
     entry_size: u64,
-    limits: &ParseLimits,
+    budget: &mut Budget,
 ) -> crate::Result<Vec<u8>> {
     let n_elements: usize = header
         .shape
@@ -528,8 +531,10 @@ fn read_array_data(
             ),
         });
     }
-    // Caller-supplied ceiling, layered on top of the permanent caps above.
-    limits.check_alloc(data_bytes_u64, "NPZ array data")?;
+    // Caller-supplied ceiling (per-item single-alloc + cumulative aggregate),
+    // layered on top of the permanent caps above. The aggregate is what bounds
+    // `parse_npz`'s peak heap (every array is held in the returned map at once).
+    budget.charge_alloc(data_bytes_u64, "NPZ array data")?;
 
     let mut buf = vec![0u8; data_bytes];
     reader
@@ -732,7 +737,7 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
         // Inspect path is header-only and not yet ParseLimits-aware (Phase 6.8
         // Step 5); unbounded default keeps the permanent NPY_MAX_HEADER_BYTES
         // cap as the only bound here.
-        let header = parse_npy_header(&mut entry, &ParseLimits::default())?;
+        let header = parse_npy_header(&mut entry, &mut Budget::unbounded())?;
 
         if header.fortran_order {
             return Err(AnamnesisError::Unsupported {
@@ -804,12 +809,13 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
 
 /// Parses an `NPZ` archive under a caller-supplied [`ParseLimits`] budget.
 ///
-/// Identical to [`parse_npz`] but enforces `limits` — the declared archive
-/// entry count and each `NPY` header and array's declared byte size are
-/// checked against the caller's budget, fail-fast, before the corresponding
-/// allocation. The built-in per-format caps still apply; `limits` can only
-/// tighten them. [`parse_npz`] is the `ParseLimits::default()` (unbounded)
-/// special case.
+/// Identical to [`parse_npz`] but enforces the caller's [`ParseLimits`] —
+/// fail-fast, before each allocation — over the declared archive entry count
+/// (the item-count cap) and every `NPY` header and array allocation (the
+/// per-allocation cap **and** the cumulative-byte aggregate, which bounds
+/// `parse_npz`'s peak heap since every array is held in the returned map at
+/// once). The built-in per-format caps still apply; `limits` can only tighten
+/// them. [`parse_npz`] is the `ParseLimits::default()` (unbounded) special case.
 ///
 /// # Errors
 ///
@@ -839,6 +845,9 @@ pub fn parse_npz_with_limits(
     let entry_count = archive.len() as u64;
     limits.check_item_count(entry_count, "NPZ archive entry count")?;
 
+    // One accountant for the whole archive: `parse_npz` holds every array in
+    // the returned map simultaneously, so the running total bounds peak heap.
+    let mut budget = Budget::new(limits);
     let mut result = HashMap::with_capacity(archive.len());
 
     for i in 0..archive.len() {
@@ -855,7 +864,7 @@ pub fn parse_npz_with_limits(
             None => continue,
         };
 
-        let header = parse_npy_header(&mut entry, limits)?;
+        let header = parse_npy_header(&mut entry, &mut budget)?;
 
         if header.fortran_order {
             return Err(AnamnesisError::Unsupported {
@@ -868,7 +877,7 @@ pub fn parse_npz_with_limits(
         }
 
         let entry_size = entry.size();
-        let data = read_array_data(&mut entry, &header, entry_size, limits)?;
+        let data = read_array_data(&mut entry, &header, entry_size, &mut budget)?;
 
         result.insert(
             name.clone(),
@@ -1105,7 +1114,7 @@ mod tests {
         );
 
         let mut reader = std::io::Cursor::new(&npy);
-        let header = parse_npy_header(&mut reader, &ParseLimits::default()).unwrap();
+        let header = parse_npy_header(&mut reader, &mut Budget::unbounded()).unwrap();
         assert_eq!(header.dtype, NpzDtype::F32);
         assert!(!header.big_endian);
         assert!(!header.fortran_order);
@@ -1114,7 +1123,7 @@ mod tests {
         // u64::MAX entry size: this test exercises the read/byteswap path, not
         // the entry-size guard (covered by its own test below).
         let result =
-            read_array_data(&mut reader, &header, u64::MAX, &ParseLimits::default()).unwrap();
+            read_array_data(&mut reader, &header, u64::MAX, &mut Budget::unbounded()).unwrap();
         assert_eq!(result, data);
     }
 
@@ -1129,11 +1138,11 @@ mod tests {
         );
 
         let mut reader = std::io::Cursor::new(&npy);
-        let header = parse_npy_header(&mut reader, &ParseLimits::default()).unwrap();
+        let header = parse_npy_header(&mut reader, &mut Budget::unbounded()).unwrap();
         assert!(header.big_endian);
 
         let result =
-            read_array_data(&mut reader, &header, u64::MAX, &ParseLimits::default()).unwrap();
+            read_array_data(&mut reader, &header, u64::MAX, &mut Budget::unbounded()).unwrap();
         // After byteswap: [00, 00, 80, 3F] = 1.0 in LE
         assert_eq!(result, vec![0x00, 0x00, 0x80, 0x3F]);
         let val = f32::from_le_bytes([result[0], result[1], result[2], result[3]]);
@@ -1162,12 +1171,12 @@ mod tests {
         npy.extend_from_slice(&42.5_f64.to_le_bytes());
 
         let mut reader = std::io::Cursor::new(&npy);
-        let header = parse_npy_header(&mut reader, &ParseLimits::default()).unwrap();
+        let header = parse_npy_header(&mut reader, &mut Budget::unbounded()).unwrap();
         assert_eq!(header.dtype, NpzDtype::F64);
         assert_eq!(header.shape, vec![1]);
 
         let result =
-            read_array_data(&mut reader, &header, u64::MAX, &ParseLimits::default()).unwrap();
+            read_array_data(&mut reader, &header, u64::MAX, &mut Budget::unbounded()).unwrap();
         assert_eq!(result, 42.5_f64.to_le_bytes());
     }
 
@@ -1175,7 +1184,7 @@ mod tests {
     fn invalid_magic_rejected() {
         let data = b"NOT_NUMPY_DATA_AT_ALL";
         let mut reader = std::io::Cursor::new(data);
-        assert!(parse_npy_header(&mut reader, &ParseLimits::default()).is_err());
+        assert!(parse_npy_header(&mut reader, &mut Budget::unbounded()).is_err());
     }
 
     #[test]
@@ -1339,6 +1348,55 @@ mod tests {
             parse_npz_with_limits(tmp.path(), &ParseLimits::default().with_max_item_count(1))
                 .is_ok()
         );
+    }
+
+    /// Phase 6.8 Step 2: the aggregate `max_total_bytes` rejects a file whose
+    /// arrays each pass `max_single_alloc` but whose cumulative heap (the peak
+    /// `parse_npz` holds, since every array lands in the returned map) crosses
+    /// the budget — the many-small-items blow-up the per-item cap misses.
+    #[test]
+    fn parse_npz_aggregate_budget() {
+        // Three little-endian f32 arrays, shape (1000,) → 4000 bytes each.
+        let data = vec![0u8; 4000];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for name in ["a.npy", "b.npy", "c.npy"] {
+                zip.start_file(name, options).unwrap();
+                let npy = make_npy_v1(
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1000,), }",
+                    &data,
+                );
+                zip.write_all(&npy).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        // Each 4000-byte array clears a 4096-byte single-allocation cap, so with
+        // no aggregate budget the file parses — isolating that the per-item cap
+        // alone does NOT reject the 12000-byte total.
+        let per_item_only = ParseLimits::default().with_max_single_alloc(4096);
+        assert!(parse_npz_with_limits(tmp.path(), &per_item_only).is_ok());
+
+        // Same per-item cap, but an 8000-byte aggregate budget < 3×4000 → the
+        // cumulative charge crosses it and the parse is rejected.
+        let with_aggregate = per_item_only.with_max_total_bytes(8000);
+        let err = parse_npz_with_limits(tmp.path(), &with_aggregate).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected aggregate limit error, got: {err}"
+        );
+
+        // A generous aggregate budget parses, and the default is unchanged.
+        assert!(parse_npz_with_limits(
+            tmp.path(),
+            &ParseLimits::default().with_max_total_bytes(1 << 20)
+        )
+        .is_ok());
+        assert!(parse_npz_with_limits(tmp.path(), &ParseLimits::default()).is_ok());
     }
 
     // G36: inspect_npz overflow — large shape values saturate gracefully
@@ -1507,7 +1565,7 @@ mod tests {
         npy.extend_from_slice(&u32::MAX.to_le_bytes());
 
         let mut reader = std::io::Cursor::new(&npy);
-        let Err(err) = parse_npy_header(&mut reader, &ParseLimits::default()) else {
+        let Err(err) = parse_npy_header(&mut reader, &mut Budget::unbounded()) else {
             panic!("expected error for oversized header length");
         };
         let msg = err.to_string();
@@ -1531,7 +1589,7 @@ mod tests {
         npy.extend_from_slice(&(NPY_MAX_HEADER_BYTES as u32).to_le_bytes());
 
         let mut reader = std::io::Cursor::new(&npy);
-        let Err(err) = parse_npy_header(&mut reader, &ParseLimits::default()) else {
+        let Err(err) = parse_npy_header(&mut reader, &mut Budget::unbounded()) else {
             panic!("expected truncated-body error past the cap gate");
         };
         let msg = err.to_string();
@@ -1559,7 +1617,7 @@ mod tests {
         // u64::MAX entry size so the absolute cap (not the entry-size guard)
         // is what rejects this shape.
         let mut empty = std::io::Cursor::new(Vec::new());
-        let result = read_array_data(&mut empty, &header, u64::MAX, &ParseLimits::default());
+        let result = read_array_data(&mut empty, &header, u64::MAX, &mut Budget::unbounded());
         assert!(
             result.is_err(),
             "oversized declared array must be rejected, got Ok"
@@ -1579,7 +1637,7 @@ mod tests {
             shape: vec![1000],
         };
         let mut empty = std::io::Cursor::new(Vec::new());
-        let Err(err) = read_array_data(&mut empty, &header, 16, &ParseLimits::default()) else {
+        let Err(err) = read_array_data(&mut empty, &header, 16, &mut Budget::unbounded()) else {
             panic!("over-declared shape vs entry size must be rejected");
         };
         let msg = err.to_string();

@@ -27,10 +27,12 @@
 /// ```
 /// use anamnesis::ParseLimits;
 ///
-/// // Reject any single allocation over 256 MiB and any file declaring
-/// // more than 4096 tensors / arrays / KV entries.
+/// // Reject any single allocation over 256 MiB, a cumulative parse-time heap
+/// // over 1 GiB, or a file declaring more than 4096 tensors / arrays / KV
+/// // entries.
 /// let limits = ParseLimits::default()
 ///     .with_max_single_alloc(256 * 1024 * 1024)
+///     .with_max_total_bytes(1024 * 1024 * 1024)
 ///     .with_max_item_count(4096);
 /// ```
 ///
@@ -43,18 +45,29 @@
 // struct. `Clone` covers the rare by-value need.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
+// The shared `max_` prefix is intentional — every field is a caller-set maximum
+// (`max_single_alloc_bytes`, `max_total_bytes`, `max_item_count`); the prefix is
+// what makes the budget axes read uniformly.
+#[allow(clippy::struct_field_names)]
 pub struct ParseLimits {
     /// Upper bound, in bytes, on any single header-declared buffer a parser
     /// allocates eagerly: an `NPZ` array and `NPY` header, a `.pth` `data.pkl`
     /// entry and each pickle string/bytes payload, a `GGUF` variable-length
-    /// (string) read, and the safetensors header. [`u64::MAX`] means unbounded
-    /// — only the per-format constant cap applies.
+    /// (string) read and scalar metadata array, and the safetensors header.
+    /// [`u64::MAX`] means unbounded — only the per-format constant cap applies.
     ///
-    /// Not covered (by design): incrementally-grown `GGUF` metadata arrays
-    /// (bounded by the `MAX_ARRAY_LEN` element cap; their *aggregate* bytes are
-    /// the `max_total_bytes` axis added in Phase 6.8 Step 2) and memory-mapped
-    /// tensor bodies (no heap allocation at parse time).
+    /// Not covered (by design): memory-mapped tensor bodies, which are never
+    /// heap-allocated at parse time (their declared total is what `inspect_*`
+    /// reports for the host's inspect-before-parse policy gate).
     max_single_alloc_bytes: u64,
+
+    /// Upper bound, in bytes, on the *cumulative* parse-time heap a file may
+    /// drive — the running sum of every eager allocation [`max_single_alloc_bytes`]
+    /// gates. Closes the many-small-items blow-up: a file declaring thousands
+    /// of buffers each just under the single-allocation cap is rejected once
+    /// their total crosses this budget, before the host `OOM`s. [`u64::MAX`]
+    /// means unbounded.
+    max_total_bytes: u64,
 
     /// Upper bound on the total number of declared items in a file — `GGUF`
     /// tensors and metadata KV entries, or `NPZ` archive entries. [`u64::MAX`]
@@ -70,6 +83,7 @@ impl ParseLimits {
     pub const fn unbounded() -> Self {
         Self {
             max_single_alloc_bytes: u64::MAX,
+            max_total_bytes: u64::MAX,
             max_item_count: u64::MAX,
         }
     }
@@ -79,6 +93,14 @@ impl ParseLimits {
     #[must_use]
     pub const fn with_max_single_alloc(mut self, bytes: u64) -> Self {
         self.max_single_alloc_bytes = bytes;
+        self
+    }
+
+    /// Sets the maximum cumulative parse-time heap budget, in bytes, and
+    /// returns the updated value. See [`ParseLimits::max_total_bytes`].
+    #[must_use]
+    pub const fn with_max_total_bytes(mut self, bytes: u64) -> Self {
+        self.max_total_bytes = bytes;
         self
     }
 
@@ -95,6 +117,13 @@ impl ParseLimits {
     #[must_use]
     pub const fn max_single_alloc_bytes(&self) -> u64 {
         self.max_single_alloc_bytes
+    }
+
+    /// Returns the maximum cumulative parse-time heap budget, in bytes
+    /// ([`u64::MAX`] if unbounded).
+    #[must_use]
+    pub const fn max_total_bytes(&self) -> u64 {
+        self.max_total_bytes
     }
 
     /// Returns the maximum declared-item-count budget ([`u64::MAX`] if
@@ -170,14 +199,87 @@ impl Default for ParseLimits {
     }
 }
 
+/// Running byte accountant for a single parse, enforcing both the per-item
+/// [`ParseLimits::max_single_alloc_bytes`] ceiling and the cumulative
+/// [`ParseLimits::max_total_bytes`] aggregate budget.
+///
+/// One `Budget` is created per parse from the caller's [`ParseLimits`] and
+/// threaded through the eager-allocation sites: each site `charge`s the bytes
+/// it is about to allocate, fail-fast *before* the allocation. The aggregate
+/// closes the many-small-items blow-up the per-item cap misses.
+///
+/// Owns a (cheap) [`ParseLimits`] clone rather than borrowing, so the per-parse
+/// reader/VM structs can own a `Budget` field without a lifetime parameter.
+pub(crate) struct Budget {
+    /// The caller's limits (the immutable ceilings).
+    limits: ParseLimits,
+    /// Cumulative bytes charged so far this parse.
+    total_bytes: u64,
+}
+
+impl Budget {
+    /// Creates a fresh accountant for one parse, with a zero running total.
+    pub(crate) fn new(limits: &ParseLimits) -> Self {
+        Self {
+            limits: limits.clone(),
+            total_bytes: 0,
+        }
+    }
+
+    /// An unbounded accountant — convenience for the inspect paths (not yet
+    /// `ParseLimits`-aware) and tests.
+    #[cfg_attr(not(feature = "npz"), allow(dead_code))]
+    pub(crate) fn unbounded() -> Self {
+        Self::new(&ParseLimits::unbounded())
+    }
+
+    /// Charges `bytes` against both the per-item single-allocation ceiling and
+    /// the cumulative aggregate budget, **before** the allocation. Enforces the
+    /// per-item cap first (rejecting an oversized single item before it can
+    /// inflate the running total), then adds to and checks the aggregate.
+    ///
+    /// `context` names the offending region for the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if
+    /// `bytes` exceeds [`ParseLimits::max_single_alloc_bytes`], if the running
+    /// total overflows `u64`, or if the new total exceeds
+    /// [`ParseLimits::max_total_bytes`].
+    pub(crate) fn charge_alloc(&mut self, bytes: u64, context: &str) -> crate::Result<()> {
+        // Per-item ceiling first (Step 1), so a single oversized item is
+        // rejected on its own terms before it touches the running total.
+        self.limits.check_alloc(bytes, context)?;
+        let new_total =
+            self.total_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| crate::AnamnesisError::Parse {
+                    reason: format!("aggregate byte total overflow charging {bytes} ({context})"),
+                })?;
+        if new_total > self.limits.max_total_bytes {
+            return Err(crate::AnamnesisError::Parse {
+                reason: format!(
+                    "cumulative declared bytes {new_total} exceeds caller ParseLimits \
+                     max_total_bytes {} ({context})",
+                    self.limits.max_total_bytes
+                ),
+            });
+        }
+        self.total_bytes = new_total;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::ParseLimits;
+    use super::{Budget, ParseLimits};
 
     #[test]
     fn default_is_unbounded() {
         let limits = ParseLimits::default();
         assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
+        assert_eq!(limits.max_total_bytes(), u64::MAX);
         assert_eq!(limits.max_item_count(), u64::MAX);
         assert_eq!(limits, ParseLimits::unbounded());
     }
@@ -186,11 +288,63 @@ mod tests {
     fn builders_set_only_their_axis() {
         let limits = ParseLimits::default().with_max_single_alloc(1024);
         assert_eq!(limits.max_single_alloc_bytes(), 1024);
+        assert_eq!(limits.max_total_bytes(), u64::MAX);
+        assert_eq!(limits.max_item_count(), u64::MAX);
+
+        let limits = ParseLimits::default().with_max_total_bytes(4096);
+        assert_eq!(limits.max_total_bytes(), 4096);
+        assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
         assert_eq!(limits.max_item_count(), u64::MAX);
 
         let limits = ParseLimits::default().with_max_item_count(8);
         assert_eq!(limits.max_item_count(), 8);
         assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
+        assert_eq!(limits.max_total_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn budget_aggregate_catches_what_per_item_misses() {
+        // Each 100-byte charge is well under the 1000-byte single-alloc cap,
+        // but their sum must not cross the 250-byte aggregate budget.
+        let limits = ParseLimits::default()
+            .with_max_single_alloc(1000)
+            .with_max_total_bytes(250);
+        let mut budget = Budget::new(&limits);
+        assert!(budget.charge_alloc(100, "a").is_ok()); // total 100
+        assert!(budget.charge_alloc(100, "b").is_ok()); // total 200
+                                                        // Third charge would reach 300 > 250 — rejected by the aggregate even
+                                                        // though 100 passes the per-item cap.
+        let err = budget.charge_alloc(100, "c").unwrap_err();
+        assert!(
+            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected aggregate error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn budget_per_item_cap_still_applies() {
+        let limits = ParseLimits::default()
+            .with_max_single_alloc(50)
+            .with_max_total_bytes(u64::MAX);
+        let mut budget = Budget::new(&limits);
+        let err = budget.charge_alloc(51, "x").unwrap_err();
+        assert!(
+            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            "expected single-alloc error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn budget_unbounded_charges_until_overflow() {
+        let mut budget = Budget::unbounded();
+        assert!(budget.charge_alloc(u64::MAX, "x").is_ok());
+        // A second non-zero charge overflows the running total → clean error,
+        // never a panic.
+        let err = budget.charge_alloc(1, "y").unwrap_err();
+        assert!(
+            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("overflow")),
+            "expected overflow error, got: {err}"
+        );
     }
 
     #[test]

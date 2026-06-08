@@ -45,6 +45,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
+use crate::limits::Budget;
 use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
@@ -1214,15 +1215,16 @@ struct GgufReader<R: Read + Seek> {
     reader: R,
     pos: u64,
     file_len: u64,
-    /// Caller-supplied allocation budget, enforced on each owned read.
-    limits: ParseLimits,
+    /// Caller-supplied allocation budget — the per-item single-allocation cap
+    /// and the cumulative parse-time-heap aggregate, charged on each owned read.
+    budget: Budget,
 }
 
 impl<R: Read + Seek> GgufReader<R> {
     /// Constructs a reader anchored at offset 0, capturing `file_len` for
     /// the bounds-check error messages and the post-tensor-info data-section
     /// arithmetic. `limits` is the caller's allocation budget, enforced on
-    /// every owned (variable-length) read.
+    /// every owned (variable-length) read and scalar metadata array.
     fn new(mut reader: R, limits: &ParseLimits) -> crate::Result<Self> {
         let file_len = reader.seek(SeekFrom::End(0)).map_err(AnamnesisError::Io)?;
         reader
@@ -1232,7 +1234,7 @@ impl<R: Read + Seek> GgufReader<R> {
             reader,
             pos: 0,
             file_len,
-            limits: limits.clone(),
+            budget: Budget::new(limits),
         })
     }
 
@@ -1300,10 +1302,11 @@ impl<R: Read + Seek> GgufReader<R> {
         #[allow(clippy::as_conversions)]
         let n_u64 = n as u64;
         self.ensure_remaining(n_u64)?;
-        // Caller-supplied ceiling, layered on top of the type cap the caller
-        // (e.g. `read_string` with `MAX_STRING_LEN`) already enforced.
-        self.limits
-            .check_alloc(n_u64, "GGUF variable-length read")?;
+        // Caller-supplied ceiling (per-item single-alloc + cumulative aggregate),
+        // layered on top of the type cap the caller (e.g. `read_string` with
+        // `MAX_STRING_LEN`) already enforced.
+        self.budget
+            .charge_alloc(n_u64, "GGUF variable-length read")?;
         let mut buf = vec![0u8; n];
         self.read_into(&mut buf)?;
         Ok(buf)
@@ -1485,12 +1488,50 @@ fn read_array_len<R: Read + Seek>(cursor: &mut GgufReader<R>) -> crate::Result<u
 /// `PREALLOC_SOFT_CAP` so an adversarial 20-byte array header claiming
 /// `MAX_ARRAY_LEN` elements cannot force ~488 MB of eager allocation;
 /// the vector grows geometrically from there.
+/// Byte size of a scalar `GGUF` metadata-array element type, or `None` for the
+/// non-scalar `STRING` (8) and `ARRAY` (9) types (and unknown discriminants),
+/// whose bytes are charged downstream rather than in bulk.
+const fn scalar_array_elem_size(inner_type: u32) -> Option<u64> {
+    match inner_type {
+        // 0=u8, 1=i8, 7=bool
+        0 | 1 | 7 => Some(1),
+        // 2=u16, 3=i16
+        2 | 3 => Some(2),
+        // 4=u32, 5=i32, 6=f32
+        4..=6 => Some(4),
+        // 10=u64, 11=i64, 12=f64
+        10..=12 => Some(8),
+        // 8=string, 9=array, or unknown → charged downstream / rejected later
+        _ => None,
+    }
+}
+
 fn read_typed_array<R: Read + Seek>(
     cursor: &mut GgufReader<R>,
     inner_type: u32,
     len: usize,
     depth: u32,
 ) -> crate::Result<GgufMetadataArray> {
+    // Charge the scalar array's full heap size to the caller's budget before
+    // growing the `Vec` — bounding both a single oversized array and the
+    // cumulative parse-time heap. `STRING` (8) and `ARRAY` (9) elements are
+    // charged downstream (per-string `read_bytes` / per-element recursion).
+    if let Some(elem_size) = scalar_array_elem_size(inner_type) {
+        // CAST: usize → u64, lossless widening on all supported targets
+        #[allow(clippy::as_conversions)]
+        let len_u64 = len as u64;
+        let bytes = len_u64
+            .checked_mul(elem_size)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("GGUF metadata array byte size overflow (len {len} × {elem_size})"),
+            })?;
+        // Validate the declared array size against the remaining file bytes
+        // before charging or growing — same order as `read_bytes`, so a tiny
+        // file declaring a huge array fails fast instead of looping to EOF.
+        cursor.ensure_remaining(bytes)?;
+        cursor.budget.charge_alloc(bytes, "GGUF metadata array")?;
+    }
+
     let cap = len.min(PREALLOC_SOFT_CAP);
     match inner_type {
         0 => {
@@ -1638,11 +1679,13 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
 
 /// Parses a `GGUF` file under a caller-supplied [`ParseLimits`] budget.
 ///
-/// Identical to [`parse_gguf`] but enforces `limits` — the declared tensor and
-/// metadata-KV counts and each variable-length (string) read are checked
-/// against the caller's budget, fail-fast, before allocation. The built-in
-/// `MAX_*` caps still apply; `limits` can only tighten them. [`parse_gguf`] is
-/// the `ParseLimits::default()` (unbounded) special case.
+/// Identical to [`parse_gguf`] but enforces the caller's [`ParseLimits`] —
+/// fail-fast, before allocation — over the declared tensor and metadata-KV
+/// counts (the item-count cap) and each variable-length read (strings, tensor
+/// names) and scalar metadata array (the per-allocation cap **and** the
+/// cumulative-byte aggregate). The built-in `MAX_*` caps still apply; `limits`
+/// can only tighten them. [`parse_gguf`] is the `ParseLimits::default()`
+/// (unbounded) special case.
 ///
 /// # Errors
 ///
@@ -2436,6 +2479,35 @@ mod tests {
             matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
             "expected single-alloc limit error, got: {err}"
         );
+    }
+
+    /// Phase 6.8 Step 2: the aggregate `max_total_bytes` rejects a GGUF whose
+    /// individual metadata strings / arrays / tensor names each pass the
+    /// per-item cap but whose cumulative parse-time heap (held in the metadata
+    /// map + tensor-info table) crosses the budget.
+    #[test]
+    fn parse_gguf_aggregate_budget() {
+        // build_minimal_gguf charges ~80 bytes total (metadata string keys +
+        // a "test" string value + a 3×f32 array + two tensor names), each item
+        // tiny. Default parses; a 50-byte aggregate budget does not.
+        let f = write_temp_gguf(&build_minimal_gguf());
+        assert!(parse_gguf_with_limits(f.path(), &ParseLimits::default()).is_ok());
+
+        let err =
+            parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_total_bytes(50))
+                .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected aggregate limit error, got: {err}"
+        );
+
+        // A generous aggregate budget parses (proving 50 rejected on the total,
+        // not any single item).
+        assert!(parse_gguf_with_limits(
+            f.path(),
+            &ParseLimits::default().with_max_total_bytes(1 << 20)
+        )
+        .is_ok());
     }
 
     /// A metadata string that declares a length **under** `MAX_STRING_LEN` (so

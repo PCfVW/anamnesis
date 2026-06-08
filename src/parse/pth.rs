@@ -35,6 +35,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
+use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
 use crate::parse::utils::byteswap_inplace;
 use crate::ParseLimits;
@@ -643,9 +644,10 @@ const MAX_PICKLE_PAYLOAD: usize = 64 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`] or
-/// the caller's `ParseLimits` single-allocation budget.
-fn enforce_pickle_payload_cap(len: usize, opcode: &str, limits: &ParseLimits) -> crate::Result<()> {
+/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`], the
+/// caller's per-allocation cap, or the cumulative-byte aggregate (each payload
+/// is an owned clone, so it counts toward the parse-time-heap total).
+fn enforce_pickle_payload_cap(len: usize, opcode: &str, budget: &mut Budget) -> crate::Result<()> {
     if len > MAX_PICKLE_PAYLOAD {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -654,10 +656,12 @@ fn enforce_pickle_payload_cap(len: usize, opcode: &str, limits: &ParseLimits) ->
             ),
         });
     }
-    // Caller-supplied ceiling, layered on top of the permanent cap above.
+    // Caller-supplied ceiling (per-item single-alloc + cumulative aggregate),
+    // layered on top of the permanent cap above. Each payload is an owned
+    // String/Vec clone, so it counts toward the parse-time-heap total.
     // CAST: usize → u64, lossless widening on all supported targets
     #[allow(clippy::as_conversions)]
-    limits.check_alloc(len as u64, "PTH pickle payload")?;
+    budget.charge_alloc(len as u64, "PTH pickle payload")?;
     Ok(())
 }
 
@@ -675,12 +679,14 @@ struct PickleVm<'a> {
     memo: HashMap<u32, PickleValue>,
     /// Auto-incrementing memo key for `MEMOIZE` opcode.
     next_memo_id: u32,
-    /// Caller-supplied allocation budget, enforced on each pickle payload.
-    limits: &'a ParseLimits,
+    /// Caller-supplied allocation budget — the per-item single-allocation cap
+    /// and the cumulative parse-time-heap aggregate, charged on each pickle
+    /// string/bytes payload.
+    budget: Budget,
 }
 
 impl<'a> PickleVm<'a> {
-    fn new(data: &'a [u8], limits: &'a ParseLimits) -> Self {
+    fn new(data: &'a [u8], limits: &ParseLimits) -> Self {
         Self {
             data,
             pos: 0,
@@ -688,7 +694,7 @@ impl<'a> PickleVm<'a> {
             mark_stack: Vec::new(),
             memo: HashMap::new(),
             next_memo_id: 0,
-            limits,
+            budget: Budget::new(limits),
         }
     }
 
@@ -878,7 +884,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINUNICODE length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINUNICODE", self.limits)?;
+                    enforce_pickle_payload_cap(len, "BINUNICODE", &mut self.budget)?;
                     let bytes = self.read_bytes(len)?;
                     let s = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
                         reason: format!("non-UTF-8 pickle string: {e}"),
@@ -911,7 +917,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINSTRING length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINSTRING", self.limits)?;
+                    enforce_pickle_payload_cap(len, "BINSTRING", &mut self.budget)?;
                     let bytes = self.read_bytes(len)?;
                     match std::str::from_utf8(bytes) {
                         // BORROW: .to_owned() converts &str to owned String
@@ -929,7 +935,7 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINBYTES length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINBYTES", self.limits)?;
+                    enforce_pickle_payload_cap(len, "BINBYTES", &mut self.budget)?;
                     let bytes = self.read_bytes(len)?;
                     // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
                     self.stack.push(PickleValue::Bytes(bytes.to_vec()));
@@ -1753,11 +1759,12 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 
 /// Parses a `.pth` archive under a caller-supplied [`ParseLimits`] budget.
 ///
-/// Identical to [`parse_pth`] but enforces `limits` — the declared `data.pkl`
-/// entry size and each 4-byte-length pickle payload are checked against the
-/// caller's single-allocation budget, fail-fast, before allocation. The
-/// built-in `MAX_PKL_SIZE` / `MAX_PICKLE_PAYLOAD` caps still apply; `limits`
-/// can only tighten them. [`parse_pth`] is the `ParseLimits::default()`
+/// Identical to [`parse_pth`] but enforces the caller's [`ParseLimits`] —
+/// fail-fast, before allocation — over the declared `data.pkl` entry size (the
+/// per-allocation cap) and each 4-byte-length pickle payload (per-allocation
+/// **and** the cumulative-byte aggregate, since each payload is an owned
+/// clone). The built-in `MAX_PKL_SIZE` / `MAX_PICKLE_PAYLOAD` caps still apply;
+/// `limits` can only tighten them. [`parse_pth`] is the `ParseLimits::default()`
 /// (unbounded) special case.
 ///
 /// # Errors
@@ -2785,6 +2792,29 @@ mod tests {
             matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
             "expected pickle-payload limit error, got: {err}"
         );
+    }
+
+    /// Phase 6.8 Step 2: the aggregate `max_total_bytes` rejects a pickle whose
+    /// individual payloads each pass `max_single_alloc` but whose cumulative
+    /// owned-clone heap crosses the budget.
+    #[test]
+    fn pth_aggregate_budget() {
+        // PROTO 2, BINUNICODE "abc" (3), BINUNICODE "def" (3), STOP — 6 bytes
+        // of owned String payloads, each well under any per-item cap.
+        let pkl: &[u8] = &[
+            0x80, 0x02, b'X', 0x03, 0x00, 0x00, 0x00, b'a', b'b', b'c', b'X', 0x03, 0x00, 0x00,
+            0x00, b'd', b'e', b'f', b'.',
+        ];
+        // 5-byte aggregate budget < 3 + 3 → the second payload crosses it.
+        let tight = ParseLimits::default().with_max_total_bytes(5);
+        let err = PickleVm::new(pkl, &tight).execute().unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected aggregate limit error, got: {err}"
+        );
+        // A 6-byte budget exactly fits both payloads.
+        let fits = ParseLimits::default().with_max_total_bytes(6);
+        assert!(PickleVm::new(pkl, &fits).execute().is_ok());
     }
 
     // G7: SHORT_BINSTRING
