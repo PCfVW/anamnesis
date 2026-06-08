@@ -811,11 +811,13 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
 ///
 /// Identical to [`parse_npz`] but enforces the caller's [`ParseLimits`] —
 /// fail-fast, before each allocation — over the declared archive entry count
-/// (the item-count cap) and every `NPY` header and array allocation (the
-/// per-allocation cap **and** the cumulative-byte aggregate, which bounds
-/// `parse_npz`'s peak heap since every array is held in the returned map at
-/// once). The built-in per-format caps still apply; `limits` can only tighten
-/// them. [`parse_npz`] is the `ParseLimits::default()` (unbounded) special case.
+/// (the item-count cap), each compressed entry's expansion ratio (the
+/// decompression-ratio cap, rejecting a `DEFLATE` zip bomb from metadata before
+/// reading), and every `NPY` header and array allocation (the per-allocation
+/// cap **and** the cumulative-byte aggregate, which bounds `parse_npz`'s peak
+/// heap since every array is held in the returned map at once). The built-in
+/// per-format caps still apply; `limits` can only tighten them. [`parse_npz`]
+/// is the `ParseLimits::default()` (unbounded) special case.
 ///
 /// # Errors
 ///
@@ -863,6 +865,11 @@ pub fn parse_npz_with_limits(
             Some(n) => n.to_owned(),
             None => continue,
         };
+
+        // Zip-bomb guard: reject an entry whose declared uncompressed size is an
+        // absurd multiple of its compressed size, from archive metadata, before
+        // reading or allocating anything. STORED entries have ratio 1 and pass.
+        limits.check_decompression_ratio(entry.size(), entry.compressed_size(), &name)?;
 
         let header = parse_npy_header(&mut entry, &mut budget)?;
 
@@ -1397,6 +1404,71 @@ mod tests {
         )
         .is_ok());
         assert!(parse_npz_with_limits(tmp.path(), &ParseLimits::default()).is_ok());
+    }
+
+    /// Phase 6.8 Step 3: the decompression-ratio cap rejects a `DEFLATE` entry
+    /// whose declared uncompressed size is an absurd multiple of its compressed
+    /// size (a zip bomb), from archive metadata, while leaving `STORED` entries
+    /// (ratio 1) and the unbounded default untouched.
+    #[test]
+    fn parse_npz_decompression_ratio_cap() {
+        // A `DEFLATE` `.npy` of 40000 zero bytes compresses to a few dozen
+        // bytes → a > 100:1 expansion ratio.
+        let zeros = vec![0u8; 40_000];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("z.npy", options).unwrap();
+            let npy = make_npy_v1(
+                "{'descr': '<u1', 'fortran_order': False, 'shape': (40000,), }",
+                &zeros,
+            );
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+
+        // A 2:1 cap rejects the high-ratio entry from metadata, before reading.
+        let err = parse_npz_with_limits(
+            tmp.path(),
+            &ParseLimits::default().with_max_decompression_ratio(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_decompression_ratio")),
+            "expected ratio limit error, got: {err}"
+        );
+
+        // A generous cap and the unbounded default both parse it.
+        assert!(parse_npz_with_limits(
+            tmp.path(),
+            &ParseLimits::default().with_max_decompression_ratio(100_000)
+        )
+        .is_ok());
+        assert!(parse_npz_with_limits(tmp.path(), &ParseLimits::default()).is_ok());
+
+        // A STORED entry (ratio 1) is never falsely rejected, even at ratio 1.
+        let stored = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(stored.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("s.npy", options).unwrap();
+            let npy = make_npy_v1(
+                "{'descr': '<u1', 'fortran_order': False, 'shape': (16,), }",
+                &[0u8; 16],
+            );
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(parse_npz_with_limits(
+            stored.path(),
+            &ParseLimits::default().with_max_decompression_ratio(1)
+        )
+        .is_ok());
     }
 
     // G36: inspect_npz overflow — large shape values saturate gracefully

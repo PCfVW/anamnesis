@@ -9,17 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Caller-configurable `ParseLimits` (Phase 6.8 Steps 1–2).** A new
+- **Caller-configurable `ParseLimits` (Phase 6.8 Steps 1–3).** A new
   `ParseLimits` budget lets a caller tighten the parsers' resource use to its
   own environment (an edge board, a per-slot MLaaS worker) below the built-in,
-  server-scale constant caps. Three axes: `max_single_alloc` (largest single
+  server-scale constant caps. Four axes: `max_single_alloc` (largest single
   header-declared buffer), `max_total_bytes` (cumulative parse-time heap — the
   running sum of every eager allocation, closing the many-small-items blow-up a
-  per-item cap misses), and `max_item_count` (declared tensor / array / KV /
-  archive-entry count). Each is enforced fail-fast, with `AnamnesisError::Parse`,
-  **before** allocation, layered on top of the permanent per-format caps
-  (`min(constant, limit)` — the limit can only tighten, never weaken the
-  existing floor). New entry points `parse_with_limits`, `parse_gguf_with_limits`,
+  per-item cap misses), `max_item_count` (declared tensor / array / KV /
+  archive-entry count), and `max_decompression_ratio` (the zip-bomb cap — rejects
+  a `DEFLATE` `NPZ` entry whose declared uncompressed size is an absurd multiple
+  of its compressed size, from archive metadata before any allocation). Each is
+  enforced fail-fast, with `AnamnesisError::Parse`, **before** allocation,
+  layered on top of the permanent per-format caps (`min(constant, limit)` — the
+  limit can only tighten, never weaken the existing floor). New entry points `parse_with_limits`, `parse_gguf_with_limits`,
   `parse_npz_with_limits`, `parse_pth_with_limits`,
   `parse_safetensors_header_with_limits`, and
   `parse_safetensors_header_from_reader_with_limits`; the existing limit-free

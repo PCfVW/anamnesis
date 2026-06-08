@@ -12,12 +12,15 @@
 //! over-budget declaration fail-fast with [`AnamnesisError::Parse`](crate::AnamnesisError::Parse)
 //! **before** it allocates.
 //!
-//! The ceiling is **tighten-only**. The effective limit at any allocation site
-//! is `min(format_constant, parse_limit)`, so a caller can make the parser
-//! stricter but never weaker than the built-in floor. [`ParseLimits::default`]
-//! is *unbounded* on every axis ([`u64::MAX`] sentinel), so the default leaves
-//! only the per-format constants in force — behaviour identical to a build with
-//! no [`ParseLimits`] at all.
+//! The ceiling is **tighten-only**: where a built-in per-format constant exists
+//! — the per-item allocation caps and the `GGUF` count caps — the effective
+//! limit is `min(format_constant, parse_limit)`, so a caller can only make the
+//! parser stricter, never weaker than the floor. The cumulative-aggregate and
+//! decompression-ratio axes have no built-in floor (anamnesis imposes no
+//! inherent aggregate or ratio cap) and are pure caller-supplied bounds.
+//! [`ParseLimits::default`] is *unbounded* on every axis ([`u64::MAX`] sentinel),
+//! so the default leaves only the per-format constants in force — behaviour
+//! identical to a build with no [`ParseLimits`] at all.
 
 /// Caller-supplied resource budget threaded through the parser entry points.
 ///
@@ -28,17 +31,20 @@
 /// use anamnesis::ParseLimits;
 ///
 /// // Reject any single allocation over 256 MiB, a cumulative parse-time heap
-/// // over 1 GiB, or a file declaring more than 4096 tensors / arrays / KV
-/// // entries.
+/// // over 1 GiB, a file declaring more than 4096 tensors / arrays / KV
+/// // entries, or a compressed entry that inflates more than 1000×.
 /// let limits = ParseLimits::default()
 ///     .with_max_single_alloc(256 * 1024 * 1024)
 ///     .with_max_total_bytes(1024 * 1024 * 1024)
-///     .with_max_item_count(4096);
+///     .with_max_item_count(4096)
+///     .with_max_decompression_ratio(1000);
 /// ```
 ///
 /// Pass it to the `parse_*_with_limits` entry points. Each axis is enforced
-/// *before* the corresponding allocation, so an over-budget file returns an
-/// error without first committing the memory.
+/// fail-fast — the size and count axes *before* the corresponding allocation,
+/// the decompression-ratio axis from archive metadata *before* reading — so an
+/// over-budget or zip-bomb file returns an error without first committing the
+/// memory.
 // Deliberately not `Copy`: `ParseLimits` is a configuration/budget value passed
 // by `&ParseLimits` everywhere (and borrowed by the `.pth` pickle VM), so a
 // `Copy` derive would trip clippy's `trivially_copy_pass_by_ref` on the 16-byte
@@ -73,6 +79,16 @@ pub struct ParseLimits {
     /// tensors and metadata KV entries, or `NPZ` archive entries. [`u64::MAX`]
     /// means unbounded — only the per-format constant cap applies.
     max_item_count: u64,
+
+    /// Upper bound on a compressed archive entry's uncompressed-to-compressed
+    /// expansion ratio — the zip-bomb cap for `DEFLATE` `NPZ` entries. A few-KB
+    /// entry that *honestly* declares a gigabyte-scale uncompressed size passes
+    /// every byte-size check yet is a `1 000 000:1` amplification no real file
+    /// produces; this rejects it from the archive metadata before allocating.
+    /// `STORED` entries report equal sizes (ratio `1`) and always pass.
+    /// [`u64::MAX`] means unbounded. Applies to `NPZ` only (the sole `DEFLATE`
+    /// path; `.pth` is `STORED`-only, `GGUF` / safetensors are not zipped).
+    max_decompression_ratio: u64,
 }
 
 impl ParseLimits {
@@ -85,6 +101,7 @@ impl ParseLimits {
             max_single_alloc_bytes: u64::MAX,
             max_total_bytes: u64::MAX,
             max_item_count: u64::MAX,
+            max_decompression_ratio: u64::MAX,
         }
     }
 
@@ -112,6 +129,15 @@ impl ParseLimits {
         self
     }
 
+    /// Sets the maximum decompression (expansion) ratio for compressed archive
+    /// entries and returns the updated value. See
+    /// [`ParseLimits::max_decompression_ratio`].
+    #[must_use]
+    pub const fn with_max_decompression_ratio(mut self, ratio: u64) -> Self {
+        self.max_decompression_ratio = ratio;
+        self
+    }
+
     /// Returns the maximum single-allocation budget, in bytes ([`u64::MAX`] if
     /// unbounded).
     #[must_use]
@@ -131,6 +157,13 @@ impl ParseLimits {
     #[must_use]
     pub const fn max_item_count(&self) -> u64 {
         self.max_item_count
+    }
+
+    /// Returns the maximum decompression (expansion) ratio for compressed
+    /// archive entries ([`u64::MAX`] if unbounded).
+    #[must_use]
+    pub const fn max_decompression_ratio(&self) -> u64 {
+        self.max_decompression_ratio
     }
 
     /// Rejects a single allocation of `requested` bytes if it exceeds the
@@ -186,6 +219,53 @@ impl ParseLimits {
             });
         }
         Ok(())
+    }
+
+    /// Rejects a compressed archive entry whose uncompressed-to-compressed
+    /// expansion ratio exceeds the caller's
+    /// [`ParseLimits::max_decompression_ratio`] cap — the zip-bomb guard,
+    /// checked from archive metadata **before** the entry is read. A `STORED`
+    /// entry has `uncompressed == compressed` (ratio `1`) and always passes.
+    ///
+    /// `context` names the offending entry for the error message (e.g. the
+    /// array name).
+    ///
+    /// The bound is `uncompressed <= max_ratio * compressed`, evaluated with a
+    /// `checked_mul` so a `compressed == 0` entry is rejected only when it
+    /// declares a non-zero `uncompressed` (an empty entry passes), and an
+    /// allowed-bound overflow (a huge ratio cap) is treated as within bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if the
+    /// declared expansion ratio exceeds the configured maximum.
+    // Only the `npz` parse path reads `DEFLATE` (compressed) archive entries;
+    // with that feature disabled this helper has no caller.
+    #[cfg_attr(not(feature = "npz"), allow(dead_code))]
+    pub(crate) fn check_decompression_ratio(
+        &self,
+        uncompressed: u64,
+        compressed: u64,
+        context: &str,
+    ) -> crate::Result<()> {
+        if self.max_decompression_ratio == u64::MAX {
+            return Ok(());
+        }
+        // Reject when `uncompressed > max_ratio * compressed`. A `checked_mul`
+        // overflow means the allowed bound exceeds `u64` (≥ any `uncompressed`)
+        // → within bound; `compressed == 0` yields `allowed == 0` → only a
+        // non-empty entry is rejected.
+        match self.max_decompression_ratio.checked_mul(compressed) {
+            Some(allowed) if uncompressed > allowed => Err(crate::AnamnesisError::Parse {
+                reason: format!(
+                    "decompression ratio (uncompressed {uncompressed} / compressed \
+                     {compressed}) exceeds caller ParseLimits max_decompression_ratio \
+                     {} ({context})",
+                    self.max_decompression_ratio
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -281,7 +361,37 @@ mod tests {
         assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
         assert_eq!(limits.max_total_bytes(), u64::MAX);
         assert_eq!(limits.max_item_count(), u64::MAX);
+        assert_eq!(limits.max_decompression_ratio(), u64::MAX);
         assert_eq!(limits, ParseLimits::unbounded());
+    }
+
+    #[test]
+    fn check_decompression_ratio_boundary() {
+        // At the cap passes; one over fails. ratio cap 100, compressed 10 →
+        // allowed 1000.
+        let limits = ParseLimits::default().with_max_decompression_ratio(100);
+        assert!(limits.check_decompression_ratio(1000, 10, "ctx").is_ok());
+        let err = limits
+            .check_decompression_ratio(1001, 10, "ctx")
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("max_decompression_ratio")),
+            "expected ratio error, got: {err}"
+        );
+
+        // `compressed == 0`: empty entry passes, non-empty is rejected.
+        assert!(limits.check_decompression_ratio(0, 0, "ctx").is_ok());
+        assert!(limits.check_decompression_ratio(1, 0, "ctx").is_err());
+
+        // A huge ratio cap whose `allowed` bound overflows `u64` is within
+        // bound (never a panic).
+        let huge = ParseLimits::default().with_max_decompression_ratio(u64::MAX / 2);
+        assert!(huge.check_decompression_ratio(10, 4, "ctx").is_ok());
+
+        // Unbounded (default) never fires.
+        assert!(ParseLimits::default()
+            .check_decompression_ratio(u64::MAX, 1, "ctx")
+            .is_ok());
     }
 
     #[test]
@@ -290,16 +400,25 @@ mod tests {
         assert_eq!(limits.max_single_alloc_bytes(), 1024);
         assert_eq!(limits.max_total_bytes(), u64::MAX);
         assert_eq!(limits.max_item_count(), u64::MAX);
+        assert_eq!(limits.max_decompression_ratio(), u64::MAX);
 
         let limits = ParseLimits::default().with_max_total_bytes(4096);
         assert_eq!(limits.max_total_bytes(), 4096);
         assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
         assert_eq!(limits.max_item_count(), u64::MAX);
+        assert_eq!(limits.max_decompression_ratio(), u64::MAX);
 
         let limits = ParseLimits::default().with_max_item_count(8);
         assert_eq!(limits.max_item_count(), 8);
         assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
         assert_eq!(limits.max_total_bytes(), u64::MAX);
+        assert_eq!(limits.max_decompression_ratio(), u64::MAX);
+
+        let limits = ParseLimits::default().with_max_decompression_ratio(1000);
+        assert_eq!(limits.max_decompression_ratio(), 1000);
+        assert_eq!(limits.max_single_alloc_bytes(), u64::MAX);
+        assert_eq!(limits.max_total_bytes(), u64::MAX);
+        assert_eq!(limits.max_item_count(), u64::MAX);
     }
 
     #[test]
