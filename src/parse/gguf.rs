@@ -46,6 +46,7 @@ use std::path::Path;
 
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
+use crate::parse::utils::PREALLOC_SOFT_CAP;
 use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
@@ -119,19 +120,6 @@ const MAX_TENSOR_ELEMENTS: u64 = 1_000_000_000_000;
 /// negligible heap pressure for a header-only inspect (~64 KiB on top of
 /// the parsed metadata `HashMap`).
 const READER_BUF_SIZE: usize = 64 * 1024;
-
-/// Soft cap on `Vec` / `HashMap` pre-allocation for file-declared counts.
-///
-/// The parser accepts adversarial headers that claim up to `MAX_KV_COUNT`
-/// or `MAX_TENSOR_COUNT` entries (1 M each). Trusting those counts for
-/// `with_capacity` calls would allocate ~175 MB of heap before reading a
-/// single entry (empirically measured: 114 MB for the metadata `HashMap`
-/// plus 61 MB for the `Vec<GgufTensorInfo>` at 1 M cap). Clamping every
-/// trust-the-header pre-allocation hint to this constant bounds the
-/// worst-case eager allocation to ~34 KB while imposing at most
-/// `log₂(MAX / CAP)` extra reallocs on legitimate files — imperceptible
-/// given parse is I/O-bound and real `GGUF` files never reach the cap.
-const PREALLOC_SOFT_CAP: usize = 256;
 
 /// Total number of [`GgufType`] variants — used to size the per-dtype
 /// dedup bitmap in [`ParsedGguf::inspect`]. Must be kept in sync with

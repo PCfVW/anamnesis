@@ -31,8 +31,8 @@ cli = ["dep:clap"]
 gptq = []
 awq = []
 bnb = []
-npz = ["dep:zip"]
-pth = ["dep:zip"]
+npz = ["dep:zip", "dep:flate2"]
+pth = ["dep:zip", "dep:flate2"]
 gguf = []
 # Ollama model-cache path resolver — turns `ollama:llama3.2:1b` into
 # the local GGUF blob path by reading the Ollama manifest. Adds NO
@@ -50,7 +50,16 @@ indicatif = { version = "0.18", optional = true }
 # to avoid eagerly reading the full file into a `Vec<u8>` (`fs::read`).
 # See `docs/perf-experiments.md` entry on audit finding #2.
 memmap2 = "0.9"
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+# Inflate-only DEFLATE: the umbrella `deflate` feature also pulls `zopfli` (a
+# DEFLATE *compressor*) plus `bumpalo`/`log` that this read-only consumer never
+# runs. `deflate-flate2` enables zip's inflate *code* but not zip's optional
+# `flate2` *dependency*; the implicit `flate2` feature flips the dep, and the
+# direct `flate2` below supplies the pure-Rust `miniz_oxide` backend via feature
+# unification — keeping inflate, dropping the compressor. (Phase 6.8 Step 4)
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"], optional = true }
+# Pure-Rust DEFLATE backend (`miniz_oxide`) for `zip`'s inflate path; only
+# pulled in when `zip` is (the `npz`/`pth` features enable both).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

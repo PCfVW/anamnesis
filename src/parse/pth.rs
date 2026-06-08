@@ -37,7 +37,7 @@ use std::path::Path;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
-use crate::parse::utils::byteswap_inplace;
+use crate::parse::utils::{byteswap_inplace, PREALLOC_SOFT_CAP};
 use crate::ParseLimits;
 
 /// Maximum declared size for a `.pth` archive's `data.pkl` entry that the
@@ -1767,6 +1767,13 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 /// `limits` can only tighten them. [`parse_pth`] is the `ParseLimits::default()`
 /// (unbounded) special case.
 ///
+/// The cumulative-byte aggregate covers the pickle string/bytes payloads. The
+/// pickle VM's own working set — the value stack and any assembled lists /
+/// dicts / tuples — is *not* charged to `max_total_bytes`; it is bounded
+/// instead by the `data.pkl` size cap (`MAX_PKL_SIZE`, which `max_single_alloc`
+/// tightens), since every value the VM builds is driven by an opcode in that
+/// bounded stream.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch`
@@ -2341,7 +2348,10 @@ fn build_entry_index(
     archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     raw: &[u8],
 ) -> crate::Result<HashMap<String, (usize, usize)>> {
-    let mut index = HashMap::with_capacity(archive.len());
+    // Clamp the pre-allocation hint: a many-entries zip would otherwise drive
+    // an eager `with_capacity` ~proportional to the file size. The map grows as
+    // entries are inserted. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP`.
+    let mut index = HashMap::with_capacity(archive.len().min(PREALLOC_SOFT_CAP));
 
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {

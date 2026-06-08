@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Inflate-only `zip` dependency (Phase 6.8 Step 4).** Switched the optional
+  `zip` dependency from the umbrella `deflate` feature to `["deflate-flate2",
+  "flate2"]` plus a direct `flate2 = { default-features = false, features =
+  ["rust_backend"] }`, gated on the `npz`/`pth` features. This drops `zopfli`
+  (a DEFLATE *compressor* this read-only consumer never runs) and its
+  `bumpalo`/`log` transitives from the dependency tree while keeping
+  `miniz_oxide` for inflate. Pure dependency hygiene — no API or behaviour
+  change; `np.savez_compressed` archives still inflate bit-exactly.
+
 ### Security
 
 - **Caller-configurable `ParseLimits` (Phase 6.8 Steps 1–3).** A new
@@ -27,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `parse_safetensors_header_from_reader_with_limits`; the existing limit-free
   functions delegate with `ParseLimits::default()` (unbounded), so default
   behaviour is byte-for-byte unchanged — no breaking change.
+- **Clamped zip entry-count pre-allocations (consistency hardening).** The
+  `NPZ` and `.pth` parsers no longer size a `Vec` / `HashMap::with_capacity`
+  hint from the untrusted zip entry count; they clamp it to the shared
+  `PREALLOC_SOFT_CAP`, matching the `GGUF` parser, and the containers grow as
+  entries are inserted (no behaviour change for legitimate files). This stops
+  the parser eagerly reserving for entries it may skip. Note: the *dominant*
+  parse-time memory for a many-entry archive is the `zip` crate's own
+  central-directory model (measured at ~5.7× the file size for 50 000 tiny
+  entries — a fat per-entry record with the filename stored 2–3×), which this
+  clamp does **not** address; bounding that requires the vendored container
+  reader tracked for a later phase.
 
 ## [0.6.2] - 2026-06-04
 

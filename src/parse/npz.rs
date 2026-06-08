@@ -26,7 +26,7 @@ use std::path::Path;
 
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::parse::utils::byteswap_inplace;
+use crate::parse::utils::{byteswap_inplace, PREALLOC_SOFT_CAP};
 use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
@@ -716,7 +716,11 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzInspectInfo> {
     let mut archive = zip::ZipArchive::new(reader)?;
 
-    let mut tensors = Vec::with_capacity(archive.len());
+    // Clamp the pre-allocation hint: `archive.len()` is attacker-influenced
+    // (a many-empty-entries zip), so trusting it for `with_capacity` would
+    // commit ~1–2× the file size eagerly. The Vec still grows as entries are
+    // pushed. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP` clamp.
+    let mut tensors = Vec::with_capacity(archive.len().min(PREALLOC_SOFT_CAP));
     let mut total_bytes: u64 = 0;
     let mut dtypes: Vec<NpzDtype> = Vec::new();
 
@@ -850,7 +854,10 @@ pub fn parse_npz_with_limits(
     // One accountant for the whole archive: `parse_npz` holds every array in
     // the returned map simultaneously, so the running total bounds peak heap.
     let mut budget = Budget::new(limits);
-    let mut result = HashMap::with_capacity(archive.len());
+    // Clamp the pre-allocation hint (see `inspect_npz_from_reader`): a
+    // many-empty-entries zip would otherwise drive a ~1–2× file-size eager
+    // `HashMap` allocation. The map grows as entries are inserted.
+    let mut result = HashMap::with_capacity(archive.len().min(PREALLOC_SOFT_CAP));
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
@@ -1469,6 +1476,36 @@ mod tests {
             &ParseLimits::default().with_max_decompression_ratio(1)
         )
         .is_ok());
+    }
+
+    /// The `PREALLOC_SOFT_CAP` clamp on the entry-count pre-allocation hint is
+    /// only a hint: an archive with more than `PREALLOC_SOFT_CAP` (256) entries
+    /// must still parse every entry (the `HashMap` grows past the clamp).
+    #[test]
+    fn parse_npz_more_entries_than_prealloc_cap() {
+        const N: usize = 300; // > PREALLOC_SOFT_CAP (256)
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..N {
+                zip.start_file(format!("a{i}.npy"), options).unwrap();
+                let npy = make_npy_v1(
+                    "{'descr': '<u1', 'fortran_order': False, 'shape': (1,), }",
+                    &[0u8],
+                );
+                zip.write_all(&npy).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let tensors = parse_npz(tmp.path()).unwrap();
+        assert_eq!(
+            tensors.len(),
+            N,
+            "every entry must round-trip past the clamp"
+        );
     }
 
     // G36: inspect_npz overflow — large shape values saturate gracefully

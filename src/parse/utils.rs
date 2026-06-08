@@ -2,6 +2,23 @@
 
 //! Shared parsing utilities used by multiple format parsers (`NPZ`, `.pth`).
 
+/// Soft cap on `Vec` / `HashMap` pre-allocation sized from a file-declared
+/// count, shared by the `GGUF`, `NPZ`, and `.pth` parsers.
+///
+/// A header or archive can declare a large entry count: a `GGUF` header up to
+/// `MAX_TENSOR_COUNT` / `MAX_KV_COUNT` (1 M each), or a zip central directory
+/// with millions of (possibly empty) entries. Passing that count straight to
+/// `with_capacity` commits the whole hint eagerly — ~175 MB for `GGUF` at 1 M
+/// (empirically 114 MB for the metadata `HashMap` + 61 MB for the
+/// `Vec<GgufTensorInfo>`), and ~1–2× the file size for a many-entries zip,
+/// before a single entry is read. Clamping every trust-the-count pre-allocation
+/// to this constant bounds the worst-case eager hint to a few dozen KB; the
+/// container still grows as entries are inserted, costing at most a handful of
+/// extra reallocs on legitimate files — imperceptible given parse is I/O-bound
+/// and real files never approach the cap.
+#[cfg(any(feature = "npz", feature = "pth", feature = "gguf"))]
+pub(crate) const PREALLOC_SOFT_CAP: usize = 256;
+
 /// Reverses the byte order of each element in `data` in-place.
 ///
 /// Each contiguous `element_size`-byte chunk is reversed, converting
