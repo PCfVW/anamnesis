@@ -198,6 +198,9 @@
 //!   estimates from the parsed header (zero further I/O)
 //! - [`ParsedModel::remember`] — dequantize all quantized tensors to `BF16`
 //!   and write a standard `.safetensors` file
+//! - [`ParsedModel::remember_to_bytes`] — the same dequant, returning the
+//!   `.safetensors` bytes in memory instead of writing a file (no disk
+//!   round-trip for an embedder)
 //! - [`parse_safetensors_header`] / [`parse_safetensors_header_from_reader`]
 //!   — header-only safetensors parsing. The reader-generic variant accepts
 //!   any `Read` substrate (in-memory `Cursor`, `HTTP`-range-backed adapter,

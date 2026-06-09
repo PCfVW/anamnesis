@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ParsedModel::remember_to_bytes(target) -> Result<Vec<u8>>` (Phase 6.8 Step 6).**
+  An in-memory twin of `remember`: the identical `BF16` dequant and
+  companion-grouping, but returns the serialized `.safetensors` bytes instead of
+  writing a file, so an embedder can load the dequantised model without a disk
+  round-trip (e.g. candle-mi's quantized loader → `from_buffered_safetensors`).
+  Completes the file/bytes pairing the crate's other serializers already have
+  (`to_safetensors[_bytes]`, `write_bnb_nf4_safetensors[_bytes]`). The shared
+  dequant + view-building is factored so `remember` (→ `serialize_to_file`,
+  streamed) and `remember_to_bytes` (→ `serialize`, one `Vec`) differ only in the
+  destination. Eager `O(2·n_params)` peak; the streaming, peak-bounded variants
+  are planned for Phase 10.
+
 ### Changed
 
 - **Inflate-only `zip` dependency (Phase 6.8 Step 4).** Switched the optional

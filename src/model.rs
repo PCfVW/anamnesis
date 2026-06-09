@@ -153,6 +153,14 @@ pub fn parse_with_limits(
     Ok(ParsedModel { header, buffer })
 }
 
+/// Owned dequantised tensors produced by [`ParsedModel::dequantize_all`]:
+/// `(output name, `BF16` bytes, output shape)`.
+type DequantizedTensors = Vec<(String, Vec<u8>, Vec<usize>)>;
+
+/// Passthrough tensors that borrow `self.buffer`: `(name, bytes, shape)`. Tied
+/// to the `ParsedModel` borrow they were collected under.
+type PassthroughRefs<'a> = Vec<(&'a str, &'a [u8], &'a [usize])>;
+
 impl ParsedModel {
     /// Returns inspection info (format, tensor counts, size estimates).
     ///
@@ -296,6 +304,9 @@ impl ParsedModel {
     /// Dequantizes all quantized tensors and writes a standard `.safetensors`
     /// file loadable by any Rust ML framework.
     ///
+    /// See [`remember_to_bytes`](Self::remember_to_bytes) for the in-memory
+    /// variant that returns the bytes instead of writing a file.
+    ///
     /// - **Quantized tensors**: dequantized to the target dtype using the
     ///   detected quantization scheme and companion scale factors.
     /// - **Scale tensors**: consumed during dequantization, not written.
@@ -362,20 +373,63 @@ impl ParsedModel {
         }
     }
 
+    /// Dequantizes all quantized tensors and returns the standard `.safetensors`
+    /// bytes in memory, instead of writing a file.
+    ///
+    /// The in-memory twin of [`remember`](Self::remember): identical dequant and
+    /// companion-grouping, but returns the serialized `BF16` safetensors as a
+    /// `Vec<u8>` so an embedder can load the dequantised model without a disk
+    /// round-trip (e.g. candle-mi's quantized loader → `from_buffered_safetensors`).
+    /// Completes the file/bytes pairing the crate's other serializers already
+    /// have ([`ParsedPth::to_safetensors_bytes`](crate::ParsedPth::to_safetensors_bytes),
+    /// `write_bnb_nf4_safetensors_bytes`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
+    /// shapes are inconsistent, or if serialization fails.
+    /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
+    /// is not yet implemented.
+    ///
+    /// # Memory
+    ///
+    /// Peak heap is **higher** than [`remember`](Self::remember)'s file path.
+    /// Both dequantize every tensor into owned `BF16` `Vec`s (`O(2 × n_parameters)`),
+    /// but where [`remember`](Self::remember) streams those bodies to disk one at
+    /// a time via `safetensors::serialize_to_file`, this method calls
+    /// `safetensors::serialize`, which copies every tensor into one contiguous
+    /// output buffer — so the per-tensor `Vec`s **and** the full output `Vec` are
+    /// live simultaneously (~`2 ×` the dequantised set transiently) before the
+    /// per-tensor `Vec`s drop. Comfortable for `≤ 7 B` models on a 32 GB system;
+    /// the streaming, peak-bounded `remember_to_writer` / `remember_to_sink`
+    /// variants are planned for ROADMAP Phase 10.
+    pub fn remember_to_bytes(&self, target: TargetDtype) -> crate::Result<Vec<u8>> {
+        match target {
+            TargetDtype::BF16 => self.remember_to_bytes_bf16(),
+        }
+    }
+
     /// Internal: dequantize to `BF16` and write (no progress callback).
     fn remember_bf16(&self, output_path: &Path) -> crate::Result<()> {
         self.remember_bf16_inner(output_path, || {})
     }
 
-    /// Internal: dequantize to `BF16` and write, with optional progress callback.
-    fn remember_bf16_inner<F>(&self, output_path: &Path, mut on_tensor: F) -> crate::Result<()>
+    /// Internal: run the per-scheme dequant for every tensor, returning the
+    /// owned `BF16` results plus the passthrough tensors (which borrow
+    /// `self.buffer`). Shared by `remember_bf16_inner` (→ file) and
+    /// `remember_to_bytes_bf16` (→ bytes); `on_tensor` fires after each
+    /// quantized tensor so callers can drive a progress bar.
+    fn dequantize_all<F>(
+        &self,
+        mut on_tensor: F,
+    ) -> crate::Result<(DequantizedTensors, PassthroughRefs<'_>)>
     where
         F: FnMut(),
     {
         // Collect dequantized data (owned) for quantized tensors.
         // Passthrough tensors borrow from self.buffer.
-        let mut dequantized_data: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
-        let mut passthrough_refs: Vec<(&str, &[u8], &[usize])> = Vec::new();
+        let mut dequantized_data: DequantizedTensors = Vec::new();
+        let mut passthrough_refs: PassthroughRefs<'_> = Vec::new();
 
         for entry in &self.header.tensors {
             match entry.role {
@@ -774,12 +828,24 @@ impl ParsedModel {
             }
         }
 
+        Ok((dequantized_data, passthrough_refs))
+    }
+
+    /// Internal: build the `safetensors` `TensorView` list from the dequantised
+    /// (owned) tensors and the passthrough (borrowed) tensors. Shared by both
+    /// `remember` destinations; the views borrow `dequantized_data`, so the
+    /// caller must keep it alive until serialization completes.
+    fn build_views<'a>(
+        &'a self,
+        dequantized_data: &'a [(String, Vec<u8>, Vec<usize>)],
+        passthrough_refs: &[(&'a str, &'a [u8], &'a [usize])],
+    ) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'a>)>> {
         // Build TensorView list for serialization.
         // Dequantized tensors use safetensors::Dtype::BF16.
         // Passthrough tensors keep their original dtype.
         let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> = Vec::new();
 
-        for (name, data, shape) in &dequantized_data {
+        for (name, data, shape) in dequantized_data {
             let view =
                 safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, shape.clone(), data)
                     .map_err(|e| AnamnesisError::Parse {
@@ -788,7 +854,7 @@ impl ParsedModel {
             views.push((name.clone(), view));
         }
 
-        for &(name, data, shape) in &passthrough_refs {
+        for &(name, data, shape) in passthrough_refs {
             // Look up the original dtype for this passthrough tensor.
             let entry = self
                 .header
@@ -806,7 +872,20 @@ impl ParsedModel {
             views.push((name.to_owned(), view));
         }
 
-        // Serialize to file.
+        Ok(views)
+    }
+
+    /// Internal: dequantize to `BF16` and write, with optional progress callback.
+    fn remember_bf16_inner<F>(&self, output_path: &Path, on_tensor: F) -> crate::Result<()>
+    where
+        F: FnMut(),
+    {
+        let (dequantized_data, passthrough_refs) = self.dequantize_all(on_tensor)?;
+        let views = self.build_views(&dequantized_data, &passthrough_refs)?;
+
+        // Serialize to file. The safetensors writer streams tensor bodies one at
+        // a time, so the file path's peak stays at the dequantised set — unlike
+        // `remember_to_bytes`, which holds the whole serialized `Vec`.
         let metadata = self.header.metadata.clone();
         safetensors::tensor::serialize_to_file(views, &metadata, output_path).map_err(
             // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
@@ -821,6 +900,17 @@ impl ParsedModel {
         )?;
 
         Ok(())
+    }
+
+    /// Internal: dequantize to `BF16` and return the serialized safetensors bytes.
+    fn remember_to_bytes_bf16(&self) -> crate::Result<Vec<u8>> {
+        let (dequantized_data, passthrough_refs) = self.dequantize_all(|| {})?;
+        let views = self.build_views(&dequantized_data, &passthrough_refs)?;
+
+        let metadata = self.header.metadata.clone();
+        safetensors::tensor::serialize(views, &metadata).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to serialize safetensors bytes: {e}"),
+        })
     }
 }
 
@@ -985,19 +1075,15 @@ mod tests {
         std::fs::remove_file(&tmp_out).ok();
     }
 
-    #[test]
-    fn remember_fp8_round_trip() {
-        // Build a safetensors file with:
-        // - FP8 weight tensor: 2x2 matrix of 0x38 (1.0 in E4M3)
-        // - F32 scale tensor: single scale = 2.0 (per-tensor)
-        // - BF16 passthrough: norm tensor
-
+    /// Builds a raw per-tensor-FP8 safetensors fixture in memory: a 2×2 `F8_E4M3`
+    /// weight (`1.0`), a scalar `F32` scale (`2.0`), and a `BF16` passthrough
+    /// norm (`1.0`). Built by hand because the `safetensors` crate may not
+    /// serialize `F8_E4M3`. Shared by the file and bytes `remember` round-trips.
+    fn build_fp8_per_tensor_fixture() -> Vec<u8> {
         let fp8_data = vec![0x38u8; 4]; // 2x2 of 1.0 in E4M3
         let scale_data = 2.0_f32.to_le_bytes().to_vec();
         let norm_data = vec![0x80, 0x3F]; // BF16 1.0
 
-        // Build header JSON manually since safetensors crate may not support F8_E4M3
-        // for serialization. Instead, build the raw file.
         let mut header_map = serde_json::Map::new();
 
         // FP8 weight at offset 0, length 4
@@ -1034,6 +1120,14 @@ mod tests {
         file_bytes.extend_from_slice(&fp8_data);
         file_bytes.extend_from_slice(&scale_data);
         file_bytes.extend_from_slice(&norm_data);
+        file_bytes
+    }
+
+    #[test]
+    fn remember_fp8_round_trip() {
+        // FP8 weight (1.0) × per-tensor scale (2.0) → BF16 2.0, plus a BF16
+        // passthrough norm; the scale tensor is consumed (absent from output).
+        let file_bytes = build_fp8_per_tensor_fixture();
 
         let tmp_in = std::env::temp_dir().join("test_fp8_in.safetensors");
         let tmp_out = std::env::temp_dir().join("test_fp8_out.safetensors");
@@ -1066,6 +1160,53 @@ mod tests {
             &out_bytes[data_start + w_entry.data_offsets.0..data_start + w_entry.data_offsets.1];
         // 4 elements × 2 bytes = 8 bytes
         assert_eq!(w_data.len(), 8);
+        for chunk in w_data.chunks_exact(2) {
+            assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
+        }
+
+        std::fs::remove_file(&tmp_in).ok();
+        std::fs::remove_file(&tmp_out).ok();
+    }
+
+    #[test]
+    fn remember_to_bytes_fp8_round_trip() {
+        let file_bytes = build_fp8_per_tensor_fixture();
+
+        let tmp_in = std::env::temp_dir().join("test_fp8_bytes_in.safetensors");
+        let tmp_out = std::env::temp_dir().join("test_fp8_bytes_out.safetensors");
+        std::fs::write(&tmp_in, &file_bytes).unwrap();
+
+        let model = parse(&tmp_in).unwrap();
+        assert_eq!(model.header.scheme, QuantScheme::PerTensorFp8);
+
+        // Core pairing invariant: the in-memory bytes are byte-identical to what
+        // the file path writes (same views, same metadata, same serialization).
+        let bytes = model.remember_to_bytes(TargetDtype::BF16).unwrap();
+        model.remember(&tmp_out, TargetDtype::BF16).unwrap();
+        let file_out = std::fs::read(&tmp_out).unwrap();
+        assert_eq!(
+            bytes, file_out,
+            "remember_to_bytes must match remember's file bytes"
+        );
+
+        // Round-trip: parse the returned bytes back and verify the dequant.
+        std::fs::write(&tmp_out, &bytes).unwrap();
+        let out_model = parse(&tmp_out).unwrap();
+        let out_info = out_model.inspect();
+        assert_eq!(out_info.passthrough, 2); // weight (now BF16) + norm
+        assert_eq!(out_info.quantized, 0); // scale consumed
+
+        // Weight values: 1.0 × 2.0 = 2.0 → BF16 0x4000 → LE [0x00, 0x40].
+        let w_entry = out_model
+            .header
+            .tensors
+            .iter()
+            .find(|t| t.name == "layer.weight")
+            .unwrap();
+        let data_start = out_model.header.header_size + 8;
+        let w_data =
+            &bytes[data_start + w_entry.data_offsets.0..data_start + w_entry.data_offsets.1];
+        assert_eq!(w_data.len(), 8); // 4 elements × 2 bytes
         for chunk in w_data.chunks_exact(2) {
             assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
         }
