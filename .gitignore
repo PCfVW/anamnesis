@@ -2,7 +2,6 @@
 
 # Large .pth benchmark files (torchvision models, download instructions in bench_pth_adhoc.rs)
 tests/fixtures/pth_benchmark/
-tests/bench_pth_adhoc.rs
 
 # GGUF model files (downloaded via hf-fm, see tests/fixtures/gguf_reference/generate_gguf.py)
 tests/fixtures/gguf_reference/models/
