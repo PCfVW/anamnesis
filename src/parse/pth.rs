@@ -1978,6 +1978,11 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// returning tensor-count / total-bytes / dtype / byte-order summary without
 /// materialising any of the tensor-data files inside the archive.
 ///
+/// This is the cheap first half of the **inspect-before-parse** policy gate:
+/// the returned [`PthInspectInfo`] reports `total_bytes` and `tensor_count`,
+/// which a host checks against its own budget before calling the authoritative
+/// [`parse_pth_with_limits`] under a matched [`ParseLimits`].
+///
 /// This is the reader-generic core of `.pth` inspection: callers supply any
 /// positional substrate (in-memory [`std::io::Cursor`], an `HTTP`-range-
 /// backed adapter, a custom transport, …) and receive the same

@@ -15,6 +15,7 @@
 
 - [Install](#install)
 - [CLI Commands](#cli-commands)
+- [Parsing untrusted input](#parsing-untrusted-input)
 - [Tested Models](#tested-models)
   - [FP8 Dequantization](#fp8-dequantization)
   - [GPTQ Dequantization](#gptq-dequantization)
@@ -28,7 +29,7 @@
 - [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
-- [Parser robustness (Phases 6.6–6.7, v0.6.1–v0.6.2)](#parser-robustness-phases-6667-v061v062)
+- [Parser robustness (Phases 6.6–6.8, v0.6.1–v0.6.3)](#parser-robustness-phases-6668-v061v063)
 - [Performance validation (Phase 6.5)](#performance-validation-phase-65)
 - [Used by](#used-by)
 - [License](#license)
@@ -92,6 +93,62 @@ Converting model.pth → model.safetensors
   3 tensors, 1.7 KB
   Done.
 ```
+
+## Parsing untrusted input
+
+A `.safetensors`, `.npz`, `.pth`, or `.gguf` file is attacker-controllable: it
+can *declare* arbitrary tensor counts, shapes, string lengths, or (for
+compressed `.npz`) expansion ratios. anamnesis is built **parse-first** so a
+multi-tenant or edge host can reject a hostile or simply too-large file against
+limits **it** chooses, before committing memory. The recommended recipe is
+**inspect → check policy → parse under limits**:
+
+```rust
+use anamnesis::{inspect_npz_from_reader, parse_npz_with_limits, ParseLimits};
+
+// 1. Inspect cheaply — header-only, bounded; never materialises tensor data.
+let info = inspect_npz_from_reader(&mut reader)?;
+
+// 2. Check the declared totals against YOUR environment's policy, and reject
+//    early — no parse, no allocation.
+if info.total_bytes > my_ram_budget || info.tensors.len() > my_tensor_cap {
+    return Err(/* 400 Too Large */);
+}
+
+// 3. Parse under a `ParseLimits` matched to this worker — the authoritative
+//    gate, enforced fail-fast *before* each allocation. (`path` is the same
+//    file; over HTTP-range you inspect remotely, then fetch and parse.)
+let limits = ParseLimits::default()
+    .with_max_total_bytes(my_ram_budget)
+    .with_max_item_count(my_tensor_cap)
+    .with_max_decompression_ratio(1000); // reject a DEFLATE entry inflating >1000×
+let tensors = parse_npz_with_limits(path, &limits)?;
+```
+
+Every parser has a `parse_*_with_limits` sibling (`parse_with_limits` for
+safetensors, `parse_gguf_with_limits`, `parse_npz_with_limits`,
+`parse_pth_with_limits`). The four `ParseLimits` axes:
+
+| Axis | Builder | Bounds |
+|---|---|---|
+| Single allocation | `with_max_single_alloc` | the largest single header-declared buffer a parser allocates |
+| Cumulative heap | `with_max_total_bytes` | the running sum of those allocations across the whole file (the many-small-items blow-up) |
+| Item count | `with_max_item_count` | declared tensors / arrays / KV entries / archive members |
+| Decompression ratio | `with_max_decompression_ratio` | a compressed entry's uncompressed:compressed ratio (`DEFLATE` `.npz` zip-bomb cap) |
+
+`ParseLimits::default()` is **unbounded** on every axis, so the limit-free
+`parse_*` functions and existing call sites are byte-for-byte unchanged — limits
+are opt-in. Limits are **tighten-only**: where a built-in per-format cap already
+exists (the single-allocation caps and the `GGUF` counts) the effective limit is
+`min(cap, your limit)` — a caller can only make the parser *stricter*, never
+weaker than that floor; the cumulative-heap and decompression-ratio axes have no
+built-in cap and are pure caller-supplied bounds. The inspection totals
+(`total_bytes`, `tensor_count` / `tensors.len()`) are a cheap *lower-bound*
+pre-filter — they omit per-entry header overhead — so they are for the early
+reject; `parse_*_with_limits` is the authoritative enforcement.
+
+See also [Parser robustness](#parser-robustness-phases-6668-v061v063) for the
+underlying per-format caps.
 
 ## Tested Models
 
@@ -273,11 +330,13 @@ PyTorch has no separate inspect-only primitive — `torch.load(weights_only=True
 
 `Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
 
-### Parser robustness (Phases 6.6–6.7, v0.6.1–v0.6.2)
+### Parser robustness (Phases 6.6–6.8, v0.6.1–v0.6.3)
 
 Every parser bounds its header-derived allocations against the [`candle #3533`](https://github.com/huggingface/candle/issues/3533) unguarded-allocation DoS class (CWE-770 / CWE-1284 / CWE-400): a length / count / dimension field read from a file header is validated against an explicit cap *before* it reaches `vec!` / `Vec::with_capacity` / the pickle VM. GGUF and safetensors were already capped; v0.6.1 closes the NPZ `header_len` window (NPY v2/v3 decode it as a `u32`, reachable to 4 GiB) and the PyTorch `.pth` mmap-path `data.pkl` size gate (previously bounded only by file size), and adds NPZ array-byte and per-opcode pickle payload caps as defence in depth. Malformed or malicious inputs fail fast with a clear `AnamnesisError::Parse`; legitimate files are unaffected, and there is no API change. This matters because remote header inspection over an `HTTP`-range adapter parses bytes from arbitrary, untrusted repositories.
 
 **v0.6.2** follows up with a full pre-Phase-7 security audit (all four parsers plus the dequant/encode layers) and adds a *container-size cross-check* — a third defence beyond constant caps and checked arithmetic. NPZ rejects a declared array size larger than the ZIP entry's own uncompressed `size()` before allocating, and the GGUF reader validates each variable-length read against the bytes physically remaining before allocating, so a tiny file can no longer drive an eager allocation up to a type cap. A shared checked shape-product helper removes a debug-panic / release-wrap on adversarial shapes. Backing the audit is a coverage-guided [`cargo fuzz`](fuzz/README.md) harness — one libFuzzer target per parser, dev-only and excluded from the published crate, focused on the pickle VM (the deepest state machine) — run with zero crashes across the parser surface.
+
+**v0.6.3** makes those fixed, server-scale caps *caller-configurable* (Phase 6.8). A new `ParseLimits` budget — `max_single_alloc`, `max_total_bytes` (the cumulative-heap aggregate), `max_item_count`, and `max_decompression_ratio` (the `DEFLATE` zip-bomb cap) — threads through every parser via `parse_*_with_limits`, enforced fail-fast and tighten-only, so a memory-constrained edge board or per-slot MLaaS worker can tighten the parser to *its* environment; `ParseLimits::default()` is unbounded, so default behaviour is byte-for-byte unchanged. The recommended **inspect → check policy → parse-under-limits** recipe is documented under [Parsing untrusted input](#parsing-untrusted-input), and the `cargo fuzz` harness gains targets that co-explore malformed files against tightened limits, exercising the enforcement branches with zero crashes. v0.6.3 also drops the unused `zopfli` DEFLATE *compressor* from the dependency tree (`zip` set to inflate-only).
 
 ### Performance validation (Phase 6.5)
 

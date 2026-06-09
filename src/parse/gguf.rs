@@ -1968,6 +1968,11 @@ struct GgufFrontMatter {
 /// metadata, and tensor-info summary statistics without touching the
 /// tensor-data segment.
 ///
+/// This is the cheap first half of the **inspect-before-parse** policy gate:
+/// the returned [`GgufInspectInfo`] reports `total_bytes` and `tensor_count`,
+/// which a host checks against its own budget before calling the authoritative
+/// [`parse_gguf_with_limits`] under a matched [`ParseLimits`].
+///
 /// This is the reader-generic core of `GGUF` inspection: callers supply any
 /// positional substrate (in-memory `Cursor`, an `HTTP`-range-backed adapter,
 /// a custom transport, …) and receive the same [`GgufInspectInfo`] as

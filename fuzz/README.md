@@ -12,9 +12,11 @@ tests *pin* them, and fuzzing *searches* for inputs we didn't think of.
 
 ## Targets
 
-Two flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
-inspection surface) and **path/parse** targets (the full data-extraction path,
-materialising the input to a temp file).
+Three flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
+inspection surface), **path/parse** targets (the full data-extraction path,
+materialising the input to a temp file), and **limit-enforcement** targets
+(Phase 6.8 Step 5) that parse under a `ParseLimits` **derived from the input**,
+so the fuzzer co-explores `(malformed file × tightened limits)`.
 
 | Target | Entry point | What it exercises |
 |---|---|---|
@@ -24,6 +26,9 @@ materialising the input to a temp file).
 | `fuzz_pth` | `inspect_pth_from_reader` | **ZIP walk + the pickle VM** (opcodes, `GLOBAL` allowlist, memo/mark stacks, recursion) — the highest-value target |
 | `fuzz_npz_parse` | `parse_npz` (via temp file) | the **data-extraction path**: `read_array_data` + the `entry.size()` cross-check |
 | `fuzz_pth_parse` | `parse_pth` + `tensors()` (via temp file) | the **mmap path + tensor extraction**: `build_entry_index`, the `MAX_PKL_SIZE` mmap guard, stride/offset resolution |
+| `fuzz_npz_limits` | `parse_npz_with_limits` (via temp file) | **all four `ParseLimits` axes**: single-alloc, cumulative `Budget` (`checked_add`), item-count, decompression-ratio (`checked_mul`) |
+| `fuzz_gguf_limits` | `parse_gguf_with_limits` (via temp file) | GGUF limit branches: single-alloc + `Budget` on variable-length reads + scalar-array charge + tensor/KV count gate |
+| `fuzz_pth_limits` | `parse_pth_with_limits` + `tensors()` (via temp file) | `.pth` limit branches: the `data.pkl` cap + the pickle-VM `Budget` charged on each owned payload |
 
 ## Prerequisites — Linux / macOS / WSL (not Windows-MSVC)
 
@@ -87,7 +92,14 @@ libFuzzer). Smoke campaigns (Phase 6.7): the four reader targets ~20 s unseeded
 (~0.2–0.8 M runs each) plus a 62 s seeded `fuzz_pth` campaign (213 k runs,
 coverage 1412 / features 5372, corpus 675 inputs, RSS steady ~489 MB); the two
 path targets 30 s seeded each (`fuzz_npz_parse` 102 k runs, `fuzz_pth_parse`
-103 k runs) — **zero crashes** across all six. Not yet wired into CI; a
-scheduled Linux fuzz job is a candidate follow-up (it needs nightly +
-`cargo-fuzz` install in the runner, so it is intentionally kept out of the
-stable-only push/PR matrix).
+103 k runs) — **zero crashes** across all six. The three `*_limits` targets
+(Phase 6.8 Step 5) each ran 60 s seeded under WSL2 Ubuntu (nightly + `cargo-fuzz`
+0.13.1, libFuzzer): `fuzz_npz_limits` 264 k runs (cov 1454, RSS 497 MB),
+`fuzz_pth_limits` 224 k runs (cov 1819, RSS 460 MB), `fuzz_gguf_limits` 469 k
+runs (cov 643, RSS 415 MB) — **~957 k executions, zero crashes**, confirming the
+`ParseLimits` enforcement branches (`check_alloc` / `Budget::charge_alloc`
+`checked_add` / `check_item_count` / `check_decompression_ratio` `checked_mul`)
+reject panic-free under input-derived limits. Not yet wired into CI; a scheduled
+Linux fuzz job is a candidate follow-up (it needs nightly + `cargo-fuzz`
+install in the runner, so it is intentionally kept out of the stable-only
+push/PR matrix).

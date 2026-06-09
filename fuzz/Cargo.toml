@@ -65,3 +65,27 @@ path = "fuzz_targets/fuzz_pth_parse.rs"
 test = false
 doc = false
 bench = false
+
+# Limit-enforcement targets (Phase 6.8 Step 5): parse under a `ParseLimits`
+# derived from the input, exercising the `check_alloc` / `Budget::charge_alloc`
+# / `check_item_count` / `check_decompression_ratio` branches.
+[[bin]]
+name = "fuzz_npz_limits"
+path = "fuzz_targets/fuzz_npz_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_gguf_limits"
+path = "fuzz_targets/fuzz_gguf_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pth_limits"
+path = "fuzz_targets/fuzz_pth_limits.rs"
+test = false
+doc = false
+bench = false

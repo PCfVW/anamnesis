@@ -652,6 +652,11 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// Inspects an `NPZ` archive from any `Read + Seek` source, returning
 /// metadata for all arrays without reading tensor data.
 ///
+/// This is the cheap first half of the **inspect-before-parse** policy gate:
+/// the returned [`NpzInspectInfo`] reports `total_bytes` and `tensors.len()`,
+/// which a host checks against its own budget before calling the authoritative
+/// [`parse_npz_with_limits`] under a matched [`ParseLimits`].
+///
 /// This is the reader-generic core of [`inspect_npz`]: the path-based
 /// variant is a two-line wrapper that opens a file and delegates here. By
 /// accepting any `Read + Seek` substrate, callers can supply alternative
@@ -1506,6 +1511,55 @@ mod tests {
             N,
             "every entry must round-trip past the clamp"
         );
+    }
+
+    /// Phase 6.8 Step 5: the documented inspect-before-parse policy gate.
+    /// `inspect_npz`'s reported `total_bytes` lets a host predict an
+    /// over-budget file *without parsing*; `parse_npz_with_limits` then enforces
+    /// the same budget authoritatively. This ties the inspect report to the
+    /// parse enforcement.
+    #[test]
+    fn inspect_npz_total_predicts_parse_limits_gate() {
+        // One f32 array, shape (1000,) → 4000 declared bytes.
+        let data = vec![0u8; 4000];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("w.npy", options).unwrap();
+            let npy = make_npy_v1(
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (1000,), }",
+                &data,
+            );
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+
+        // Step 1: inspect (cheap, header-only) reports the declared total.
+        let info = inspect_npz(tmp.path()).unwrap();
+        assert_eq!(info.total_bytes, 4000);
+        assert_eq!(info.tensors.len(), 1);
+
+        // Step 2: a host whose budget is below the inspected total rejects early
+        // — and `parse_npz_with_limits` under that same budget agrees (Err). The
+        // parse charges the `NPY` header too, so the inspected total is a
+        // lower bound: a budget at/below it always rejects.
+        let policy_budget = info.total_bytes - 1;
+        assert!(info.total_bytes > policy_budget); // the host's cheap pre-check fires
+        assert!(parse_npz_with_limits(
+            tmp.path(),
+            &ParseLimits::default().with_max_total_bytes(policy_budget)
+        )
+        .is_err());
+
+        // Step 3: a generous budget (> inspected total + header overhead) parses.
+        assert!(parse_npz_with_limits(
+            tmp.path(),
+            &ParseLimits::default().with_max_total_bytes(info.total_bytes * 2)
+        )
+        .is_ok());
     }
 
     // G36: inspect_npz overflow — large shape values saturate gracefully

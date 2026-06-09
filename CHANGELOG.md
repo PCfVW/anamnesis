@@ -30,14 +30,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archive-entry count), and `max_decompression_ratio` (the zip-bomb cap — rejects
   a `DEFLATE` `NPZ` entry whose declared uncompressed size is an absurd multiple
   of its compressed size, from archive metadata before any allocation). Each is
-  enforced fail-fast, with `AnamnesisError::Parse`, **before** allocation,
-  layered on top of the permanent per-format caps (`min(constant, limit)` — the
-  limit can only tighten, never weaken the existing floor). New entry points `parse_with_limits`, `parse_gguf_with_limits`,
+  enforced fail-fast, with `AnamnesisError::Parse`, **before** allocation, and is
+  tighten-only — where a permanent per-format cap exists (the single-allocation
+  caps, the `GGUF` counts) the effective bound is `min(cap, limit)`, never below
+  that floor; the aggregate and ratio axes have no built-in cap and are pure
+  caller bounds. New entry points `parse_with_limits`, `parse_gguf_with_limits`,
   `parse_npz_with_limits`, `parse_pth_with_limits`,
   `parse_safetensors_header_with_limits`, and
   `parse_safetensors_header_from_reader_with_limits`; the existing limit-free
   functions delegate with `ParseLimits::default()` (unbounded), so default
-  behaviour is byte-for-byte unchanged — no breaking change.
+  behaviour is byte-for-byte unchanged — no breaking change. The recommended
+  **inspect-before-parse** policy-gate pattern (cheap `inspect_*_from_reader`
+  → check the reported totals against your policy → `parse_*_with_limits`) is
+  documented front-of-README, and the `cargo-fuzz` harness gains three
+  `*_limits` targets that co-explore malformed files against input-derived
+  limits, exercising every enforcement branch.
 - **Clamped zip entry-count pre-allocations (consistency hardening).** The
   `NPZ` and `.pth` parsers no longer size a `Vec` / `HashMap::with_capacity`
   hint from the untrusted zip entry count; they clamp it to the shared
