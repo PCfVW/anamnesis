@@ -2102,9 +2102,10 @@ pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<Gguf
     // `Cursor<&[u8]>` over the mmap, which is already zero-syscall). Adding
     // a `BufReader` there would only add a memcpy.
     let buffered = BufReader::with_capacity(READER_BUF_SIZE, reader);
-    // The inspect path is header-only and not yet ParseLimits-aware (wired in
-    // Phase 6.8 Step 5); unbounded default keeps the permanent GGUF caps as the
-    // only bound here.
+    // The inspect path is intentionally limit-free: it reports the totals a host
+    // checks against its policy (the inspect-before-parse gate), then the host
+    // calls `parse_gguf_with_limits` for the real enforcement. So pass the
+    // unbounded default — the permanent GGUF caps remain the only bound here.
     let front = parse_gguf_from_reader(buffered, &ParseLimits::default())?;
     Ok(build_inspect_info(
         front.version,

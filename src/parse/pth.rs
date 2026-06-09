@@ -2154,9 +2154,9 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// inspects with ~150 KiB peak heap.
 pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthInspectInfo> {
     let (big_endian, pkl_bytes) = read_pth_archive_for_inspect(reader)?;
-    // The inspect path is header-only and not yet ParseLimits-aware (wired in
-    // Phase 6.8 Step 5 with the README policy-gate docs); use the unbounded
-    // default so behaviour is unchanged.
+    // The inspect path is intentionally limit-free: it reports the totals a host
+    // checks against its policy (the inspect-before-parse gate), then calls
+    // `parse_pth_with_limits` for enforcement. Use the unbounded default.
     let meta = interpret_pickle_to_meta(&pkl_bytes, &ParseLimits::default())?;
     Ok(build_pth_inspect_info(&meta, big_endian))
 }
@@ -2220,8 +2220,9 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<
     let (pkl_name, pkl_size, byteorder_name, byteorder_size) =
         locate_inspect_entries(&mut archive)?;
 
-    // Inspect path is not yet ParseLimits-aware (Phase 6.8 Step 5); unbounded
-    // default keeps the permanent MAX_PKL_SIZE cap as the only bound here.
+    // Inspect path is intentionally limit-free (it reports totals for the host's
+    // inspect-before-parse gate); unbounded default keeps the permanent
+    // MAX_PKL_SIZE cap as the only bound here.
     enforce_pkl_size_cap(pkl_size, &pkl_name, &ParseLimits::default())?;
 
     let big_endian = match byteorder_name {

@@ -743,9 +743,10 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
             None => continue,
         };
 
-        // Inspect path is header-only and not yet ParseLimits-aware (Phase 6.8
-        // Step 5); unbounded default keeps the permanent NPY_MAX_HEADER_BYTES
-        // cap as the only bound here.
+        // Inspect path is intentionally limit-free: it reports the totals a host
+        // checks against its policy (the inspect-before-parse gate), then calls
+        // `parse_npz_with_limits` for enforcement. Unbounded budget keeps the
+        // permanent NPY_MAX_HEADER_BYTES cap as the only bound here.
         let header = parse_npy_header(&mut entry, &mut Budget::unbounded())?;
 
         if header.fortran_order {
