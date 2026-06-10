@@ -208,6 +208,7 @@ fn peak_heap_bnb_dq_small_1m_elements() {
         &fixture.quant_map,
         &fixture.nested_absmax,
         &fixture.nested_quant_map,
+        0.0, // nested_offset: synthetic fixture, never offset-compressed
         total_elements,
         BLOCK_SIZE,
         NESTED_BLOCK_SIZE,
@@ -241,6 +242,7 @@ fn peak_heap_bnb_dq_layer_45m_elements() {
         &fixture.quant_map,
         &fixture.nested_absmax,
         &fixture.nested_quant_map,
+        0.0, // nested_offset: synthetic fixture, never offset-compressed
         total_elements,
         BLOCK_SIZE,
         NESTED_BLOCK_SIZE,

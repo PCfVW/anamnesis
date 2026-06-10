@@ -260,15 +260,16 @@ mod tests {
             let w_start = block_idx * (block_size / 2);
             let w_end = w_start + block_size / 2;
             for (offset, &byte) in weight[w_start..w_end].iter().enumerate() {
-                let low = (byte & 0x0F) as usize;
+                // bitsandbytes order: high nibble decodes to the first element.
                 let high = (byte >> 4) as usize;
-                let val_low = cb[low] * scale;
-                let val_high = cb[high] * scale;
-                let bf16_low = (val_low.to_bits() >> 16) as u16;
-                let bf16_high = (val_high.to_bits() >> 16) as u16;
+                let low = (byte & 0x0F) as usize;
+                let val_first = cb[high] * scale;
+                let val_second = cb[low] * scale;
+                let bf16_first = (val_first.to_bits() >> 16) as u16;
+                let bf16_second = (val_second.to_bits() >> 16) as u16;
                 let o = (block_idx * block_size + offset * 2) * 2;
-                out[o..o + 2].copy_from_slice(&bf16_low.to_le_bytes());
-                out[o + 2..o + 4].copy_from_slice(&bf16_high.to_le_bytes());
+                out[o..o + 2].copy_from_slice(&bf16_first.to_le_bytes());
+                out[o + 2..o + 4].copy_from_slice(&bf16_second.to_le_bytes());
             }
         }
         Ok(out)
@@ -305,7 +306,8 @@ mod tests {
                 let n0 = nearest_idx(f0, &cb);
                 let n1 = nearest_idx(f1, &cb);
                 let o = block_idx * (block_size / 2) + pair_idx;
-                out[o] = (n1 << 4) | n0;
+                // bitsandbytes order: first element packs into the HIGH nibble.
+                out[o] = (n0 << 4) | n1;
             }
         }
         Ok(out)

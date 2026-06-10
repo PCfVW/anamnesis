@@ -4,8 +4,32 @@
 
 Extracts a small block-aligned slice of BnB tensors (weight, absmax, quant_map,
 and optionally nested_absmax/nested_quant_map or SCB), dequantizes with the
-bitsandbytes Python formula, and writes a binary fixture file for Rust
+**real bitsandbytes library** (`bitsandbytes.functional.dequantize_4bit` /
+`int8_vectorwise_dequant`), and writes a binary fixture file for Rust
 cross-validation.
+
+External-reference discipline (the v0.6.4 rule)
+-----------------------------------------------
+The "expected" output MUST come from the canonical library's own code — never
+from a hand-rolled reimplementation of the formula. A previous version of this
+script reimplemented the dequant in plain PyTorch and hard-coded a WRONG
+nibble order (low-nibble-first; bitsandbytes is high-nibble-first), which let
+an element-permuting decode bug ship green at 0 ULP. See
+docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md.
+
+Generation runs the CUDA kernel (`dequantize_4bit` dispatches to the GPU when
+the tensors live there). This is deliberate:
+
+- The CUDA kernel is what the ecosystem's inference actually runs, and it
+  computes `code[nibble] * absmax` in f32 with a single rounding at the output
+  store — measured bit-identical (0/4096 mismatches across NF4, NF4-DQ, and
+  FP4 fixtures) to anamnesis' f32-multiply + round-to-nearest-even BF16 path.
+- The bitsandbytes CPU kernel (0.49) computes in the target dtype instead and
+  double-rounds, diverging from the CUDA kernel by 1 ULP on ~19 % of elements.
+  Anchoring to it would force max_ulp=1 and hide real regressions.
+
+Only *generation* needs the GPU; the committed `.bin` fixture and the Rust
+cross-validation tests remain 100 % CPU.
 
 Fixture binary format — NF4/FP4 (all little-endian):
   4 bytes: format_id (u32) — 0=NF4/FP4, 1=INT8, 2=NF4/FP4 double-quant
@@ -17,6 +41,7 @@ Fixture binary format — NF4/FP4 (all little-endian):
   4 bytes: nested_absmax_len (u32) — bytes of nested absmax (0 if not double-quant)
   4 bytes: nested_quant_map_len (u32) — bytes of nested quant_map (0 if not double-quant)
   4 bytes: expected_len (u32) — bytes of expected BF16 output
+  4 bytes: nested_offset (f32) — double-quant absmax offset (0.0 if not double-quant)
   [weight_len bytes]: raw U8 weight data
   [absmax_len bytes]: raw absmax data
   [quant_map_len bytes]: raw quant_map data
@@ -24,7 +49,14 @@ Fixture binary format — NF4/FP4 (all little-endian):
   [nested_quant_map_len bytes]: raw nested quant_map (empty if not double-quant)
   [expected_len bytes]: expected BF16 output
 
-Fixture binary format — INT8:
+The `nested_offset` field is new in v0.6.4: real bitsandbytes double-quant
+recovers `absmax = dequantize_blockwise(absmax_u8, state2) + offset`, where
+`offset` (the mean of the original absmax values) is stored in the
+`quant_state` JSON blob as `nested_offset`. The previous hand-rolled
+reference omitted it — circularly hiding the same omission in the Rust
+decoder.
+
+Fixture binary format — INT8 (unchanged):
   4 bytes: format_id (u32) — 1
   4 bytes: out_features (u32)
   4 bytes: in_features (u32)
@@ -40,10 +72,13 @@ Each fixture also emits `<name>.timing.json` with:
   {
     "pytorch_quantize_ns": <best-of-N ns>,
     "pytorch_quantize_iters": N,
-    "operation": "bitsandbytes.functional.quantize_4bit"  // or "quantize_int8"
+    "operation": "bitsandbytes.functional.quantize_4bit (cuda)"
   }
 The Rust encode cross-validation tests read this sidecar (if present) to
 print a side-by-side runtime comparison. Sidecar absence is non-fatal.
+The timing now measures the REAL bitsandbytes quantize kernel on the GPU
+(the previous version timed a hand-rolled CPU reimplementation), so the
+numbers are an inference-ecosystem baseline, not a CPU-vs-CPU comparison.
 
 Usage:
   python generate_bnb.py
@@ -57,8 +92,18 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+import bitsandbytes
+from bitsandbytes.functional import (
+    QuantState,
+    dequantize_4bit,
+    int8_vectorwise_dequant,
+    quantize_4bit,
+)
+
 
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
+
+TORCH_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
 def find_snapshot(model_dir: Path) -> Path:
@@ -72,175 +117,13 @@ def find_snapshot(model_dir: Path) -> Path:
     return dirs[0]
 
 
-# ---- NF4/FP4 dequantization (matching bitsandbytes) ----
-
-def dequant_bnb4_pytorch(
-    weight_u8: torch.Tensor,
-    absmax_f32: torch.Tensor,
-    quant_map: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Dequantize NF4/FP4 to BF16 using the bitsandbytes formula.
-
-    weight_u8: flat U8 tensor (2 nibbles per byte)
-    absmax_f32: F32 tensor, one per block
-    quant_map: F32[16] lookup table
-    """
-    # Unpack nibbles: low first, high second
-    weight_bytes = weight_u8.to(torch.uint8)
-    low_nibbles = weight_bytes & 0x0F
-    high_nibbles = weight_bytes >> 4
-
-    # Interleave: [low0, high0, low1, high1, ...]
-    total_elements = weight_bytes.numel() * 2
-    unpacked = torch.zeros(total_elements, dtype=torch.long)
-    unpacked[0::2] = low_nibbles.long()
-    unpacked[1::2] = high_nibbles.long()
-
-    # Lookup
-    values = quant_map[unpacked]
-
-    # Scale by block absmax
-    num_blocks = total_elements // block_size
-    values = values.reshape(num_blocks, block_size)
-    absmax_expanded = absmax_f32[:num_blocks].unsqueeze(1)
-    result = values * absmax_expanded
-    return result.reshape(-1).to(torch.bfloat16)
-
-
-def dequant_bnb4_double_quant_pytorch(
-    weight_u8: torch.Tensor,
-    absmax_u8: torch.Tensor,
-    quant_map: torch.Tensor,
-    nested_absmax_f32: torch.Tensor,
-    nested_quant_map: torch.Tensor,
-    block_size: int,
-    nested_block_size: int,
-) -> torch.Tensor:
-    """Dequantize double-quant NF4/FP4: first recover absmax, then dequant."""
-    # Step 1: dequant nested absmax (U8 → F32)
-    num_blocks = absmax_u8.numel()
-    absmax_indices = absmax_u8.long()
-    absmax_values = nested_quant_map[absmax_indices]
-
-    # Scale by nested absmax
-    import math
-    num_nested = math.ceil(num_blocks / nested_block_size)
-    recovered = torch.zeros(num_blocks, dtype=torch.float32)
-    for i in range(num_blocks):
-        nb_idx = i // nested_block_size
-        recovered[i] = absmax_values[i] * nested_absmax_f32[nb_idx]
-
-    # Step 2: dequant weights using recovered absmax
-    return dequant_bnb4_pytorch(weight_u8, recovered, quant_map, block_size)
-
-
-# ---- NF4/FP4 quantization (matching bitsandbytes encode side) ----
-
-def quantize_bnb4_pytorch(
-    source_bf16: torch.Tensor,
-    quant_map: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Quantize BF16 → packed U8 nibbles via bitsandbytes' nearest-codebook
-    rule.
-
-    Mirrors the inverse of ``dequant_bnb4_pytorch``. For each pair of
-    consecutive BF16 elements, find the nearest codebook entry by abs
-    distance (lower index breaks ties), pack low nibble in bits [3:0]
-    and high nibble in bits [7:4]. Per-block absmax is derived from the
-    source.
-
-    Returns the packed weight tensor (uint8). Used solely for *timing
-    measurement* in the encode sidecar; correctness is validated against
-    bitsandbytes' on-disk bytes by the Rust cross-validation tests.
-    """
-    flat = source_bf16.reshape(-1).to(torch.float32)
-    total = flat.numel()
-    num_blocks = total // block_size
-    blocks = flat.reshape(num_blocks, block_size)
-    absmax = blocks.abs().max(dim=1).values  # [num_blocks]
-    return _quantize_bnb4_inner_pytorch(blocks, absmax, quant_map, block_size)
-
-
-def _quantize_bnb4_inner_pytorch(
-    blocks: torch.Tensor,        # [num_blocks, block_size], F32
-    absmax: torch.Tensor,        # [num_blocks], F32
-    quant_map: torch.Tensor,     # [16], F32
-    block_size: int,
-) -> torch.Tensor:
-    """Shared inner kernel: normalise by absmax, nearest-codebook search,
-    pack nibbles. Used by both plain `quantize_bnb4_pytorch` (derives
-    absmax from source) and `quantize_bnb4_double_quant_pytorch` (takes
-    pre-recovered absmax)."""
-    safe_absmax = absmax.unsqueeze(1).clamp(min=1e-30)
-    normalised = blocks / safe_absmax
-    diff = (normalised.unsqueeze(-1) - quant_map.to(torch.float32).reshape(1, 1, -1)).abs()
-    nibbles = diff.argmin(dim=-1).to(torch.uint8)
-    flat_nibbles = nibbles.reshape(-1)
-    low = flat_nibbles[0::2]
-    high = flat_nibbles[1::2]
-    packed = (high << 4) | (low & 0x0F)
-    return packed
-
-
-def quantize_bnb4_double_quant_pytorch(
-    source_bf16: torch.Tensor,
-    recovered_absmax: torch.Tensor,  # F32 [num_blocks], from nested decode
-    quant_map: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Quantize BF16 → packed U8 nibbles using a pre-recovered F32 absmax.
-
-    Mirrors the Rust `encode_bnb4_double_quant` signature (takes the
-    decoded-and-recovered absmax rather than re-deriving from source).
-    Used solely for *timing measurement* in the encode sidecar for
-    double-quant fixtures.
-    """
-    flat = source_bf16.reshape(-1).to(torch.float32)
-    total = flat.numel()
-    num_blocks = total // block_size
-    blocks = flat.reshape(num_blocks, block_size)
-    return _quantize_bnb4_inner_pytorch(blocks, recovered_absmax, quant_map, block_size)
-
-
-# ---- INT8 dequantization ----
-
-def dequant_bnb_int8_pytorch(
-    weight_i8: torch.Tensor,
-    scb: torch.Tensor,
-) -> torch.Tensor:
-    """Dequantize BnB INT8 to BF16: weight_i8 * SCB[row] / 127.0"""
-    scale = scb / 127.0  # [out_features]
-    weight_f32 = weight_i8.float()
-    result = weight_f32 * scale.unsqueeze(1)  # broadcast scale across columns
-    return result.to(torch.bfloat16)
-
-
-def quantize_bnb_int8_pytorch(
-    source_bf16: torch.Tensor,
-    scb: torch.Tensor,
-) -> torch.Tensor:
-    """Quantize BF16 → I8 via the inverse of ``dequant_bnb_int8_pytorch``.
-
-    For each row: scale = SCB / 127.0; element = round(value / scale)
-    clamped to [-128, 127], stored as int8. Used solely for *timing
-    measurement* in the encode sidecar.
-    """
-    scale = (scb / 127.0).unsqueeze(1).clamp(min=1e-30)  # avoid /0 in zero-SCB rows
-    f32 = source_bf16.to(torch.float32)
-    quotient = f32 / scale
-    rounded = torch.round(quotient).clamp(-128.0, 127.0)
-    return rounded.to(torch.int8)
-
-
 # ---- Sidecar writer ----
 
 def write_timing_sidecar(name: str, op: str, ns_iters: list[int]) -> None:
     """Write `<name>.timing.json` next to the .bin fixture.
 
     `ns_iters` is the list of per-iteration durations in nanoseconds;
-    we record the best-of-N median.
+    we record the best-of-N.
     """
     output_path = Path(__file__).parent / f"{name}.timing.json"
     best_ns = min(ns_iters)
@@ -280,23 +163,17 @@ MODELS = [
         "format": "int8",
         "layer_base": "model.layers.0.mlp.gate_proj",
     },
-    # Step 1b — cross-architecture plain-FP4 fixture (Qwen3).
-    # Proves the sign-of-zero preservation rule (introduced in Step 1a for
-    # the Llama FP4 fixture) generalises to a different architecture and
-    # a different HF org. Same on-disk layout as the Llama FP4 fixture:
-    # F32 absmax + F32 quant_map + U8 packed weight + U8 quant_state blob.
+    # Cross-architecture plain-FP4 fixture (Qwen3). Proves the sign-of-zero
+    # preservation rule generalises to a different architecture and HF org.
     {
         "name": "qwen3_mcqa_fp4",
         "model_dir": HF_CACHE / "models--ema1234--qwen_mcqa_bnb_fp4",
         "format": "bnb4",
         "layer_base": "model.layers.0.mlp.gate_proj",
     },
-    # Step 1c — cross-architecture double-quant NF4 fixtures.
-    # Surfaced by `hf-fm inspect` during candidate selection: every
-    # non-Llama BnB-NF4 model checked uses double-quant (bitsandbytes'
-    # default). These two fixtures validate `encode_bnb4_double_quant`
-    # across two more architectures (Qwen2.5 and Phi-3.5) — the
-    # ecosystem-realistic test set for the NF4 encode path.
+    # Cross-architecture double-quant NF4 fixtures (Qwen2.5 and Phi-3.5) —
+    # the ecosystem-realistic test set for the NF4 path: every non-Llama
+    # BnB-NF4 model checked uses double-quant (bitsandbytes' default).
     {
         "name": "qwen2_5_1_5b_nf4_dq",
         "model_dir": HF_CACHE / "models--unsloth--Qwen2.5-1.5B-Instruct-bnb-4bit",
@@ -310,6 +187,19 @@ MODELS = [
         "layer_base": "model.layers.0.mlp.gate_proj",
     },
 ]
+
+
+def load_quant_state_blob(f, layer_base: str) -> dict:
+    """Read and parse the `quant_state.bitsandbytes__nf4/__fp4` JSON blob."""
+    qs_names = [
+        n for n in f.keys() if n.startswith(f"{layer_base}.weight.quant_state.bitsandbytes__")
+    ]
+    if not qs_names:
+        raise KeyError(f"no quant_state tensor under {layer_base}")
+    blob = f.get_tensor(qs_names[0])
+    meta = json.loads(bytes(blob.numpy().tobytes()).decode("utf-8"))
+    meta["_quant_type"] = qs_names[0].rsplit("__", 1)[1]  # "nf4" or "fp4"
+    return meta
 
 
 def generate_bnb4_fixture(model_info: dict) -> None:
@@ -329,10 +219,9 @@ def generate_bnb4_fixture(model_info: dict) -> None:
 
     st_files = list(snapshot.glob("*.safetensors"))
     if not st_files:
-        print(f"  ERROR: no safetensors files found")
+        print("  ERROR: no safetensors files found")
         return
 
-    # Tensor names
     weight_name = f"{layer_base}.weight"
     absmax_name = f"{layer_base}.weight.absmax"
     quant_map_name = f"{layer_base}.weight.quant_map"
@@ -341,24 +230,30 @@ def generate_bnb4_fixture(model_info: dict) -> None:
         weight_raw = f.get_tensor(weight_name)
         absmax_raw = f.get_tensor(absmax_name)
         quant_map = f.get_tensor(quant_map_name)
+        qs_meta = load_quant_state_blob(f, layer_base)
 
         if is_double_quant:
-            nested_absmax_name = f"{layer_base}.weight.nested_absmax"
-            nested_quant_map_name = f"{layer_base}.weight.nested_quant_map"
-            nested_absmax = f.get_tensor(nested_absmax_name)
-            nested_quant_map = f.get_tensor(nested_quant_map_name)
+            nested_absmax = f.get_tensor(f"{layer_base}.weight.nested_absmax")
+            nested_quant_map = f.get_tensor(f"{layer_base}.weight.nested_quant_map")
 
+    quant_type = qs_meta["_quant_type"]
+    block_size = int(qs_meta["blocksize"])
+    out_dtype = TORCH_DTYPES[qs_meta["dtype"]]
     total_elements_full = weight_raw.numel() * 2
-    num_blocks_full = absmax_raw.numel()
-    block_size = total_elements_full // num_blocks_full if num_blocks_full > 0 else 64
 
     print(f"  weight:    {list(weight_raw.shape)}, dtype={weight_raw.dtype}")
     print(f"  absmax:    {list(absmax_raw.shape)}, dtype={absmax_raw.dtype}")
     print(f"  quant_map: {list(quant_map.shape)}, dtype={quant_map.dtype}")
-    print(f"  block_size={block_size}, total_elements={total_elements_full}")
+    print(f"  quant_state: type={quant_type}, blocksize={block_size}, dtype={qs_meta['dtype']}")
+
+    nested_offset = 0.0
     if is_double_quant:
-        print(f"  nested_absmax:    {list(nested_absmax.shape)}, dtype={nested_absmax.dtype}")
-        print(f"  nested_quant_map: {list(nested_quant_map.shape)}, dtype={nested_quant_map.dtype}")
+        nested_block_size = int(qs_meta["nested_blocksize"])
+        nested_offset = float(qs_meta["nested_offset"])
+        print(
+            f"  nested: blocksize={nested_block_size}, offset={nested_offset:.9f}, "
+            f"absmax={list(nested_absmax.shape)}, quant_map={list(nested_quant_map.shape)}"
+        )
 
     # Extract a slice: 4096 elements = 2048 bytes = 64 blocks (for block_size=64)
     slice_elements = min(4096, total_elements_full)
@@ -366,76 +261,86 @@ def generate_bnb4_fixture(model_info: dict) -> None:
     slice_bytes = slice_elements // 2
 
     weight_slice = weight_raw.reshape(-1)[:slice_bytes].contiguous()
+    absmax_slice = absmax_raw.reshape(-1)[:slice_blocks].contiguous()
 
     if is_double_quant:
-        absmax_slice = absmax_raw.reshape(-1)[:slice_blocks].contiguous()
-        # Nested block size: infer from absmax count / nested_absmax count
-        nested_block_size = max(1, num_blocks_full // max(1, nested_absmax.numel()))
-        import math
-        nested_needed = math.ceil(slice_blocks / nested_block_size)
+        nested_needed = -(-slice_blocks // nested_block_size)  # ceil div
         nested_absmax_slice = nested_absmax.reshape(-1)[:nested_needed].contiguous()
         nested_quant_map_slice = nested_quant_map.contiguous()
-    else:
-        absmax_slice = absmax_raw.reshape(-1)[:slice_blocks].contiguous()
 
     print(f"  Slice: {slice_elements} elements ({slice_bytes} bytes, {slice_blocks} blocks)")
 
-    # Dequantize and time it
+    # ---- Build the QuantState for the REAL bitsandbytes dequant (CUDA) ----
+    if is_double_quant:
+        state2 = QuantState(
+            absmax=nested_absmax_slice.float().cuda(),
+            code=nested_quant_map_slice.float().cuda(),
+            blocksize=nested_block_size,
+            dtype=torch.float32,
+        )
+        qstate = QuantState(
+            absmax=absmax_slice.cuda(),
+            shape=(slice_elements, 1),
+            code=quant_map.float().cuda(),
+            blocksize=block_size,
+            quant_type=quant_type,
+            dtype=out_dtype,
+            offset=torch.tensor(nested_offset, dtype=torch.float32).cuda(),
+            state2=state2,
+        )
+    else:
+        qstate = QuantState(
+            absmax=absmax_slice.float().cuda(),
+            shape=(slice_elements, 1),
+            code=quant_map.float().cuda(),
+            blocksize=block_size,
+            quant_type=quant_type,
+            dtype=out_dtype,
+        )
+
+    weight_cuda = weight_slice.reshape(-1, 1).cuda()
+
+    # Dequantize with the canonical kernel and time it (best of 5)
     best_us = float("inf")
-    for run in range(5):
+    for _ in range(5):
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        if is_double_quant:
-            result_bf16 = dequant_bnb4_double_quant_pytorch(
-                weight_slice, absmax_slice, quant_map,
-                nested_absmax_slice, nested_quant_map_slice,
-                block_size, nested_block_size,
-            )
-        else:
-            result_bf16 = dequant_bnb4_pytorch(
-                weight_slice, absmax_slice.float(), quant_map, block_size,
-            )
+        result = dequantize_4bit(weight_cuda, qstate, quant_type=quant_type)
+        torch.cuda.synchronize()
         t1 = time.perf_counter()
         best_us = min(best_us, (t1 - t0) * 1e6)
 
-    expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
-    print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {slice_elements} elements)")
+    # Expected is BF16: a no-op for bf16-dtype quant states; for f16-dtype
+    # states (e.g. the FP4 fixtures) this is the canonical f16 output
+    # converted once to BF16 — measured bit-identical to anamnesis'
+    # direct f32→BF16 path on every fixture (0 mismatches).
+    result_bf16 = result.reshape(-1).to(torch.bfloat16).cpu()
+    expected_bytes = result_bf16.view(torch.uint8).numpy().tobytes()
+    print(
+        f"  bitsandbytes dequantize_4bit (cuda): {best_us:.1f} µs "
+        f"(best of 5, {slice_elements} elements)"
+    )
 
-    # ---- Time the inverse (quantize) for the encode-side sidecar ----
-    # Inputs: the decoded BF16, the same per-block absmax, the same codebook.
-    # Plain (single-quant) and double-quant variants have different signatures:
-    # plain derives absmax from source, double-quant takes pre-recovered absmax
-    # (matches the Rust API split between `encode_bnb4` and
-    # `encode_bnb4_double_quant`).
+    # ---- Time the REAL quantize kernel for the encode-side sidecar ----
     quantize_iters_ns: list[int] = []
-    if is_double_quant:
-        # Recover absmax via the same nested-codebook decode the Rust side
-        # uses. The recovered F32 array is what `encode_bnb4_double_quant`
-        # internally derives in its first pass.
-        absmax_indices = absmax_slice.long()
-        absmax_values_lut = nested_quant_map_slice[absmax_indices]
-        recovered_absmax = torch.zeros(slice_blocks, dtype=torch.float32)
-        for i in range(slice_blocks):
-            nb_idx = i // nested_block_size
-            recovered_absmax[i] = absmax_values_lut[i] * nested_absmax_slice[nb_idx]
-        for _ in range(5):
-            q0 = time.perf_counter_ns()
-            _packed = quantize_bnb4_double_quant_pytorch(
-                result_bf16, recovered_absmax, quant_map, block_size,
-            )
-            q1 = time.perf_counter_ns()
-            quantize_iters_ns.append(q1 - q0)
-        write_timing_sidecar(
-            name, "bitsandbytes-style quantize_4bit_double_quant", quantize_iters_ns
+    src = result.reshape(-1, 1)
+    for _ in range(5):
+        torch.cuda.synchronize()
+        q0 = time.perf_counter_ns()
+        _packed, _st = quantize_4bit(
+            src,
+            blocksize=block_size,
+            compress_statistics=is_double_quant,
+            quant_type=quant_type,
         )
-    else:
-        for _ in range(5):
-            q0 = time.perf_counter_ns()
-            _packed = quantize_bnb4_pytorch(result_bf16, quant_map, block_size)
-            q1 = time.perf_counter_ns()
-            quantize_iters_ns.append(q1 - q0)
-        write_timing_sidecar(
-            name, "bitsandbytes.functional.quantize_4bit", quantize_iters_ns
-        )
+        torch.cuda.synchronize()
+        q1 = time.perf_counter_ns()
+        quantize_iters_ns.append(q1 - q0)
+    write_timing_sidecar(
+        name,
+        f"bitsandbytes.functional.quantize_4bit (cuda, compress_statistics={is_double_quant})",
+        quantize_iters_ns,
+    )
 
     # Get raw bytes
     w_bytes = weight_slice.numpy().tobytes()
@@ -464,6 +369,7 @@ def generate_bnb4_fixture(model_info: dict) -> None:
         out.write(struct.pack("<I", len(na_bytes)))
         out.write(struct.pack("<I", len(nqm_bytes)))
         out.write(struct.pack("<I", len(expected_bytes)))
+        out.write(struct.pack("<f", nested_offset))
         out.write(w_bytes)
         out.write(a_bytes)
         out.write(qm_bytes)
@@ -490,7 +396,7 @@ def generate_int8_fixture(model_info: dict) -> None:
 
     st_files = list(snapshot.glob("*.safetensors"))
     if not st_files:
-        print(f"  ERROR: no safetensors files found")
+        print("  ERROR: no safetensors files found")
         return
 
     weight_name = f"{layer_base}.weight"
@@ -515,25 +421,44 @@ def generate_int8_fixture(model_info: dict) -> None:
 
     print(f"  Slice: {slice_out}×{slice_in} = {slice_out * slice_in} elements")
 
-    # Dequantize and time it
+    # Dequantize with the canonical function (CUDA) and time it (best of 5).
+    # `int8_vectorwise_dequant` computes `A * stats * (1/127)` in f32 — the
+    # named LLM.int8() weight dequant in bitsandbytes. Measured bit-identical
+    # to anamnesis' `w × (SCB/127)` after BF16 rounding (0/65536 mismatches).
+    w_cuda = weight_slice.cuda()
+    scb_cuda = scb_slice.cuda()
     best_us = float("inf")
-    for run in range(5):
+    for _ in range(5):
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        result_bf16 = dequant_bnb_int8_pytorch(weight_slice, scb_slice)
+        result_f32 = int8_vectorwise_dequant(w_cuda, scb_cuda)
+        torch.cuda.synchronize()
         t1 = time.perf_counter()
         best_us = min(best_us, (t1 - t0) * 1e6)
 
+    result_bf16 = result_f32.to(torch.bfloat16).cpu()
     expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
-    print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {slice_out}×{slice_in} = {slice_out * slice_in} elements)")
+    print(
+        f"  bitsandbytes int8_vectorwise_dequant (cuda): {best_us:.1f} µs "
+        f"(best of 5, {slice_out}×{slice_in} = {slice_out * slice_in} elements)"
+    )
 
     # ---- Time the inverse (quantize) for the encode-side sidecar ----
+    # int8_vectorwise_quant is the canonical row-wise int8 quantizer.
+    from bitsandbytes.functional import int8_vectorwise_quant
+
+    src = result_bf16.to(torch.float16).cuda()
     quantize_iters_ns: list[int] = []
     for _ in range(5):
+        torch.cuda.synchronize()
         q0 = time.perf_counter_ns()
-        _i8 = quantize_bnb_int8_pytorch(result_bf16, scb_slice)
+        _q, _stats, _outliers = int8_vectorwise_quant(src)
+        torch.cuda.synchronize()
         q1 = time.perf_counter_ns()
         quantize_iters_ns.append(q1 - q0)
-    write_timing_sidecar(name, "bitsandbytes-style quantize_int8", quantize_iters_ns)
+    write_timing_sidecar(
+        name, "bitsandbytes.functional.int8_vectorwise_quant (cuda)", quantize_iters_ns
+    )
 
     # Write the weight as unsigned bytes (I8 → U8 reinterpret)
     w_bytes = weight_slice.view(torch.uint8).reshape(-1).numpy().tobytes()
@@ -555,7 +480,13 @@ def generate_int8_fixture(model_info: dict) -> None:
 
 
 if __name__ == "__main__":
-    print("Generating BitsAndBytes cross-validation fixtures...")
+    print(f"Generating BitsAndBytes cross-validation fixtures (bitsandbytes {bitsandbytes.__version__})...")
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "CUDA is required for fixture GENERATION: the anchor is the canonical "
+            "CUDA dequant kernel (single f32 rounding). The committed fixtures and "
+            "the Rust cross-validation tests remain CPU-only."
+        )
     for model in MODELS:
         if model["format"] in ("bnb4", "bnb4_dq"):
             generate_bnb4_fixture(model)

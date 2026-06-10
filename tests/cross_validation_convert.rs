@@ -433,7 +433,8 @@ fn t5_bnb_nf4_byte_exact_vs_python_reference() {
     // Fixture header layout (cross_validation_bnb_encode.rs):
     //   u32 format_id, u32 total_elements, u32 block_size,
     //   u32 weight_len, u32 absmax_len, u32 quant_map_len,
-    //   u32 nested_absmax_len, u32 nested_quant_map_len, u32 expected_len
+    //   u32 nested_absmax_len, u32 nested_quant_map_len, u32 expected_len,
+    //   f32 nested_offset (0.0 for plain fixtures)
     let read_u32 = |off: usize| u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
     let format_id = read_u32(0);
     assert_eq!(format_id, 0, "expect plain (non-DQ) NF4 fixture");
@@ -443,7 +444,7 @@ fn t5_bnb_nf4_byte_exact_vs_python_reference() {
     let absmax_len = read_u32(16) as usize;
     let quant_map_len = read_u32(20) as usize;
     let _expected_len = read_u32(32) as usize;
-    let mut off = 36;
+    let mut off = 40;
     let weight_data = raw[off..off + weight_len].to_vec();
     off += weight_len;
     let absmax_data = raw[off..off + absmax_len].to_vec();

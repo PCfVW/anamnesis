@@ -5,7 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.3] - 2026-06-09
+## [Unreleased]
+
+Phase 6.9 — exact-parity fixes surfaced by dogfooding `v0.6.3` inside candle-mi.
+Full post-mortem:
+[`docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md`](docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md).
+
+### Fixed
+
+- **BnB NF4/FP4 nibble order (decode + encode).** `dequantize_bnb4_core`
+  unpacked the two 4-bit values in each byte low-nibble-first; the
+  `bitsandbytes` kernel is **high-nibble-first** (`byte >> 4` → element `2i`,
+  `byte & 0x0F` → element `2i + 1`). Every NF4/FP4 dequant produced
+  correctly-valued but **element-permuted** weights (adjacent pairs swapped) —
+  confirmed end-to-end by candle-mi's forward-parity gate (garbage logits,
+  `max|Δlogit| ≈ 19.9` → top-1 ` Paris` after the fix). The `lethe` encoder
+  (`encode_bnb4_core`) is mirrored, so the written nibbles now match
+  `bitsandbytes`' on-disk layout byte-exactly *and* the decode↔encode round
+  trip still closes.
+- **BnB double-quant `nested_offset` was dropped (decode + encode + parse).**
+  Real `bitsandbytes` double quantization recovers
+  `absmax = nested_dequant(absmax_u8) + nested_offset`, where the offset (the
+  mean of the original absmax values, ~0.05–0.08 on real checkpoints) is
+  stored in the `quant_state` JSON blob. anamnesis ignored it, biasing every
+  recovered absmax low — every double-quant BnB model (the `bitsandbytes`
+  default; the entire unsloth catalog checked) dequantized with a systematic
+  error. `ParsedModel::remember`/`remember_to_bytes` now parse
+  `nested_offset` from the blob (mandatory for DQ tensors — a DQ tensor
+  without it is rejected as malformed).
+- **AWQ GEMM nibble interleave was missing (decode).** AutoAWQ packs the 8
+  nibbles of each `I32` in the order `AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]`
+  (for **both** `qweight` and `qzeros`); anamnesis unpacked sequentially,
+  producing column-permuted output — 44 468 / 65 536 elements wrong on the
+  re-anchored Llama fixture. `remember::awq` now applies the canonical
+  interleave (`AWQ_ORDER` / `AWQ_REVERSE_ORDER`, mirroring
+  `awq/utils/packing_utils.py`).
+
+### Changed
+
+- **BREAKING: `dequantize_bnb4_double_quant_to_bf16` and
+  `encode_bnb4_double_quant` take a new `nested_offset: f32` parameter** (the
+  `bitsandbytes` `QuantState.offset`). Callers reading real `bitsandbytes`
+  checkpoints must pass the value from the `quant_state` blob; `0.0`
+  reproduces the only case the old signature handled correctly (synthetic
+  states that were never offset-compressed). The high-level
+  `remember`/`remember_to_bytes` paths extract it automatically.
+- **BREAKING: AWQ dequantization rejects `bits != 4`.** AutoAWQ's GEMM format
+  is 4-bit only (its packer raises `NotImplementedError` for other widths), so
+  no canonical nibble interleave exists to anchor an 8-bit decode against —
+  and no real 8-bit AWQ-GEMM checkpoints exist (the "8-bit AWQ" models on the
+  Hub are misnamed 4-bit GEMM or `compressed-tensors`). Rejecting beats
+  emitting plausibly-permuted weights.
+- **Cross-validation fixtures re-anchored on the canonical libraries' own
+  code** (the methodology fix — the previous generators reimplemented the
+  dequant formulas in plain PyTorch and shared the Rust code's blind spots,
+  validating the BnB and AWQ bugs green at 0 ULP):
+  `generate_bnb.py` → `bitsandbytes.functional.dequantize_4bit` /
+  `int8_vectorwise_dequant` (CUDA kernel at generation time — measured
+  bit-identical to anamnesis' single f32→BF16 rounding, unlike the
+  double-rounding 0.49 CPU kernel; committed fixtures stay CPU-checkable);
+  `generate_awq.py` → AutoAWQ `unpack_awq` + `reverse_awq_order`;
+  `generate_gptq.py` → GPTQModel `TorchLinear.dequantize_weight` +
+  `convert_gptq_v1_to_v2_format_module`. GPTQ's convention was **confirmed
+  correct** by re-anchoring (the on-disk `+1` zero-point offset matches
+  GPTQModel's loader-side v1→v2 conversion). The BnB fixture format gains a
+  `nested_offset` header field; AWQ/GPTQ cross-validation tightened from
+  `max_ulp = 1` to `0`. GGUF/Ollama/NPZ/PTH/safetensors/FP8 generators were
+  audited and already genuinely anchored (real `gguf-py`, the formats' own
+  libraries, torch's native fp8 cast).
 
 ### Added
 

@@ -688,6 +688,20 @@ impl ParsedModel {
                                     }
                                 })?;
 
+                            // Read the quant_state JSON blob once: the
+                            // double-quant path needs `nested_offset` from it
+                            // BEFORE dequantizing, and the shape recovery
+                            // below needs `shape`.
+                            let quant_state_data = companions
+                                .quant_state
+                                .map(|qs_entry| {
+                                    self.tensor_data(
+                                        qs_entry.data_offsets.0,
+                                        qs_entry.data_offsets.1,
+                                    )
+                                })
+                                .transpose()?;
+
                             let bf16_data = if config.double_quant {
                                 let nested_absmax = companions.nested_absmax.ok_or_else(|| {
                                     AnamnesisError::Parse {
@@ -724,12 +738,32 @@ impl ParsedModel {
                                     256
                                 };
 
+                                // The nested_offset is mandatory for the
+                                // double-quant absmax recovery; a DQ tensor
+                                // without a quant_state blob cannot be
+                                // decoded correctly.
+                                let nested_offset = match quant_state_data {
+                                    Some(qs_data) => {
+                                        parse_bnb_quant_state_nested_offset(qs_data, &entry.name)?
+                                    }
+                                    None => {
+                                        return Err(AnamnesisError::Parse {
+                                            reason: format!(
+                                                "BnB4 double-quant: quant_state blob not found \
+                                                 for `{}` (required for nested_offset)",
+                                                entry.name
+                                            ),
+                                        })
+                                    }
+                                };
+
                                 dequantize_bnb4_double_quant_to_bf16(
                                     weight_data,
                                     absmax_data,
                                     quant_map_data,
                                     nested_absmax_data,
                                     nested_quant_map_data,
+                                    nested_offset,
                                     total_elements,
                                     config.block_size,
                                     nested_block_size,
@@ -747,11 +781,7 @@ impl ParsedModel {
                             // BnB4 weights are stored flattened to [N, 1]. Recover the original
                             // 2D shape from the quant_state companion tensor (JSON blob with
                             // "shape" field), falling back to flat [total_elements] if absent.
-                            let output_shape = if let Some(qs_entry) = companions.quant_state {
-                                let qs_data = self.tensor_data(
-                                    qs_entry.data_offsets.0,
-                                    qs_entry.data_offsets.1,
-                                )?;
+                            let output_shape = if let Some(qs_data) = quant_state_data {
                                 parse_bnb_quant_state_shape(qs_data, total_elements, &entry.name)?
                             } else {
                                 vec![total_elements]
@@ -981,6 +1011,49 @@ fn parse_bnb_quant_state_shape(
     }
 
     Ok(shape)
+}
+
+/// Parses the double-quant `nested_offset` from a `BnB` `quant_state`
+/// companion tensor.
+///
+/// `bitsandbytes` double quantization subtracts the mean of the per-block
+/// absmax values before nested-quantizing them, and stores that mean in the
+/// `quant_state` `JSON` blob as `"nested_offset"`. Recovery must add it back
+/// (`absmax = nested_dequant(...) + nested_offset`); omitting it biases every
+/// recovered absmax low by the offset.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the `JSON` is malformed or the
+/// `"nested_offset"` field is missing or not a number. The field is
+/// mandatory for double-quant states: every `bitsandbytes` serialization
+/// that emits `nested_absmax` / `nested_quant_map` also emits it, so its
+/// absence indicates a malformed or truncated `quant_state`.
+#[cfg(feature = "bnb")]
+fn parse_bnb_quant_state_nested_offset(qs_data: &[u8], weight_name: &str) -> crate::Result<f32> {
+    let qs_str = std::str::from_utf8(qs_data).map_err(|e| AnamnesisError::Parse {
+        reason: format!("quant_state for `{weight_name}` is not valid UTF-8: {e}"),
+    })?;
+
+    let qs_json: serde_json::Value =
+        serde_json::from_str(qs_str).map_err(|e| AnamnesisError::Parse {
+            reason: format!("failed to parse quant_state JSON for `{weight_name}`: {e}"),
+        })?;
+
+    let offset_f64 = qs_json
+        .get("nested_offset")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "quant_state for `{weight_name}` missing \"nested_offset\" (required for \
+                 double-quant absmax recovery)"
+            ),
+        })?;
+
+    // CAST: the JSON value is the decimal rendering of a bitsandbytes f32;
+    // narrowing f64 → f32 recovers it exactly.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    Ok(offset_f64 as f32)
 }
 
 #[cfg(test)]

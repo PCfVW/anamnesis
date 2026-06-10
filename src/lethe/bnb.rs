@@ -343,7 +343,7 @@ fn encode_bnb4_core(
         for (pair, out_byte) in scratch_view.chunks_exact(2).zip(out_block.iter_mut()) {
             // INDEX: chunks_exact(2) guarantees exactly 2 f32 per pair
             #[allow(clippy::indexing_slicing)]
-            let (val_low, val_high) = (pair[0], pair[1]);
+            let (val_first, val_second) = (pair[0], pair[1]);
             // If absmax is zero, every value collapses to zero;
             // divide-by-zero would propagate NaN/inf into the search
             // and produce undefined nibbles. Decode treats absmax = 0
@@ -353,24 +353,28 @@ fn encode_bnb4_core(
             // we use the codebook itself to find the lowest-index
             // exact-zero entry so the choice is codebook-driven, not
             // hard-coded.
-            let (norm_low, norm_high) = if block_absmax == 0.0 {
+            let (norm_first, norm_second) = if block_absmax == 0.0 {
                 (0.0_f32, 0.0_f32)
             } else {
-                (val_low / block_absmax, val_high / block_absmax)
+                (val_first / block_absmax, val_second / block_absmax)
             };
-            let low_raw = nearest_codebook_index(norm_low, codebook);
-            let high_raw = nearest_codebook_index(norm_high, codebook);
+            let first_raw = nearest_codebook_index(norm_first, codebook);
+            let second_raw = nearest_codebook_index(norm_second, codebook);
             // Sign-magnitude correction: mirror the decode-side
             // sign-of-zero preservation. For codebooks where
             // codebook[i] == codebook[i+8] in bits (FP4's +0/+0 pair),
             // a negative-sign input that rounds to the lower-half
             // index is shifted to the upper-half index so the round
             // trip preserves the nibble byte-exactly.
-            let low_nibble = apply_sign_magnitude_encode_correction(norm_low, low_raw, codebook);
-            let high_nibble = apply_sign_magnitude_encode_correction(norm_high, high_raw, codebook);
-            // BITWISE: pack low nibble in bits [3:0], high nibble in bits [7:4]
-            // (inverse of the decode-side unpack: `byte & 0x0F`, `byte >> 4`)
-            *out_byte = (high_nibble << 4) | (low_nibble & 0x0F);
+            let first_nibble =
+                apply_sign_magnitude_encode_correction(norm_first, first_raw, codebook);
+            let second_nibble =
+                apply_sign_magnitude_encode_correction(norm_second, second_raw, codebook);
+            // BITWISE: pack the FIRST element in the high nibble (bits [7:4])
+            // and the SECOND in the low nibble (bits [3:0]) — the bitsandbytes
+            // order, inverse of the decode-side unpack (`byte >> 4` first,
+            // `byte & 0x0F` second).
+            *out_byte = (first_nibble << 4) | (second_nibble & 0x0F);
         }
     }
 
@@ -381,8 +385,9 @@ fn encode_bnb4_core(
 ///
 /// The inverse of [`dequantize_bnb4_to_bf16`]. Each pair of consecutive
 /// `BF16` elements is encoded into one byte: the first element's
-/// nearest-codebook nibble in the low position (`byte & 0x0F`), the
-/// second in the high position (`byte >> 4`). The caller supplies the
+/// nearest-codebook nibble in the high position (`byte >> 4`), the
+/// second in the low position (`byte & 0x0F`) — the `bitsandbytes`
+/// packing order. The caller supplies the
 /// codebook (`quant_map_data` — usually the `.weight.quant_map`
 /// companion tensor read from the source `.safetensors` file) and the
 /// per-block absmax values (`absmax_data` — usually freshly derived
@@ -561,15 +566,17 @@ pub fn encode_bnb4_compute_absmax(
 /// Mirrors the recovery step inside
 /// [`dequantize_bnb4_double_quant_to_bf16`](crate::remember::bnb::dequantize_bnb4_double_quant_to_bf16):
 /// for each block `i`, reads the `U8` quantised absmax byte, looks up the
-/// corresponding entry in the 256-entry nested codebook, and multiplies by
-/// the per-nested-block `nested_absmax` scale. The recovered `Vec<f32>` is
-/// the same value the decoder uses, so encoding `BF16` produced by decode
-/// through `encode_bnb4_core` with this recovered absmax round-trips
-/// byte-exactly.
+/// corresponding entry in the 256-entry nested codebook, multiplies by
+/// the per-nested-block `nested_absmax` scale, and adds the
+/// `nested_offset` (the `bitsandbytes` absmax-mean compression bias).
+/// The recovered `Vec<f32>` is the same value the decoder uses, so
+/// encoding `BF16` produced by decode through `encode_bnb4_core` with
+/// this recovered absmax round-trips byte-exactly.
 fn recover_double_quant_absmax(
     absmax_data: &[u8],
     nested_absmax_data: &[u8],
     nested_quant_map_data: &[u8],
+    nested_offset: f32,
     nested_block_size: usize,
 ) -> crate::Result<Vec<f32>> {
     if nested_block_size == 0 {
@@ -633,7 +640,7 @@ fn recover_double_quant_absmax(
         // INDEX: idx is 0-255, nested_codebook has 256 entries
         #[allow(clippy::indexing_slicing)]
         let entry = nested_codebook[idx];
-        *slot = entry * nested_absmax_val;
+        *slot = entry * nested_absmax_val + nested_offset;
     }
     Ok(recovered)
 }
@@ -669,6 +676,9 @@ fn recover_double_quant_absmax(
 /// - `nested_absmax_data` — `F32` little-endian per-nested-block scale.
 /// - `nested_quant_map_data` — `F32` little-endian 256-entry nested codebook
 ///   (`1024` bytes).
+/// - `nested_offset` — additive absmax offset from the `quant_state` blob
+///   (`bitsandbytes` `QuantState.offset`); must equal the value the decoder
+///   used for the round trip to close.
 /// - `total_elements` — total number of `BF16` elements.
 /// - `block_size` — elements per absmax block (typically 64).
 /// - `nested_block_size` — absmax indices per nested-absmax block (typically 256).
@@ -697,6 +707,7 @@ pub fn encode_bnb4_double_quant(
     quant_map_data: &[u8],
     nested_absmax_data: &[u8],
     nested_quant_map_data: &[u8],
+    nested_offset: f32,
     total_elements: usize,
     block_size: usize,
     nested_block_size: usize,
@@ -754,6 +765,7 @@ pub fn encode_bnb4_double_quant(
         absmax_data,
         nested_absmax_data,
         nested_quant_map_data,
+        nested_offset,
         nested_block_size,
     )?;
     let codebook = parse_codebook(quant_map_data)?;
@@ -1186,13 +1198,14 @@ mod tests {
     #[test]
     fn encode_bnb4_nibble_extraction_inverse() {
         // codebook = [0, 1, 2, …, 15]; bf16 input [1, 3, 2, 4] with absmax=1.0
-        // → nibbles [1, 3, 2, 4] → bytes [0x31, 0x42].
+        // → nibbles [1, 3, 2, 4] → bytes [0x13, 0x24] (bitsandbytes order:
+        // first element packs into the HIGH nibble).
         let cb: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let cb_bytes = f32_to_bytes(&cb);
         let absmax_bytes = f32_to_bytes(&[1.0]);
         let bf16 = bf16_bytes_from_f32(&[1.0, 3.0, 2.0, 4.0]);
         let out = encode_bnb4(&bf16, &absmax_bytes, &cb_bytes, 4, 4).unwrap();
-        assert_eq!(out, vec![0x31, 0x42]);
+        assert_eq!(out, vec![0x13, 0x24]);
     }
 
     #[test]
@@ -1222,18 +1235,21 @@ mod tests {
         // - nested_codebook[64] = 0.5, nested_codebook[200] = 1.5
         //   (other entries are 0.0 → un-exercised, valid).
         // - nested_absmax: single F32 = 2.0 (one nested block).
-        // - Recovered absmax = [0.5 * 2.0, 1.5 * 2.0] = [1.0, 3.0].
+        // - nested_offset = 0.5 (exercises the bitsandbytes absmax-mean bias).
+        // - Recovered absmax = [0.5 * 2.0 + 0.5, 1.5 * 2.0 + 0.5] = [1.5, 3.5].
         // - Codebook: NF4 (distinct entries, no sign-of-zero ambiguity).
         let mut nested_cb = [0.0_f32; 256];
         nested_cb[64] = 0.5;
         nested_cb[200] = 1.5;
         let nested_cb_bytes: Vec<u8> = nested_cb.iter().flat_map(|v| v.to_le_bytes()).collect();
         let nested_absmax_bytes = f32_to_bytes(&[2.0]);
+        let nested_offset = 0.5_f32;
         let absmax_data = vec![64u8, 200u8];
         let codebook_bytes = f32_to_bytes(&NF4_CODEBOOK);
 
         // Build a weight_data with diverse nibbles, decode, then encode → assert byte equality.
-        // 4 elements packed in 2 bytes: nibbles (3, 5) (12, 9) → bytes 0x53, 0x9C.
+        // 4 elements packed in 2 bytes: bytes 0x53, 0x9C → nibble pairs
+        // (high=5, low=3) and (high=9, low=12) in bitsandbytes order.
         let weight_data = vec![0x53u8, 0x9Cu8];
         let bf16 = crate::remember::bnb::dequantize_bnb4_double_quant_to_bf16(
             &weight_data,
@@ -1241,6 +1257,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &nested_cb_bytes,
+            nested_offset,
             4,
             2,
             256,
@@ -1252,6 +1269,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &nested_cb_bytes,
+            nested_offset,
             4,
             2,
             256,
@@ -1274,6 +1292,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &nested_cb_bytes,
+            0.0,
             2,
             0,
             256,
@@ -1287,6 +1306,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &nested_cb_bytes,
+            0.0,
             3,
             3,
             256,
@@ -1300,6 +1320,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &[0; 512],
+            0.0,
             2,
             2,
             256,
@@ -1313,6 +1334,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &nested_cb_bytes,
+            0.0,
             2,
             2,
             256,
@@ -1326,6 +1348,7 @@ mod tests {
             &codebook_bytes,
             &nested_absmax_bytes,
             &nested_cb_bytes,
+            0.0,
             2,
             2,
             0,

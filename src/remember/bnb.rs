@@ -110,6 +110,11 @@ fn dequantize_bnb4_core(
 
         // --- Pass 1 (unpack): byte → 2 nibbles → table lookup → f32 scratch ---
         // Each byte produces two f32 values via the quant_map lookup.
+        // Nibble order is HIGH-first (`byte >> 4` → element 2i, `byte & 0x0F`
+        // → element 2i+1), matching the bitsandbytes kernel. The opposite
+        // (low-first) order shipped in ≤ v0.6.3 and produced element-permuted
+        // output; see docs/dogfooding-feedbacks/
+        // bnb-nibble-order-and-circular-fixture-validation.md.
         //
         // Sign-of-zero preservation (FP4-style sign-magnitude codebooks):
         // when the looked-up codebook entry is exactly +0.0 AND the
@@ -129,17 +134,17 @@ fn dequantize_bnb4_core(
         #[allow(clippy::indexing_slicing)]
         let scratch_block = &mut scratch[..block_size];
         for (&byte, pair) in weight_block.iter().zip(scratch_block.chunks_exact_mut(2)) {
-            // BITWISE: extract low nibble (bits [3:0]) and high nibble (bits [7:4])
+            // BITWISE: extract high nibble (bits [7:4]) and low nibble (bits [3:0])
             // CAST: u8 → usize, nibble values 0-15 used as lookup indices
             #[allow(clippy::as_conversions)]
-            let low = (byte & 0x0F) as usize;
-            #[allow(clippy::as_conversions)]
             let high = (byte >> 4) as usize;
-            // INDEX: low and high are 0-15, quant_map has 16 entries
+            #[allow(clippy::as_conversions)]
+            let low = (byte & 0x0F) as usize;
+            // INDEX: high and low are 0-15, quant_map has 16 entries
             #[allow(clippy::indexing_slicing)]
             {
-                pair[0] = apply_sign_magnitude_zero(quant_map[low], low);
-                pair[1] = apply_sign_magnitude_zero(quant_map[high], high);
+                pair[0] = apply_sign_magnitude_zero(quant_map[high], high);
+                pair[1] = apply_sign_magnitude_zero(quant_map[low], low);
             }
         }
 
@@ -160,10 +165,11 @@ fn dequantize_bnb4_core(
 
 /// Dequantizes `BitsAndBytes` `NF4`/`FP4` quantized weights to `BF16`.
 ///
-/// Each byte in `weight_data` packs two 4-bit values: low nibble first
-/// (`byte & 0x0F`), high nibble second (`byte >> 4`). Each nibble indexes
-/// into `quant_map_data` (a 16-entry `F32` lookup table). The looked-up
-/// value is then scaled by the block's absmax.
+/// Each byte in `weight_data` packs two 4-bit values: high nibble first
+/// (`byte >> 4` → element `2i`), low nibble second (`byte & 0x0F` →
+/// element `2i + 1`) — the `bitsandbytes` kernel convention. Each nibble
+/// indexes into `quant_map_data` (a 16-entry `F32` lookup table). The
+/// looked-up value is then scaled by the block's absmax.
 ///
 /// # Sign-of-zero preservation
 ///
@@ -290,6 +296,20 @@ pub fn dequantize_bnb4_to_bf16(
 /// First dequantizes the nested absmax values (themselves quantized to `U8`),
 /// then uses the recovered `F32` absmax values for the main `NF4`/`FP4` dequant.
 ///
+/// The recovery formula is the `bitsandbytes` one:
+///
+/// ```text
+/// absmax[i] = nested_quant_map[absmax_u8[i]] × nested_absmax[i / nested_block_size]
+///             + nested_offset
+/// ```
+///
+/// The additive `nested_offset` (the mean of the original absmax values,
+/// subtracted by `bitsandbytes` before nested quantization to centre the
+/// distribution) is stored in the `quant_state` `JSON` blob as
+/// `"nested_offset"`. Versions ≤ v0.6.3 omitted it, biasing every recovered
+/// absmax low by the offset; see
+/// `docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md`.
+///
 /// # Arguments
 ///
 /// - `weight_data` — `U8` bytes, two 4-bit values per byte.
@@ -297,6 +317,9 @@ pub fn dequantize_bnb4_to_bf16(
 /// - `quant_map_data` — `F32[16]` main lookup table.
 /// - `nested_absmax_data` — `F32` absmax for the nested quantization.
 /// - `nested_quant_map_data` — `F32[256]` lookup table for the nested quantization.
+/// - `nested_offset` — additive absmax offset from the `quant_state` blob
+///   (`bitsandbytes` `QuantState.offset`); `0.0` only for synthetic inputs
+///   that were never offset-compressed.
 /// - `total_elements` — total number of dequantized elements.
 /// - `block_size` — elements per absmax block (typically 64).
 /// - `nested_block_size` — elements per nested absmax block (typically 256).
@@ -317,6 +340,7 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
     quant_map_data: &[u8],
     nested_absmax_data: &[u8],
     nested_quant_map_data: &[u8],
+    nested_offset: f32,
     total_elements: usize,
     block_size: usize,
     nested_block_size: usize,
@@ -401,7 +425,7 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
         //        i < num_blocks, dequantized_absmax has num_blocks entries
         #[allow(clippy::indexing_slicing)]
         {
-            dequantized_absmax[i] = nested_quant_map[idx] * nested_absmax_val;
+            dequantized_absmax[i] = nested_quant_map[idx] * nested_absmax_val + nested_offset;
         }
     }
 
@@ -611,9 +635,10 @@ mod tests {
         cb[1] = 0.1; // arbitrary non-zero to avoid an all-zero codebook
         cb[9] = -0.1;
         let cb_bytes: Vec<u8> = cb.iter().flat_map(|v| v.to_le_bytes()).collect();
-        // Weight bytes: 0x10 (low=0, high=1), 0x98 (low=8, high=9).
+        // Weight bytes: 0x01 (high=0, low=1), 0x89 (high=8, low=9) —
+        // bitsandbytes order: high nibble decodes first.
         // 4 elements, block_size=4, absmax=[1.0]. 1 block.
-        let weight = vec![0x10u8, 0x98u8];
+        let weight = vec![0x01u8, 0x89u8];
         let absmax = f32_to_bytes(&[1.0]);
         let out = dequantize_bnb4_to_bf16(&weight, &absmax, &cb_bytes, 4, 4).unwrap();
         let elem0 = u16::from_le_bytes([out[0], out[1]]);
@@ -658,8 +683,9 @@ mod tests {
 
     #[test]
     fn bnb4_nibble_extraction() {
-        // Byte 0x31 → low nibble = 1, high nibble = 3
-        // Byte 0x42 → low nibble = 2, high nibble = 4
+        // bitsandbytes order: HIGH nibble decodes to the first element.
+        // Byte 0x31 → high nibble = 3 (element 0), low nibble = 1 (element 1)
+        // Byte 0x42 → high nibble = 4 (element 2), low nibble = 2 (element 3)
         let quant_map: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let quant_map_bytes = f32_to_bytes(&quant_map);
         let weight_data = vec![0x31, 0x42];
@@ -668,14 +694,14 @@ mod tests {
         let out =
             dequantize_bnb4_to_bf16(&weight_data, &absmax_bytes, &quant_map_bytes, 4, 4).unwrap();
 
-        // Element 0: quant_map[1] * 1.0 = 1.0
-        assert_eq!(read_bf16(&out, 0), 1.0);
-        // Element 1: quant_map[3] * 1.0 = 3.0
-        assert_eq!(read_bf16(&out, 1), 3.0);
-        // Element 2: quant_map[2] * 1.0 = 2.0
-        assert_eq!(read_bf16(&out, 2), 2.0);
-        // Element 3: quant_map[4] * 1.0 = 4.0
-        assert_eq!(read_bf16(&out, 3), 4.0);
+        // Element 0: quant_map[3] * 1.0 = 3.0
+        assert_eq!(read_bf16(&out, 0), 3.0);
+        // Element 1: quant_map[1] * 1.0 = 1.0
+        assert_eq!(read_bf16(&out, 1), 1.0);
+        // Element 2: quant_map[4] * 1.0 = 4.0
+        assert_eq!(read_bf16(&out, 2), 4.0);
+        // Element 3: quant_map[2] * 1.0 = 2.0
+        assert_eq!(read_bf16(&out, 3), 2.0);
     }
 
     #[test]
@@ -699,7 +725,7 @@ mod tests {
         // Two blocks with different absmax values
         let quant_map: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let quant_map_bytes = f32_to_bytes(&quant_map);
-        // Block 0: byte 0x10 → nibbles 0,1; Block 1: byte 0x10 → nibbles 0,1
+        // Block 0: byte 0x10 → nibbles (high=1, low=0); Block 1: same
         let weight_data = vec![0x10, 0x10];
         let absmax_bytes = f32_to_bytes(&[1.0, 3.0]);
 
@@ -712,12 +738,12 @@ mod tests {
         )
         .unwrap();
 
-        // Block 0: quant_map[0]*1.0=0.0, quant_map[1]*1.0=1.0
-        assert_eq!(read_bf16(&out, 0), 0.0);
-        assert_eq!(read_bf16(&out, 1), 1.0);
-        // Block 1: quant_map[0]*3.0=0.0, quant_map[1]*3.0=3.0
-        assert_eq!(read_bf16(&out, 2), 0.0);
-        assert_eq!(read_bf16(&out, 3), 3.0);
+        // Block 0: quant_map[1]*1.0=1.0, quant_map[0]*1.0=0.0
+        assert_eq!(read_bf16(&out, 0), 1.0);
+        assert_eq!(read_bf16(&out, 1), 0.0);
+        // Block 1: quant_map[1]*3.0=3.0, quant_map[0]*3.0=0.0
+        assert_eq!(read_bf16(&out, 2), 3.0);
+        assert_eq!(read_bf16(&out, 3), 0.0);
     }
 
     #[test]
@@ -751,7 +777,7 @@ mod tests {
                                                         // Recovered absmax = nested_quant_map[2] * nested_absmax[0] = 0.5 * 4.0 = 2.0
 
         let absmax_data = vec![2u8]; // 1 block, absmax byte = 2
-        let weight_data = vec![0x10]; // nibbles: 0, 1
+        let weight_data = vec![0x10]; // nibbles: high=1, low=0
 
         let out = dequantize_bnb4_double_quant_to_bf16(
             &weight_data,
@@ -759,16 +785,53 @@ mod tests {
             &quant_map_bytes,
             &nested_absmax_bytes,
             &nested_quant_map_bytes,
+            0.0, // nested_offset (none for this synthetic input)
             2,   // total_elements
             2,   // block_size
             256, // nested_block_size
         )
         .unwrap();
 
+        // quant_map[1] * 2.0 = 2.0 (high nibble decodes first)
+        assert_eq!(read_bf16(&out, 0), 2.0);
         // quant_map[0] * 2.0 = 0.0
-        assert_eq!(read_bf16(&out, 0), 0.0);
-        // quant_map[1] * 2.0 = 2.0
-        assert_eq!(read_bf16(&out, 1), 2.0);
+        assert_eq!(read_bf16(&out, 1), 0.0);
+    }
+
+    #[test]
+    fn bnb4_double_quant_applies_nested_offset() {
+        // Same setup as `bnb4_double_quant_basic` but with a non-zero
+        // nested_offset (the bitsandbytes absmax-mean compression bias):
+        // recovered absmax = nested_quant_map[2] * nested_absmax[0] + offset
+        //                  = 0.5 * 4.0 + 1.0 = 3.0
+        let quant_map: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let quant_map_bytes = f32_to_bytes(&quant_map);
+
+        let mut nested_quant_map = [0.0f32; 256];
+        nested_quant_map[2] = 0.5;
+        let nested_quant_map_bytes = f32_to_bytes(&nested_quant_map);
+        let nested_absmax_bytes = f32_to_bytes(&[4.0]);
+
+        let absmax_data = vec![2u8];
+        let weight_data = vec![0x10]; // nibbles: high=1, low=0
+
+        let out = dequantize_bnb4_double_quant_to_bf16(
+            &weight_data,
+            &absmax_data,
+            &quant_map_bytes,
+            &nested_absmax_bytes,
+            &nested_quant_map_bytes,
+            1.0, // nested_offset
+            2,
+            2,
+            256,
+        )
+        .unwrap();
+
+        // quant_map[1] * 3.0 = 3.0
+        assert_eq!(read_bf16(&out, 0), 3.0);
+        // quant_map[0] * 3.0 = 0.0
+        assert_eq!(read_bf16(&out, 1), 0.0);
     }
 
     // --- INT8 tests ---

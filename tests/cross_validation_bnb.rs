@@ -37,6 +37,9 @@ struct Bnb4Fixture {
     format_id: u32,
     total_elements: usize,
     block_size: usize,
+    /// Double-quant absmax offset from the `quant_state` JSON blob
+    /// (`nested_offset`); `0.0` for plain (non-double-quant) fixtures.
+    nested_offset: f32,
     weight_data: Vec<u8>,
     absmax_data: Vec<u8>,
     quant_map_data: Vec<u8>,
@@ -64,8 +67,9 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
     let nested_absmax_len = read_u32_le(data, 24) as usize;
     let nested_quant_map_len = read_u32_le(data, 28) as usize;
     let expected_len = read_u32_le(data, 32) as usize;
+    let nested_offset = f32::from_le_bytes(data[36..40].try_into().unwrap());
 
-    let header_size = 36;
+    let header_size = 40;
     let mut offset = header_size;
 
     let weight_data = data[offset..offset + weight_len].to_vec();
@@ -84,6 +88,7 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
         format_id,
         total_elements,
         block_size,
+        nested_offset,
         weight_data,
         absmax_data,
         quant_map_data,
@@ -208,6 +213,7 @@ fn run_bnb4_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
             &fixture.quant_map_data,
             &fixture.nested_absmax_data,
             &fixture.nested_quant_map_data,
+            fixture.nested_offset,
             fixture.total_elements,
             fixture.block_size,
             nested_block_size,
