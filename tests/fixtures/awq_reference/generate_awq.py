@@ -2,12 +2,40 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Generate AWQ dequantization reference fixtures from real models.
 
+External-reference discipline (the v0.6.4 rule)
+-----------------------------------------------
+The "expected" output MUST come from the canonical library's own code — never
+from a hand-rolled reimplementation of the formula. A previous version of this
+script reimplemented the unpack in plain PyTorch with a **sequential**
+LSB-first nibble order — but AutoAWQ's GEMM format packs with the interleaved
+order ``AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]`` (its dequant applies
+``AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]`` after shift-unpacking, to
+BOTH qweight and qzeros). The hand-rolled fixture shared the missing reorder
+with the Rust decoder, so a column-permuting bug validated green at 0 ULP.
+See docs/dogfooding-feedbacks/
+bnb-nibble-order-and-circular-fixture-validation.md (Finding 2 / blast
+radius).
+
+This version takes the convention-bearing steps — ``unpack_awq`` +
+``reverse_awq_order`` + the overflow mask — verbatim from AutoAWQ
+(``awq.utils.packing_utils``, pure-torch, CPU). Only the final
+``(iweight - izeros) * scales`` is computed in f32 instead of AutoAWQ's f16:
+anamnesis dequantizes straight to BF16 with a single f32 rounding, while
+AutoAWQ's f16 output would double-round (f32 → f16 → BF16) and shift a small
+fraction of elements by 1 ULP. The numerics choice is guarded below by an
+allclose check against AutoAWQ's full ``dequantize_gemm`` f16 output, so a
+convention regression cannot hide behind the rounding difference.
+
 AWQ packs along out_features (columns), unlike GPTQ which packs along
 in_features (rows). The dequantization formula is:
   dequant = (qw - qz) * scale   (NO +1 offset on qzeros)
 
+Note: AutoAWQ's GEMM format is 4-bit only (``raise NotImplementedError``
+for any other width), so every fixture here is 4-bit and the Rust decoder
+rejects other widths.
+
 Fixture binary format (all little-endian):
-  4 bytes: bits (u32) — 4 or 8
+  4 bytes: bits (u32) — 4
   4 bytes: group_size (u32)
   4 bytes: in_features (u32)
   4 bytes: out_features (u32)
@@ -19,7 +47,7 @@ Fixture binary format (all little-endian):
   [qweight_len bytes]: raw packed qweight data
   [scales_len bytes]: raw scale data
   [qzeros_len bytes]: raw packed qzeros data
-  [expected_len bytes]: expected BF16 output from PyTorch
+  [expected_len bytes]: expected BF16 output
 
 Usage:
   python generate_awq.py
@@ -32,6 +60,8 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
+
+from awq.utils.packing_utils import dequantize_gemm, reverse_awq_order, unpack_awq
 
 
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
@@ -73,45 +103,29 @@ MODELS = [
 ]
 
 
-def dequant_awq_pytorch(
+def dequant_awq_canonical_f32(
     qweight: torch.Tensor,
-    scales: torch.Tensor,
     qzeros: torch.Tensor,
+    scales: torch.Tensor,
     bits: int,
     group_size: int,
-    in_features: int,
-    out_features: int,
 ) -> torch.Tensor:
-    """Dequantize AWQ to BF16 using the standard AutoAWQ formula.
+    """AutoAWQ's own unpack + reorder, with the final multiply in f32.
 
-    AWQ packs along out_features (columns).
-    Formula: dequant = (qw - qz) * scale   (NO +1 offset)
+    Mirrors ``awq.utils.packing_utils.dequantize_gemm`` step for step —
+    ``unpack_awq`` → ``reverse_awq_order`` → overflow mask — and replaces only
+    the final ``(iweight - izeros) * scales`` (f16 in AutoAWQ) with f32 math
+    so the single rounding to BF16 matches anamnesis' output path exactly.
     """
-    pack_factor = 32 // bits
-    maxq = (1 << bits) - 1
+    iweight, izeros = unpack_awq(qweight, qzeros, bits)
+    iweight, izeros = reverse_awq_order(iweight, izeros, bits)
 
-    # Unpack qweight: [in_features, packed_cols] → [in_features, out_features]
-    weight = torch.zeros(in_features, out_features, dtype=torch.int32)
-    for pos in range(pack_factor):
-        shift = bits * pos
-        unpacked = (qweight >> shift) & maxq
-        weight[:, pos::pack_factor] = unpacked
+    iweight = torch.bitwise_and(iweight, (2**bits) - 1)
+    izeros = torch.bitwise_and(izeros, (2**bits) - 1)
 
-    # Unpack qzeros: [num_groups, packed_cols] → [num_groups, out_features]
-    num_groups = qzeros.shape[0]
-    zeros = torch.zeros(num_groups, out_features, dtype=torch.int32)
-    for pos in range(pack_factor):
-        shift = bits * pos
-        unpacked = (qzeros >> shift) & maxq
-        zeros[:, pos::pack_factor] = unpacked
-    # AWQ: NO +1 offset (unlike GPTQ)
-
-    # Build group assignment (always sequential for AWQ)
-    g = torch.arange(in_features, dtype=torch.long) // group_size
-
-    # Dequantize
-    result = (weight.float() - zeros[g, :].float()) * scales[g, :].float()
-    return result.to(torch.bfloat16)
+    scales_f32 = scales.float().repeat_interleave(group_size, dim=0)
+    izeros_f32 = izeros.float().repeat_interleave(group_size, dim=0)
+    return (iweight.float() - izeros_f32) * scales_f32
 
 
 def generate_fixture(model_info: dict) -> None:
@@ -130,6 +144,9 @@ def generate_fixture(model_info: dict) -> None:
     bits = config.get("bits", config.get("w_bit", 4))
     group_size = config.get("group_size", config.get("q_group_size", 128))
     print(f"  Config: bits={bits}, group_size={group_size}")
+    if bits != 4:
+        print(f"  SKIP: AutoAWQ GEMM is 4-bit only (got bits={bits})")
+        return
 
     st_files = list(snapshot.glob("*.safetensors"))
     if not st_files:
@@ -180,19 +197,32 @@ def generate_fixture(model_info: dict) -> None:
 
     print(f"  Scale dtype: {SCALE_DTYPE_NAMES[scale_dtype_id]}")
 
-    # Dequantize with PyTorch (best of 5)
+    # Dequantize with AutoAWQ's own unpack/reorder (best of 5)
     best_us = float("inf")
     for _ in range(5):
         t0 = time.perf_counter()
-        result_bf16 = dequant_awq_pytorch(
-            qw_slice, sc_slice, qz_slice,
-            bits, group_size, slice_in, slice_out,
-        )
+        result_f32 = dequant_awq_canonical_f32(qw_slice, qz_slice, sc_slice, bits, group_size)
         t1 = time.perf_counter()
         best_us = min(best_us, (t1 - t0) * 1e6)
+    result_bf16 = result_f32.to(torch.bfloat16)
+
+    # Guard: the f32-multiply variant must agree with AutoAWQ's full
+    # canonical dequantize_gemm (f16 math) to within f16 rounding. A
+    # convention error (wrong reorder, wrong zero handling) would blow
+    # far past this bound.
+    canonical_f16 = dequantize_gemm(qw_slice, qz_slice, sc_slice, bits, group_size)
+    max_diff = (result_f32 - canonical_f16.float()).abs().max().item()
+    scale_mag = canonical_f16.float().abs().max().item()
+    assert max_diff <= 2e-3 * max(scale_mag, 1.0), (
+        f"f32-multiply variant diverges from canonical dequantize_gemm: "
+        f"max|diff|={max_diff:.6e} (magnitude {scale_mag:.3f}) — convention regression?"
+    )
+    print(
+        f"  AutoAWQ unpack+reverse_awq_order: {best_us:.1f} µs (best of 5); "
+        f"guard vs dequantize_gemm f16: max|diff|={max_diff:.2e}"
+    )
 
     expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
-    print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {slice_in}×{slice_out} = {slice_in*slice_out} elements)")
 
     # Write fixture
     output_path = Path(__file__).parent / f"{name}.bin"
@@ -215,7 +245,7 @@ def generate_fixture(model_info: dict) -> None:
 
 
 if __name__ == "__main__":
-    print("Generating AWQ cross-validation fixtures...")
+    print("Generating AWQ cross-validation fixtures (AutoAWQ packing_utils)...")
     for model in MODELS:
         generate_fixture(model)
     print("\nDone.")

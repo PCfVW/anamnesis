@@ -181,7 +181,7 @@ fn cross_validate_llama_3_2_1b_awq() {
     run_awq_cross_validation(
         "Llama-3.2-1B AWQ INT4",
         include_bytes!("fixtures/awq_reference/llama_3_2_1b_awq.bin"),
-        1,
+        0,
     );
 }
 
@@ -190,6 +190,6 @@ fn cross_validate_falcon3_1b_awq() {
     run_awq_cross_validation(
         "Falcon3-1B AWQ INT4",
         include_bytes!("fixtures/awq_reference/falcon3_1b_awq.bin"),
-        1,
+        0,
     );
 }

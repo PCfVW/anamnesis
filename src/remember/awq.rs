@@ -1,19 +1,49 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `AWQ` dequantization (activation-aware, INT4/INT8 with per-group scales) to `BF16`.
+//! `AWQ` dequantization (activation-aware, INT4 with per-group scales) to `BF16`.
 //!
 //! Converts packed integer weights with per-group scale factors and zero-points
 //! into `BF16` output bytes. `AWQ` packs along `out_features` (columns), unlike
 //! `GPTQ` which packs along `in_features` (rows). No `.g_idx` — groups are always
 //! sequential.
 //!
+//! # Packing order (the `AutoAWQ` GEMM interleave)
+//!
+//! Unlike `GPTQ`, the 8 nibbles inside each packed `I32` are NOT in
+//! sequential LSB-first order. `AutoAWQ` packs logical column offset
+//! `AWQ_ORDER[i] = [0, 2, 4, 6, 1, 3, 5, 7][i]` at bit position `4 × i`,
+//! for BOTH `qweight` and `qzeros`; its dequant applies the inverse
+//! permutation (`AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]`) after
+//! shift-unpacking. Versions ≤ v0.6.3 unpacked sequentially, producing
+//! column-permuted output that validated green against an equally
+//! sequential hand-rolled fixture; see docs/dogfooding-feedbacks/
+//! bnb-nibble-order-and-circular-fixture-validation.md.
+//!
+//! `AutoAWQ`'s GEMM format is 4-bit only (`raise NotImplementedError`
+//! otherwise), so this module rejects every other bit width — there is no
+//! canonical interleave definition to anchor an 8-bit decode against.
+//!
 //! Reference: Lin et al., "AWQ: Activation-aware Weight Quantization for LLM
-//! Compression and Acceleration", `MLSys` 2024 (arXiv:2306.00978).
+//! Compression and Acceleration", `MLSys` 2024 (arXiv:2306.00978);
+//! `AutoAWQ` `awq/utils/packing_utils.py` (`unpack_awq`, `reverse_awq_order`).
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
 use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
+
+/// `AWQ` 4-bit pack factor: 8 nibbles per packed `I32`.
+const AWQ_PACK_FACTOR: usize = 8;
+
+/// `AutoAWQ` packing order: the nibble at bit position `4 × i` holds the
+/// logical column offset `AWQ_ORDER[i]` within its group of 8 columns.
+/// Mirrors `AWQ_ORDER` in `awq/utils/packing_utils.py`.
+const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+
+/// Inverse of [`AWQ_ORDER`]: logical column offset `j` is stored at bit
+/// position `4 × AWQ_REVERSE_ORDER[j]`. Mirrors `AWQ_REVERSE_ORDER` in
+/// `awq/utils/packing_utils.py`.
+const AWQ_REVERSE_ORDER: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
 
 // ---------------------------------------------------------------------------
 // Per-group unpacking (lazy, cache-friendly)
@@ -23,7 +53,10 @@ use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 ///
 /// Fills `buf[0..out_features]` with the f32 zero-points for group `g`.
 /// Unlike `GPTQ`, `AWQ` does NOT add +1 to zero-points. The stored values
-/// are used directly: `dequant = (qw - qz) × scale`.
+/// are used directly: `dequant = (qw - qz) × scale`. The nibble for
+/// logical column offset `j % 8` sits at bit position
+/// `4 × AWQ_REVERSE_ORDER[j % 8]` (the `AutoAWQ` interleave — applied to
+/// `qzeros` exactly as to `qweight`).
 ///
 /// # Errors
 ///
@@ -33,29 +66,19 @@ fn unpack_zeros_for_group(
     qzeros_data: &[u8],
     g: usize,
     out_features: usize,
-    bits: u8,
 ) -> crate::Result<()> {
-    // CAST: u8 → u32, bits is 4 or 8
-    #[allow(clippy::as_conversions)]
-    let bits_u32 = u32::from(bits);
-    // BITWISE: mask for one quantized value
-    let mask = (1u32 << bits_u32) - 1;
-    // CAST: u8 → usize, bits is 4 or 8
-    #[allow(clippy::as_conversions)]
-    let pack_factor = 32 / bits as usize;
-    let packed_cols =
-        out_features
-            .checked_div(pack_factor)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "pack_factor is zero".into(),
-            })?;
+    // BITWISE: mask for one 4-bit quantized value
+    let mask = 0xFu32;
+    let packed_cols = out_features / AWQ_PACK_FACTOR;
 
     for (j, buf_val) in buf.iter_mut().enumerate() {
-        let packed_col = j / pack_factor;
-        let pos = j % pack_factor;
-        // CAST: usize → u32, pos is at most 7 (4-bit) or 3 (8-bit)
+        let packed_col = j / AWQ_PACK_FACTOR;
+        // INDEX: j % AWQ_PACK_FACTOR < 8, AWQ_REVERSE_ORDER has 8 entries
+        #[allow(clippy::indexing_slicing)]
+        let pos = AWQ_REVERSE_ORDER[j % AWQ_PACK_FACTOR];
+        // CAST: usize → u32, pos is at most 7
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-        let shift = bits_u32 * (pos as u32);
+        let shift = 4 * (pos as u32);
 
         let byte_offset = (g * packed_cols + packed_col)
             .checked_mul(4)
@@ -65,7 +88,7 @@ fn unpack_zeros_for_group(
         let packed = read_u32_le(qzeros_data, byte_offset)?;
         // BITWISE: extract unsigned zero-point — NO +1 offset (AWQ convention)
         let qz = (packed >> shift) & mask;
-        // CAST: u32 → f32, qz is at most 15 (4-bit) or 255 (8-bit), exact in f32
+        // CAST: u32 → f32, qz is at most 15, exact in f32
         #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
         {
             *buf_val = qz as f32;
@@ -121,7 +144,10 @@ fn unpack_scales_for_group(
 /// `dequant[i, j] = (qweight[i, j] - qzeros[g, j]) × scales[g, j]`
 ///
 /// Unlike `GPTQ`, there is no +1 offset on zero-points and no `g_idx` —
-/// groups are always sequential (`g = i / group_size`).
+/// groups are always sequential (`g = i / group_size`). Also unlike
+/// `GPTQ`, the 8 nibbles inside each packed `I32` follow the `AutoAWQ`
+/// GEMM interleave (`AWQ_ORDER` / `AWQ_REVERSE_ORDER`), not
+/// sequential LSB-first order — for both `qweight` and `qzeros`.
 ///
 /// # Arguments
 ///
@@ -131,7 +157,9 @@ fn unpack_scales_for_group(
 /// * `in_features` — number of input features (weight rows).
 /// * `out_features` — number of output features (unpacked weight columns).
 /// * `group_size` — number of input features per group (typically 128).
-/// * `bits` — quantization bit width (4 or 8).
+/// * `bits` — quantization bit width. Must be 4: `AutoAWQ`'s GEMM format
+///   is 4-bit only, so no canonical packing interleave exists for any
+///   other width.
 /// * `scale_dtype` — dtype of the scales tensor (`F16`, `BF16`, or `F32`).
 ///
 /// # Returns
@@ -164,16 +192,18 @@ pub fn dequantize_awq_to_bf16(
     scale_dtype: Dtype,
 ) -> crate::Result<Vec<u8>> {
     // --- Validate bit width ---
-    if bits != 4 && bits != 8 {
+    // AutoAWQ's GEMM format is 4-bit only (its packer raises
+    // NotImplementedError for every other width), so there is no canonical
+    // nibble interleave to anchor a non-4-bit decode against. Rejecting is
+    // safer than emitting plausibly-permuted weights.
+    if bits != 4 {
         return Err(AnamnesisError::Unsupported {
             format: "AWQ".into(),
-            detail: format!("{bits}-bit quantization not supported (expected 4 or 8)"),
+            detail: format!("{bits}-bit quantization not supported (AutoAWQ GEMM is 4-bit only)"),
         });
     }
 
-    // CAST: u8 → usize, bits is 4 or 8
-    #[allow(clippy::as_conversions)]
-    let pack_factor = 32 / bits as usize;
+    let pack_factor = AWQ_PACK_FACTOR;
 
     // --- Validate dimensions ---
     if in_features == 0 || out_features == 0 || group_size == 0 {
@@ -266,11 +296,8 @@ pub fn dequantize_awq_to_bf16(
     let mut cached_group: Option<usize> = None;
 
     // --- Precompute constants ---
-    // CAST: u8 → u32, bits is 4 or 8
-    #[allow(clippy::as_conversions)]
-    let bits_u32 = u32::from(bits);
-    // BITWISE: mask for one quantized value
-    let mask = (1u32 << bits_u32) - 1;
+    // BITWISE: mask for one 4-bit quantized value
+    let mask = 0xFu32;
 
     // --- Hot loop: row-by-row dequantization ---
     // Two-level bounds checking per CONVENTIONS.md: validate slices ONCE
@@ -301,7 +328,7 @@ pub fn dequantize_awq_to_bf16(
         // changes. For sequential access, this fires once per group_size rows.
         // The scratch buffers are out_features-sized and L1-resident.
         if cached_group != Some(g) {
-            unpack_zeros_for_group(&mut zeros_buf, qzeros_data, g, out_features, bits)?;
+            unpack_zeros_for_group(&mut zeros_buf, qzeros_data, g, out_features)?;
             unpack_scales_for_group(&mut scales_buf, scales_data, g, out_features, scale_dtype)?;
             cached_group = Some(g);
         }
@@ -337,8 +364,9 @@ pub fn dequantize_awq_to_bf16(
                 })?;
 
         // --- Pass 1: unpack qweight row → f32 scratch buffer ---
-        // AWQ packs along out_features: each I32 contains pack_factor consecutive
-        // output features. Unpack all of them.
+        // AWQ packs along out_features: each I32 contains pack_factor output
+        // features in the AutoAWQ interleave — the nibble at bit position
+        // 4 × pos belongs at logical column offset AWQ_ORDER[pos].
         #[allow(clippy::indexing_slicing)]
         for (packed_col, qw_chunk) in qw_row.chunks_exact(4).enumerate() {
             // INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk
@@ -346,17 +374,19 @@ pub fn dequantize_awq_to_bf16(
 
             // Unpack pack_factor values from this I32
             for pos in 0..pack_factor {
-                // CAST: usize → u32, pos is at most 7 (4-bit) or 3 (8-bit)
+                // CAST: usize → u32, pos is at most 7
                 #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-                let shift = bits_u32 * (pos as u32);
+                let shift = 4 * (pos as u32);
                 // BITWISE: extract unsigned quantized value
                 let qw = (packed >> shift) & mask;
-                // CAST: u32 → f32, exact for values ≤ 255
+                // CAST: u32 → f32, exact for values ≤ 15
                 #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
                 let qw_f32 = qw as f32;
-                // INDEX: packed_col * pack_factor + pos < out_features
-                // (packed_col < packed_cols, pos < pack_factor, packed_cols * pack_factor = out_features)
-                unpacked_row[packed_col * pack_factor + pos] = qw_f32;
+                // INDEX: pos < pack_factor = 8, AWQ_ORDER has 8 entries;
+                // packed_col * pack_factor + AWQ_ORDER[pos] < out_features
+                // (packed_col < packed_cols, AWQ_ORDER[pos] < pack_factor,
+                // packed_cols * pack_factor = out_features)
+                unpacked_row[packed_col * pack_factor + AWQ_ORDER[pos]] = qw_f32;
             }
         }
 
@@ -499,32 +529,32 @@ mod tests {
         }
     }
 
+    /// Pins the `AutoAWQ` GEMM interleave: packed nibbles `0x76543210`
+    /// (value `i` at bit position `4 × i`) must unpack to logical column
+    /// values `[0, 4, 1, 5, 2, 6, 3, 7]` — i.e. logical column `j` reads
+    /// the nibble at position `AWQ_REVERSE_ORDER[j]`. A sequential
+    /// (`GPTQ`-style) unpack would yield `[0, 1, 2, …, 7]` instead.
     #[test]
-    fn dequant_8bit_uniform() {
-        let in_features = 4;
-        let out_features = 4;
-        let group_size = 4;
-        let bits: u8 = 8;
+    fn dequant_4bit_interleave_order() {
+        let in_features = 8;
+        let out_features = 8;
+        let group_size = 8;
+        let bits: u8 = 4;
 
-        // qweight: [4, 1] (4 rows, 4/4=1 packed col)
-        // Each I32 packs 4 output features. All bytes = 100.
-        let qweight_i32 = 0x6464_6464u32; // 0x64 = 100
+        // qweight: every row packs nibble value i at bit position 4×i.
+        let qweight_i32 = 0x7654_3210u32;
         let mut qweight_data = Vec::new();
         for _i in 0..in_features {
             qweight_data.extend_from_slice(&qweight_i32.to_le_bytes());
         }
 
-        // scales: [1, 4], all 0.5 in F16
-        let scale_half = half::f16::from_f32(0.5).to_le_bytes();
+        // scales: all 1.0; qzeros: all 0 → output = unpacked nibble value.
+        let scale_f16 = half::f16::from_f32(1.0).to_le_bytes();
         let mut scales_data = Vec::new();
         for _ in 0..out_features {
-            scales_data.extend_from_slice(&scale_half);
+            scales_data.extend_from_slice(&scale_f16);
         }
-
-        // qzeros: [1, 1] (1 group, 1 packed col)
-        // All bytes = 50
-        let qzeros_i32 = 0x3232_3232u32; // 0x32 = 50
-        let qzeros_data = qzeros_i32.to_le_bytes().to_vec();
+        let qzeros_data = 0u32.to_le_bytes().to_vec();
 
         let output = dequantize_awq_to_bf16(
             &qweight_data,
@@ -538,12 +568,28 @@ mod tests {
         )
         .unwrap();
 
-        // Expected: (100 - 50) × 0.5 = 25.0
-        let bf16_25 = f32_bits_to_bf16_bits(25.0_f32.to_bits());
-        for chunk in output.chunks_exact(2) {
-            let actual = u16::from_le_bytes([chunk[0], chunk[1]]);
-            assert_eq!(actual, bf16_25, "expected BF16 25.0");
+        let expected: [f32; 8] = [0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0];
+        for i in 0..in_features {
+            for (j, &exp) in expected.iter().enumerate() {
+                let offset = (i * out_features + j) * 2;
+                let actual = u16::from_le_bytes([output[offset], output[offset + 1]]);
+                let exp_bf16 = f32_bits_to_bf16_bits(exp.to_bits());
+                assert_eq!(actual, exp_bf16, "element [{i},{j}]: expected {exp}");
+            }
         }
+    }
+
+    /// `AutoAWQ`'s GEMM format is 4-bit only — 8-bit must be rejected, not
+    /// decoded with a guessed interleave.
+    #[test]
+    fn validation_8bit_unsupported() {
+        let result = dequantize_awq_to_bf16(&[], &[], &[], 4, 4, 4, 8, Dtype::F16);
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("4-bit only"),
+            "expected 4-bit-only rejection, got: {msg}"
+        );
     }
 
     #[test]
