@@ -152,9 +152,11 @@ underlying per-format caps.
 
 ## Tested Models
 
+> **Validation provenance (v0.6.4):** "Cross-validated" below means the expected output comes from the **canonical library's own code** — `bitsandbytes` (`dequantize_4bit` / `int8_vectorwise_dequant`), AutoAWQ (`unpack_awq` + `reverse_awq_order`), GPTQModel (`dequantize_weight` + its v1→v2 zero-point conversion), PyTorch's native fp8 cast, and `gguf-py`'s `dequantize` — never a hand-rolled reimplementation of the formula. v0.6.4 adopted this rule after dogfooding in candle-mi exposed a circularly-validated nibble-order bug (full post-mortem: [`docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md`](docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md)) and fixed three real defects (BnB nibble order, BnB double-quant `nested_offset`, AWQ GEMM interleave). The "vs PyTorch" speed columns are historical CPU-PyTorch timings (pre-v0.6.4 baselines); they document throughput, not correctness.
+
 ### FP8 Dequantization
 
-Cross-validated against PyTorch on 7 real FP8 models from 5 quantization tools. Bit-exact output (0 ULP difference). Auto-vectorized: SSE2 on any x86-64, AVX2 with `target-cpu=native`.
+Cross-validated against PyTorch's native fp8→f32 cast on 7 real FP8 models from 5 quantization tools. Bit-exact output (0 ULP difference). Auto-vectorized: SSE2 on any x86-64, AVX2 with `target-cpu=native`.
 
 | Model | Quantizer | Scheme | Scales | vs PyTorch (AVX2) |
 |---|---|---|---|---|
@@ -168,7 +170,7 @@ Cross-validated against PyTorch on 7 real FP8 models from 5 quantization tools. 
 
 ### GPTQ Dequantization
 
-Cross-validated against PyTorch on 4 real GPTQ models from 2 quantizers (AutoGPTQ, GPTQModel). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization.
+Cross-validated against GPTQModel's own dequant pipeline (`TorchLinear.dequantize_weight` + its loader-side v1→v2 zero-point conversion) on 4 real GPTQ models from 2 quantizers (AutoGPTQ, GPTQModel). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization.
 
 | Model | Quantizer | Bits | vs PyTorch (AVX2) |
 |---|---|---|---|
@@ -179,7 +181,7 @@ Cross-validated against PyTorch on 4 real GPTQ models from 2 quantizers (AutoGPT
 
 ### AWQ Dequantization
 
-Cross-validated against PyTorch on 2 real AWQ models (AutoAWQ GEMM). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization.
+Cross-validated against AutoAWQ's own unpack + reorder (`packing_utils.unpack_awq` + `reverse_awq_order`, including the GEMM nibble interleave `[0, 2, 4, 6, 1, 3, 5, 7]`) on 2 real AWQ models. Bit-exact output (0 ULP difference). 4-bit only — AutoAWQ's GEMM format defines no other width, so anamnesis rejects the rest rather than guess an interleave. Loop fission for full AVX2 vectorization.
 
 | Model | Quantizer | Bits | vs PyTorch (AVX2) |
 |---|---|---|---|
@@ -188,7 +190,7 @@ Cross-validated against PyTorch on 2 real AWQ models (AutoAWQ GEMM). Bit-exact o
 
 ### BitsAndBytes Dequantization
 
-Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-quant, INT8). Bit-exact output (0 ULP difference). Loop fission for AVX2 on NF4/FP4; single-pass AVX2 on INT8 (`vpmovsxbd` → `vcvtdq2ps` → `vmulps`).
+Cross-validated against real `bitsandbytes` (`functional.dequantize_4bit` / `int8_vectorwise_dequant`) on 7 real BitsAndBytes models across 4 architecture families (NF4, FP4, double-quant incl. the `nested_offset` absmax recovery, INT8). Bit-exact output (0 ULP difference). Loop fission for AVX2 on NF4/FP4; single-pass AVX2 on INT8 (`vpmovsxbd` → `vcvtdq2ps` → `vmulps`).
 
 | Model | Format | Elements | vs PyTorch (AVX2) |
 |---|---|---|---|
@@ -201,7 +203,7 @@ Cross-validated against PyTorch on 4 real BitsAndBytes models (NF4, FP4, double-
 
 ### BitsAndBytes Quantization (Lethe — Phase 5)
 
-The inverse direction. Phase 5 ships the `lethe` namespace alongside `remember`: `encode_bnb4` / `encode_bnb4_double_quant` / `encode_bnb_int8` plus the bit-exact `round_trip` validation harness. Cross-validated against PyTorch `bitsandbytes` on **7 fixtures across 4 architecture families** (Llama 3.2 / Qwen3 / Qwen2.5 / Phi-3.5): every fixture round-trips **byte-exact** (0 byte diffs) against the original PyTorch-quantised bytes.
+The inverse direction. Phase 5 ships the `lethe` namespace alongside `remember`: `encode_bnb4` / `encode_bnb4_double_quant` / `encode_bnb_int8` plus the bit-exact `round_trip` validation harness. Cross-validated against real `bitsandbytes` on **7 fixtures across 4 architecture families** (Llama 3.2 / Qwen3 / Qwen2.5 / Phi-3.5): every fixture round-trips **byte-exact** (0 byte diffs) against the original `bitsandbytes`-quantised on-disk bytes — including the high-nibble-first packing order and the double-quant `nested_offset` (both fixed in v0.6.4).
 
 | Fixture | Format | Elements | Byte-exact round-trip | vs PyTorch quantize (CPU) |
 |---|---|---|---|---|

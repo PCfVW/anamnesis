@@ -2,10 +2,41 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Generate GPTQ dequantization reference fixtures from real models.
 
-Extracts a small slice of GPTQ tensors (qweight, scales, qzeros, g_idx)
-from a real safetensors model, dequantizes with the standard GPTQ formula
-matching AutoGPTQ/GPTQModel, and writes a binary fixture file that the
-Rust cross-validation test can compare against.
+External-reference discipline (the v0.6.4 rule)
+-----------------------------------------------
+The "expected" output MUST come from the canonical library's own code — never
+from a hand-rolled reimplementation of the formula. A previous version of this
+script reimplemented the dequant in plain PyTorch ("the standard GPTQ
+formula") without ever importing the real library, so the fixture was circular
+with the Rust decoder. See docs/dogfooding-feedbacks/
+bnb-nibble-order-and-circular-fixture-validation.md (Finding 2 / blast
+radius). Re-anchoring CONFIRMED the GPTQ convention (sequential LSB-first
+unpack, +1 zero-point offset on v1 checkpoints) — unlike BnB and AWQ, where
+re-anchoring exposed real bugs — but the fixture must still come from the
+canonical code so future regressions cannot hide.
+
+This version drives **GPTQModel** (the maintained AutoGPTQ successor):
+
+1. A ``TorchLinear`` module is built over the exact on-disk tensor slices.
+2. ``convert_gptq_v1_to_v2_format_module`` — GPTQModel's own loader step —
+   converts the v1 checkpoint zeros (stored as ``z - 1``) to runtime v2 form.
+   This is where the canonical ``+1`` lives: GPTQModel's dequant itself does
+   NOT add 1; its loader does. anamnesis reads on-disk v1 bytes directly, so
+   its ``(qz + 1)`` at dequant time must equal loader-conversion + plain
+   dequant.
+3. ``dequantize_weight()`` — the canonical unpack + dequant.
+
+The module's ``scales`` buffer is cast to f32 before the dequant call so the
+final multiply happens in f32 with a single rounding to BF16 (anamnesis'
+output path). GPTQModel's stock f16 math would double-round (f32 → f16 →
+BF16); the guard below asserts the f32 variant agrees with the stock f16
+output to within f16 rounding, so a convention regression cannot hide behind
+the rounding difference.
+
+Note: ``import pcre`` shim — GPTQModel's logger imports the ``pcre`` module
+(PyPI ``pypcre``), which has no Python 3.14 Windows wheel. The shim aliases
+the stdlib ``re`` (PCRE-compatible for the logger's ANSI-escape regex); the
+dequant code path never touches it.
 
 Fixture binary format (all little-endian):
   4 bytes: bits (u32) — 4 or 8
@@ -16,26 +47,48 @@ Fixture binary format (all little-endian):
   4 bytes: has_g_idx (u32) — 0 or 1
   4 bytes: qweight_len (u32) — bytes of packed qweight data
   4 bytes: scales_len (u32) — bytes of scale data
-  4 bytes: qzeros_len (u32) — bytes of packed qzeros data
+  4 bytes: qzeros_len (u32) — bytes of packed qzeros data (v1 on-disk form)
   4 bytes: g_idx_len (u32) — bytes of g_idx data (0 if absent)
   4 bytes: expected_len (u32) — bytes of expected BF16 output
   [qweight_len bytes]: raw packed qweight data
   [scales_len bytes]: raw scale data
   [qzeros_len bytes]: raw packed qzeros data
   [g_idx_len bytes]: raw g_idx data (empty if has_g_idx=0)
-  [expected_len bytes]: expected BF16 output from PyTorch
+  [expected_len bytes]: expected BF16 output
 
 Usage:
   python generate_gptq.py
 """
 
 import json
+import re as _re
 import struct
+import sys
 import time
+import types
+import warnings
 from pathlib import Path
+
+# ---- pcre shim (see module docstring) — must precede the gptqmodel import ----
+_shim = types.ModuleType("pcre")
+for _k in dir(_re):
+    if not _k.startswith("_"):
+        setattr(_shim, _k, getattr(_re, _k))
+_shim.Flag = types.SimpleNamespace(
+    CASELESS=_re.IGNORECASE, IGNORECASE=_re.IGNORECASE,
+    MULTILINE=_re.MULTILINE, DOTALL=_re.DOTALL,
+    EXTENDED=_re.VERBOSE, VERBOSE=_re.VERBOSE,
+    UNICODE=_re.UNICODE, UTF=_re.UNICODE, ANCHORED=0, NO_AUTO_CAPTURE=0,
+)
+sys.modules["pcre"] = _shim
+
+warnings.filterwarnings("ignore")
 
 import torch
 from safetensors import safe_open
+
+from gptqmodel.nn_modules.qlinear.torch import TorchLinear
+from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module
 
 
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
@@ -57,13 +110,11 @@ def find_snapshot(model_dir: Path) -> Path:
 
 def load_quantize_config(snapshot: Path) -> dict:
     """Load GPTQ quantization config from various sources."""
-    # Try quantize_config.json first
     qc_path = snapshot / "quantize_config.json"
     if qc_path.exists():
         with open(qc_path) as f:
             return json.load(f)
 
-    # Try config.json → quantization_config
     cfg_path = snapshot / "config.json"
     if cfg_path.exists():
         with open(cfg_path) as f:
@@ -101,56 +152,59 @@ MODELS = [
 ]
 
 
-def dequant_gptq_pytorch(
+def dequant_gptq_canonical(
     qweight: torch.Tensor,
     scales: torch.Tensor,
     qzeros: torch.Tensor,
     g_idx: torch.Tensor | None,
     bits: int,
     group_size: int,
+    sym: bool,
+    desc_act: bool,
     in_features: int,
     out_features: int,
-) -> torch.Tensor:
-    """Dequantize GPTQ to BF16 using the standard AutoGPTQ formula.
+    checkpoint_format: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize via GPTQModel's own module pipeline.
 
-    Formula: dequant = (qw - (qz + 1)) * scale
+    Returns ``(f32_result, f16_result)``: the f32 variant (scales cast to
+    f32 so the final multiply single-rounds to BF16 like anamnesis) and the
+    stock-precision variant (scales dtype as stored) used as the guard.
     """
-    pack_factor = 32 // bits
-    maxq = (1 << bits) - 1
 
-    # Unpack qweight: [packed_rows, out_features] → [in_features, out_features]
-    weight = torch.zeros(in_features, out_features, dtype=torch.int32)
-    for pos in range(pack_factor):
-        shift = bits * pos
-        start = pos
-        # Each packed_row contributes one value per position
-        unpacked = (qweight >> shift) & maxq
-        weight[pos::pack_factor, :] = unpacked
+    def build_module(scales_tensor: torch.Tensor) -> TorchLinear:
+        lin = TorchLinear(
+            bits=bits,
+            group_size=group_size,
+            sym=sym,
+            desc_act=desc_act,
+            in_features=in_features,
+            out_features=out_features,
+            bias=False,
+            register_buffers=True,
+        )
+        lin.qweight.copy_(qweight)
+        lin.qzeros.copy_(qzeros)
+        lin.scales = scales_tensor.clone()
+        if g_idx is not None:
+            lin.g_idx.copy_(g_idx.to(lin.g_idx.dtype))
+        else:
+            lin.g_idx.copy_(
+                (torch.arange(in_features, dtype=torch.int32) // group_size)
+            )
+        if checkpoint_format == "gptq":
+            # GPTQModel's own loader-side v1 → v2 conversion (adds the +1
+            # to the packed zeros). Its dequantize_weight assumes v2.
+            convert_gptq_v1_to_v2_format_module(
+                lin, bits=bits, pack_dtype=torch.int32
+            )
+        return lin
 
-    # Unpack qzeros: [num_groups, packed_cols] → [num_groups, out_features]
-    num_groups = qzeros.shape[0]
-    packed_cols = qzeros.shape[1]
-    zeros = torch.zeros(num_groups, out_features, dtype=torch.int32)
-    for pos in range(pack_factor):
-        shift = bits * pos
-        unpacked = (qzeros >> shift) & maxq
-        zeros[:, pos::pack_factor] = unpacked
-    # Standard GPTQ +1 offset
-    zeros = zeros + 1
-
-    # Build group assignment
-    if g_idx is not None:
-        g = g_idx.long()
-    else:
-        g = torch.arange(in_features, dtype=torch.long) // group_size
-
-    # Dequantize
-    scales_f32 = scales.float()
-    weight_f32 = weight.float()
-    zeros_f32 = zeros.float()
-
-    result = (weight_f32 - zeros_f32[g, :]) * scales_f32[g, :]
-    return result.to(torch.bfloat16)
+    lin_f32 = build_module(scales.float())
+    result_f32 = lin_f32.dequantize_weight()
+    lin_stock = build_module(scales)
+    result_stock = lin_stock.dequantize_weight()
+    return result_f32, result_stock
 
 
 def generate_fixture(model_info: dict) -> None:
@@ -170,12 +224,18 @@ def generate_fixture(model_info: dict) -> None:
     config = load_quantize_config(snapshot)
     bits = config.get("bits", 4)
     group_size = config.get("group_size", 128)
-    print(f"  Config: bits={bits}, group_size={group_size}")
+    sym = bool(config.get("sym", True))
+    desc_act = bool(config.get("desc_act", False))
+    checkpoint_format = config.get("checkpoint_format") or "gptq"
+    print(
+        f"  Config: bits={bits}, group_size={group_size}, sym={sym}, "
+        f"desc_act={desc_act}, checkpoint_format={checkpoint_format}"
+    )
 
     # Find safetensors file
     st_files = list(snapshot.glob("*.safetensors"))
     if not st_files:
-        print(f"  ERROR: no safetensors files found")
+        print("  ERROR: no safetensors files found")
         return
 
     # Load tensors
@@ -225,17 +285,12 @@ def generate_fixture(model_info: dict) -> None:
     qz_slice = qzeros[:num_groups, :packed_slice_cols].contiguous()
     gi_slice = g_idx[:slice_in].contiguous() if g_idx is not None else None
 
-    # For g_idx, remap to local group indices (0..num_groups-1)
+    # For g_idx, the slice must reference only groups within [0, num_groups).
+    # Sequential (desc_act=False) checkpoints satisfy this naturally; an
+    # act-order slice would not, so fall back to sequential assignment.
     if gi_slice is not None:
-        # The g_idx values may reference groups beyond our slice.
-        # For the slice, we need them to be in [0, num_groups).
-        # Since we're taking the first slice_in features, and group_size
-        # divides slice_in, the sequential g_idx would be [0,0,...,1,1,...].
-        # For act-order models, we just use the original g_idx values
-        # but clamp to our group range.
         gi_max = gi_slice.max().item()
         if gi_max >= num_groups:
-            # Remap: use sequential assignment for the slice
             print(f"  Note: remapping g_idx (max={gi_max} >= num_groups={num_groups})")
             gi_slice = torch.arange(slice_in, dtype=torch.int32) // group_size
 
@@ -252,20 +307,35 @@ def generate_fixture(model_info: dict) -> None:
 
     print(f"  Scale dtype: {SCALE_DTYPE_NAMES[scale_dtype_id]}")
 
-    # Dequantize with PyTorch and measure time (best of 5 runs to exclude JIT warmup)
+    # Dequantize with GPTQModel's own module pipeline (best of 5)
     best_us = float("inf")
-    for run in range(5):
+    for _ in range(5):
         t0 = time.perf_counter()
-        result_bf16 = dequant_gptq_pytorch(
+        result_f32, result_stock = dequant_gptq_canonical(
             qw_slice, sc_slice, qz_slice, gi_slice,
-            bits, group_size, slice_in, slice_out,
+            bits, group_size, sym, desc_act,
+            slice_in, slice_out, checkpoint_format,
         )
         t1 = time.perf_counter()
-        run_us = (t1 - t0) * 1e6
-        best_us = min(best_us, run_us)
+        best_us = min(best_us, (t1 - t0) * 1e6)
 
+    # Guard: the f32-scales variant must agree with GPTQModel's stock-dtype
+    # output to within stock rounding. A convention error (unpack order,
+    # missing v1→v2 zero conversion) would blow far past this bound.
+    max_diff = (result_f32 - result_stock.float()).abs().max().item()
+    scale_mag = result_stock.float().abs().max().item()
+    assert max_diff <= 2e-3 * max(scale_mag, 1.0), (
+        f"f32-scales variant diverges from stock dequantize_weight: "
+        f"max|diff|={max_diff:.6e} (magnitude {scale_mag:.3f}) — convention regression?"
+    )
+
+    result_bf16 = result_f32.to(torch.bfloat16)
     expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
-    print(f"  PyTorch dequant: {best_us:.1f} µs (best of 5, {slice_in}×{slice_out} = {slice_in*slice_out} elements)")
+    print(
+        f"  GPTQModel dequantize_weight: {best_us:.1f} µs (best of 5, "
+        f"{slice_in}×{slice_out} = {slice_in*slice_out} elements); "
+        f"guard vs stock dtype: max|diff|={max_diff:.2e}"
+    )
     print(f"  Output shape: {list(result_bf16.shape)}")
 
     # Write fixture
@@ -294,7 +364,7 @@ def generate_fixture(model_info: dict) -> None:
 
 
 if __name__ == "__main__":
-    print("Generating GPTQ cross-validation fixtures...")
+    print("Generating GPTQ cross-validation fixtures (GPTQModel TorchLinear)...")
     for model in MODELS:
         generate_fixture(model)
     print("\nDone.")

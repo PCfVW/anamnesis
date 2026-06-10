@@ -19,8 +19,15 @@
 //! | `BitsAndBytes` `NF4`/`FP4` (lookup + per-block absmax) | `bnb` | 18–54× |
 //! | `BitsAndBytes` `INT8` (`LLM.int8()`, per-row absmax) | `bnb` | 1.2× |
 //!
-//! All schemes produce **bit-exact** output (0 ULP difference) against
-//! `PyTorch` reference implementations, verified on real models.
+//! All schemes produce **bit-exact** output (0 ULP difference) against the
+//! canonical quantization libraries' own dequantization code —
+//! `bitsandbytes` (`dequantize_4bit` / `int8_vectorwise_dequant`), `AutoAWQ`
+//! (`unpack_awq` + `reverse_awq_order`), `GPTQModel` (`dequantize_weight`
+//! plus its v1→v2 zero-point conversion), and `PyTorch`'s native `fp8`
+//! cast — verified on real-model fixtures. Hand-rolled reference
+//! reimplementations are banned from the fixture generators (v0.6.4 rule;
+//! see `docs/dogfooding-feedbacks/` for the circular-validation incident
+//! that motivated it).
 //!
 //! # Supported Quantization Schemes (encode — [`lethe`])
 //!
@@ -34,8 +41,8 @@
 //!
 //! | Scheme | Feature gate | Cross-validation contract |
 //! |--------|-------------|---------------------------|
-//! | `BitsAndBytes` `NF4`/`FP4` encode | `bnb` | 0-ULP bit-exact round trip on every fixture |
-//! | `BitsAndBytes` `INT8` encode | `bnb` | 0-ULP bit-exact round trip on every fixture |
+//! | `BitsAndBytes` `NF4`/`FP4` encode | `bnb` | byte-exact vs `bitsandbytes`' on-disk bytes on every fixture |
+//! | `BitsAndBytes` `INT8` encode | `bnb` | byte-exact vs `bitsandbytes`' on-disk bytes on every fixture |
 //!
 //! Subsequent encode-kernel families (`FP8`, `GGUF` legacy / `K-quants`
 //! / `IQ` / `TQ` / `MXFP4`) land in Phase 7.5 and reuse the

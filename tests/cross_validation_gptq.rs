@@ -206,7 +206,7 @@ fn cross_validate_falcon3_1b_gptq_int4() {
     run_gptq_cross_validation(
         "Falcon3-1B GPTQ INT4",
         include_bytes!("fixtures/gptq_reference/falcon3_1b_int4.bin"),
-        1,
+        0,
     );
 }
 
@@ -215,7 +215,7 @@ fn cross_validate_llama_3_2_1b_gptq_int4() {
     run_gptq_cross_validation(
         "Llama-3.2-1B GPTQ INT4",
         include_bytes!("fixtures/gptq_reference/llama_3_2_1b_int4.bin"),
-        1,
+        0,
     );
 }
 
@@ -228,7 +228,7 @@ fn cross_validate_falcon3_1b_gptq_int8() {
     run_gptq_cross_validation(
         "Falcon3-1B GPTQ INT8",
         include_bytes!("fixtures/gptq_reference/falcon3_1b_int8.bin"),
-        1,
+        0,
     );
 }
 
@@ -237,6 +237,6 @@ fn cross_validate_llama_3_2_1b_gptqmodel_int8() {
     run_gptq_cross_validation(
         "Llama-3.2-1B GPTQModel INT8",
         include_bytes!("fixtures/gptq_reference/llama_3_2_1b_gptqmodel_int8.bin"),
-        1,
+        0,
     );
 }
