@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Phase 6.9 — exact-parity fixes surfaced by dogfooding `v0.6.3` inside candle-mi.
 Full post-mortem:
-[`docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md`](docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md).
+`docs/dogfooding-feedbacks/bnb-nibble-order-and-circular-fixture-validation.md` (internal dogfooding report, not tracked in the repo).
 
 ### Fixed
 
