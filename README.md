@@ -170,7 +170,7 @@ Cross-validated against PyTorch's native fp8→f32 cast on 7 real FP8 models fro
 
 ### GPTQ Dequantization
 
-Cross-validated against GPTQModel's own dequant pipeline (`TorchLinear.dequantize_weight` + its loader-side v1→v2 zero-point conversion) on 4 real GPTQ models from 2 quantizers (AutoGPTQ, GPTQModel). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization.
+Cross-validated against GPTQModel's own dequant pipeline (`TorchLinear.dequantize_weight` + its loader-side v1→v2 zero-point conversion) on 4 real GPTQ models from 2 quantizers (AutoGPTQ, GPTQModel). Bit-exact output (0 ULP difference). Loop fission for full AVX2 vectorization. `remember` emits the standard `nn.Linear` `[out_features, in_features]` orientation (transposed from the GEMM-native packed layout, the same `.T` GPTQModel's `dequantize_model` applies) — pinned by the orientation contract tests in `tests/remember_orientation.rs` (v0.6.5).
 
 | Model | Quantizer | Bits | vs PyTorch (AVX2) |
 |---|---|---|---|
@@ -181,7 +181,7 @@ Cross-validated against GPTQModel's own dequant pipeline (`TorchLinear.dequantiz
 
 ### AWQ Dequantization
 
-Cross-validated against AutoAWQ's own unpack + reorder (`packing_utils.unpack_awq` + `reverse_awq_order`, including the GEMM nibble interleave `[0, 2, 4, 6, 1, 3, 5, 7]`) on 2 real AWQ models. Bit-exact output (0 ULP difference). 4-bit only — AutoAWQ's GEMM format defines no other width, so anamnesis rejects the rest rather than guess an interleave. Loop fission for full AVX2 vectorization.
+Cross-validated against AutoAWQ's own unpack + reorder (`packing_utils.unpack_awq` + `reverse_awq_order`, including the GEMM nibble interleave `[0, 2, 4, 6, 1, 3, 5, 7]`) on 2 real AWQ models. Bit-exact output (0 ULP difference). 4-bit only — AutoAWQ's GEMM format defines no other width, so anamnesis rejects the rest rather than guess an interleave. Loop fission for full AVX2 vectorization. `remember` emits the standard `nn.Linear` `[out_features, in_features]` orientation (transposed from the GEMM-native packed layout) — pinned by the orientation contract tests in `tests/remember_orientation.rs` (v0.6.5).
 
 | Model | Quantizer | Bits | vs PyTorch (AVX2) |
 |---|---|---|---|
