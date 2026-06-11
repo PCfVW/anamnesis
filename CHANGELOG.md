@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Phase 6.10 — the second candle-mi dogfooding fix. Full post-mortem:
+`docs/dogfooding-feedbacks/awq-gptq-dequant-transpose-orientation.md`
+(internal dogfooding report, not tracked in the repo).
+
+### Fixed
+
+- **BREAKING (behavior): AWQ and GPTQ `remember` output is now standard
+  `nn.Linear` orientation `[out_features, in_features]`.** The dequant
+  kernels produce the GEMM-native `[in, out]` layout (the canonical
+  AutoAWQ / GPTQModel kernel orientation, which the 0-ULP cross-validation
+  anchors — values were always correct), but `remember` /
+  `remember_to_bytes` previously serialized that layout as-is, so every
+  2-D projection weight came out transposed and no standard consumer
+  (candle, `transformers` as a plain model) could load the output
+  (`shape mismatch … expected [512, 2048], got [2048, 512]` on Llama
+  `k_proj`). The remember path now transposes each AWQ/GPTQ quantized
+  weight at the output-contract boundary — exactly what GPTQModel's own
+  `dequantize_model` does (`.T`) when assigning its GEMM-native dequant to
+  a plain `nn.Linear`. Passthrough tensors (norms, biases, 2-D
+  `embed_tokens` / `lm_head` kept in BF16) are untouched; BnB and FP8
+  were already standard-orientation. Anyone consuming the old `[in, out]`
+  output must drop their compensating transpose.
+
+### Added
+
+- **Output-orientation contract tests** (`tests/remember_orientation.rs`):
+  every quantized scheme (GPTQ, AWQ, BnB NF4, BnB INT8, FP8) is now
+  loaded through the public `parse → remember_to_bytes →
+  safetensors::deserialize` path on a synthetic **non-square** model,
+  asserting both the emitted shape (`[out, in]`) and the element mapping
+  (`W_std[o][i] == W_native[i][o]` for the transposed schemes, identity
+  for the rest), plus passthrough byte-identity. The GGUF↔safetensors
+  shape reversal is pinned with an absolute-orientation assert in the
+  convert round-trip test. Closes the gap the dogfooding report
+  identified: value-only cross-validation is structurally blind to the
+  emitted layout.
+
 ## [0.6.4] - 2026-06-10
 
 Phase 6.9 — exact-parity fixes surfaced by dogfooding `v0.6.3` inside candle-mi.

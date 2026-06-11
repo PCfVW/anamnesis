@@ -31,6 +31,8 @@ use crate::remember::fp8::{
 };
 #[cfg(feature = "gptq")]
 use crate::remember::gptq::dequantize_gptq_to_bf16;
+#[cfg(any(feature = "gptq", feature = "awq"))]
+use crate::remember::quant_utils::transpose_bf16;
 use crate::ParseLimits;
 
 /// Target dtype for dequantization output.
@@ -308,7 +310,14 @@ impl ParsedModel {
     /// variant that returns the bytes instead of writing a file.
     ///
     /// - **Quantized tensors**: dequantized to the target dtype using the
-    ///   detected quantization scheme and companion scale factors.
+    ///   detected quantization scheme and companion scale factors. `GPTQ` /
+    ///   `AWQ` projection weights are additionally transposed from the
+    ///   GEMM-native `[in_features, out_features]` kernel orientation to the
+    ///   standard `nn.Linear` `[out_features, in_features]` — the layout a
+    ///   standard consumer (candle, `transformers` as a plain model)
+    ///   expects, and the same boundary transpose `GPTQModel`'s
+    ///   `dequantize_model` applies. `BnB` and `FP8` weights are already
+    ///   stored / recovered in standard orientation.
     /// - **Scale tensors**: consumed during dequantization, not written.
     /// - **Passthrough tensors**: copied as-is (zero-copy from the buffer).
     ///
@@ -330,10 +339,12 @@ impl ParsedModel {
     /// simultaneously** until the underlying `safetensors::serialize_to_file`
     /// call returns: the safetensors crate's writer itself streams tensor
     /// bodies one at a time, but the eager buffering happens in this
-    /// method's caller-side `Vec` collection. Comfortable for `≤ 7 B`
-    /// models on a 32 GB system; tight at 13 B; `OOM`s at 70 B+.
-    /// A streaming output path (planned ROADMAP Phase 10) will drop this
-    /// to `O(largest_tensor_BF16)`.
+    /// method's caller-side `Vec` collection. The `GPTQ` / `AWQ`
+    /// orientation transpose holds one extra tensor-sized buffer
+    /// transiently (per tensor, dropped immediately) — the peak class is
+    /// unchanged. Comfortable for `≤ 7 B` models on a 32 GB system; tight
+    /// at 13 B; `OOM`s at 70 B+. A streaming output path (planned ROADMAP
+    /// Phase 10) will drop this to `O(largest_tensor_BF16)`.
     pub fn remember(
         &self,
         output_path: impl AsRef<Path>,
@@ -547,7 +558,7 @@ impl ParsedModel {
                                     }
                                 })?;
 
-                            let bf16_data = dequantize_gptq_to_bf16(
+                            let bf16_native = dequantize_gptq_to_bf16(
                                 weight_data,
                                 scales_data,
                                 qzeros_data,
@@ -558,13 +569,22 @@ impl ParsedModel {
                                 config.bits,
                                 companions.scales.dtype,
                             )?;
+                            // The kernel returns the GEMM-native
+                            // [in_features, out_features] orientation (the
+                            // canonical GPTQModel kernel layout the
+                            // cross-validation fixtures anchor). A standard
+                            // nn.Linear safetensors is [out, in] — apply the
+                            // same boundary transpose GPTQModel's
+                            // dequantize_model applies (`.T`).
+                            let bf16_data =
+                                transpose_bf16(&bf16_native, in_features, out_features)?;
 
                             // Output tensor: strip ".qweight" suffix, use ".weight".
                             let output_name = entry.name.strip_suffix(".qweight").map_or_else(
                                 || entry.name.clone(),
                                 |base| format!("{base}.weight"),
                             );
-                            let output_shape = vec![in_features, out_features];
+                            let output_shape = vec![out_features, in_features];
 
                             dequantized_data.push((output_name, bf16_data, output_shape));
                             on_tensor();
@@ -622,7 +642,7 @@ impl ParsedModel {
                                     }
                                 })?;
 
-                            let bf16_data = dequantize_awq_to_bf16(
+                            let bf16_native = dequantize_awq_to_bf16(
                                 weight_data,
                                 scales_data,
                                 qzeros_data,
@@ -632,13 +652,23 @@ impl ParsedModel {
                                 config.bits,
                                 companions.scales.dtype,
                             )?;
+                            // The kernel returns the GEMM-native
+                            // [in_features, out_features] orientation (the
+                            // canonical AutoAWQ kernel layout the
+                            // cross-validation fixtures anchor). A standard
+                            // nn.Linear safetensors is [out, in] — transpose
+                            // at the output-contract boundary, exactly as
+                            // GPTQModel's dequantize_model does for its
+                            // GEMM-native dequant (`.T`).
+                            let bf16_data =
+                                transpose_bf16(&bf16_native, in_features, out_features)?;
 
                             // Output tensor: strip ".qweight" suffix, use ".weight".
                             let output_name = entry.name.strip_suffix(".qweight").map_or_else(
                                 || entry.name.clone(),
                                 |base| format!("{base}.weight"),
                             );
-                            let output_shape = vec![in_features, out_features];
+                            let output_shape = vec![out_features, in_features];
 
                             dequantized_data.push((output_name, bf16_data, output_shape));
                             on_tensor();

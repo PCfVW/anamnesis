@@ -165,7 +165,12 @@ fn unpack_scales_for_group(
 /// # Returns
 ///
 /// A `Vec<u8>` of length `in_features × out_features × 2`, containing `BF16`
-/// values in little-endian byte order. Shape: `[in_features, out_features]`.
+/// values in little-endian byte order. Shape: `[in_features, out_features]`
+/// — the **GEMM-native** orientation the canonical `AutoAWQ` kernel
+/// produces (and the cross-validation fixtures anchor). Note this is the
+/// transpose of a standard `nn.Linear.weight` (`[out, in]`);
+/// `ParsedModel::remember` / `remember_to_bytes` transpose to the standard
+/// orientation before serializing.
 ///
 /// # Errors
 ///

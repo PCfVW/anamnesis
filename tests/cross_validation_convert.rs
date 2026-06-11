@@ -657,6 +657,17 @@ fn t9_gguf_to_st_to_gguf_byte_exact_loop() {
     // Safetensors -> GGUF #2.
     let model = parse(&st_path).unwrap();
     let entry = &model.header.tensors[0];
+    // Orientation pin (non-square): the GGUF header declares the shape
+    // most-significant-first (`ne` order, [3, 2] here); the safetensors
+    // side must carry the NumPy/torch row-major REVERSE ([2, 3]) — the
+    // standard orientation a framework loads. Pins the reversal pair in
+    // the GGUF→st and st→GGUF dispatch paths against regression.
+    assert_eq!(collected_a[0].shape, &[3, 2], "GGUF-side shape (ne order)");
+    assert_eq!(
+        entry.shape,
+        vec![2, 3],
+        "safetensors-side shape must be the reverse of the GGUF ne order"
+    );
     let raw = std::fs::read(&st_path).unwrap();
     let data_offset = model.header.header_size + 8;
     let mid_bytes =

@@ -20,7 +20,7 @@ pub mod npz;
 #[cfg(feature = "pth")]
 pub mod pth;
 #[cfg(any(feature = "gptq", feature = "awq"))]
-mod quant_utils;
+pub(crate) mod quant_utils;
 
 #[cfg(feature = "awq")]
 pub use awq::dequantize_awq_to_bf16;

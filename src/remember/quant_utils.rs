@@ -113,6 +113,89 @@ pub(crate) fn read_scale_f32(data: &[u8], byte_offset: usize, dtype: Dtype) -> c
     }
 }
 
+/// Tile edge (in elements) for the cache-blocked `BF16` transpose.
+///
+/// 32×32 `u16` elements = 2 KiB per tile side — both the read and the
+/// write tile fit in L1 regardless of the matrix's leading dimension.
+const TRANSPOSE_TILE: usize = 32;
+
+/// Transposes a row-major `[rows, cols]` `BF16` matrix to row-major
+/// `[cols, rows]`.
+///
+/// Used by `ParsedModel::remember` / `remember_to_bytes` to convert the
+/// GEMM-native `[in_features, out_features]` orientation the `GPTQ` / `AWQ`
+/// dequant kernels produce (the canonical libraries' own kernel orientation,
+/// which the cross-validation fixtures anchor) into the standard
+/// `nn.Linear.weight` `[out_features, in_features]` orientation a
+/// loadable-by-any-framework safetensors requires — the same boundary
+/// transpose `GPTQModel`'s `dequantize_model` applies (`.T`) when assigning
+/// to a plain `nn.Linear`.
+///
+/// Elements are copied as opaque `u16` words (no float interpretation), in
+/// [`TRANSPOSE_TILE`]² cache-blocked tiles so both access streams stay
+/// L1-resident.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `rows × cols × 2` overflows or does
+/// not equal `data.len()`.
+///
+/// # Memory
+///
+/// Allocates one `rows × cols × 2`-byte output buffer; the input is
+/// unmodified. Callers replacing their input with the result hold both
+/// buffers only for the duration of the call.
+pub(crate) fn transpose_bf16(data: &[u8], rows: usize, cols: usize) -> crate::Result<Vec<u8>> {
+    let n_elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "transpose element count overflow".into(),
+        })?;
+    let byte_len = n_elements
+        .checked_mul(2)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "transpose byte count overflow".into(),
+        })?;
+    if data.len() != byte_len {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "transpose input length {} != rows × cols × 2 = {byte_len} \
+                 (rows={rows}, cols={cols})",
+                data.len()
+            ),
+        });
+    }
+
+    let mut output = vec![0u8; byte_len];
+
+    // Cache-blocked transpose over TRANSPOSE_TILE² element tiles. All
+    // indices below are bounded by `n_elements`: r < rows, c < cols, and
+    // both `r * cols + c` and `c * rows + r` are < rows × cols, with the
+    // ×2 byte offsets < byte_len (validated against data.len() above and
+    // matching output.len() by construction).
+    // EXPLICIT: imperative tile loops — the 2-D blocked traversal has no
+    // iterator-chain equivalent that preserves the tiling.
+    #[allow(clippy::indexing_slicing)]
+    for row_tile in (0..rows).step_by(TRANSPOSE_TILE) {
+        for col_tile in (0..cols).step_by(TRANSPOSE_TILE) {
+            let row_end = (row_tile + TRANSPOSE_TILE).min(rows);
+            let col_end = (col_tile + TRANSPOSE_TILE).min(cols);
+            for r in row_tile..row_end {
+                for c in col_tile..col_end {
+                    // INDEX: src/dst element indices < rows × cols (see the
+                    // block-level bound argument above)
+                    let src = (r * cols + c) * 2;
+                    let dst = (c * rows + r) * 2;
+                    output[dst] = data[src];
+                    output[dst + 1] = data[src + 1];
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -120,6 +203,7 @@ pub(crate) fn read_scale_f32(data: &[u8], byte_offset: usize, dtype: Dtype) -> c
     clippy::unwrap_used,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
     clippy::float_cmp
 )]
 mod tests {
@@ -148,5 +232,52 @@ mod tests {
         let data = 2.0_f32.to_le_bytes();
         let val = read_scale_f32(&data, 0, Dtype::F32).unwrap();
         assert_eq!(val, 2.0);
+    }
+
+    // -- transpose_bf16 ------------------------------------------------------
+
+    /// Build BF16 LE bytes where element k carries the value k (exact for
+    /// the small test sizes used here).
+    fn bf16_ramp(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|k| {
+                let bits = ((k as f32).to_bits() >> 16) as u16;
+                bits.to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn bf16_value(data: &[u8], idx: usize) -> f32 {
+        let bits = u16::from_le_bytes([data[idx * 2], data[idx * 2 + 1]]);
+        f32::from_bits(u32::from(bits) << 16)
+    }
+
+    #[test]
+    fn transpose_maps_elements_exactly() {
+        // 2×3 matrix [[0,1,2],[3,4,5]] → 3×2 [[0,3],[1,4],[2,5]].
+        let data = bf16_ramp(6);
+        let out = transpose_bf16(&data, 2, 3).unwrap();
+        let expected = [0.0, 3.0, 1.0, 4.0, 2.0, 5.0];
+        for (idx, &exp) in expected.iter().enumerate() {
+            assert_eq!(bf16_value(&out, idx), exp, "element {idx}");
+        }
+    }
+
+    #[test]
+    fn transpose_round_trips_non_square() {
+        // Sizes straddling the 32-element tile edge, including odd remainders.
+        for &(rows, cols) in &[(1usize, 7usize), (5, 33), (33, 5), (64, 96), (40, 40)] {
+            let data = bf16_ramp(rows * cols);
+            let once = transpose_bf16(&data, rows, cols).unwrap();
+            let twice = transpose_bf16(&once, cols, rows).unwrap();
+            assert_eq!(twice, data, "transpose² != identity for {rows}×{cols}");
+        }
+    }
+
+    #[test]
+    fn transpose_rejects_length_mismatch() {
+        let data = bf16_ramp(6);
+        assert!(transpose_bf16(&data, 2, 4).is_err());
+        assert!(transpose_bf16(&data, 7, 1).is_err());
     }
 }
