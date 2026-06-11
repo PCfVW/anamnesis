@@ -43,6 +43,10 @@ use anamnesis::{parse, TargetDtype};
 
 /// Build a minimal safetensors file in memory with the given tensors
 /// (mirrors the `build_safetensors` helper in `src/model.rs` tests).
+/// Only the feature-gated GPTQ/AWQ/BnB tests use it — the always-on FP8
+/// test hand-assembles its header (`F8_E4M3` is not serializable through
+/// the `safetensors` crate's writer).
+#[cfg(any(feature = "gptq", feature = "awq", feature = "bnb"))]
 fn build_safetensors(tensors: &[(&str, safetensors::Dtype, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
     let views: Vec<(&str, safetensors::tensor::TensorView<'_>)> = tensors
         .iter()
