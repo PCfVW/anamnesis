@@ -776,8 +776,9 @@ impl<'a> PickleVm<'a> {
     /// the whole subtree is freshly allocated.
     fn deep_size(v: &PickleValue) -> u64 {
         let mut total = Self::shallow_size(v);
-        // EXPLICIT: structural recursion over the value tree; depth is capped
-        // at construction so this cannot overflow the call stack.
+        // EXHAUSTIVE: only the nested variants add children; the `_` arm covers
+        // every leaf variant (no children). The recursion is depth-bounded by
+        // MAX_PICKLE_VM_DEPTH, so it cannot overflow the call stack.
         #[allow(clippy::wildcard_enum_match_arm)]
         match v {
             PickleValue::Tuple(items) | PickleValue::List(items) => {
@@ -995,8 +996,9 @@ impl<'a> PickleVm<'a> {
         let v = self.stack.pop().ok_or_else(|| AnamnesisError::Parse {
             reason: "pickle stack underflow".into(),
         })?;
-        // INDEX: meta_stack.len() == stack.len() invariant (every push goes
-        // through push_value); a successful stack.pop() guarantees a meta to pop.
+        // meta_stack.len() == stack.len() (every push goes through push_value),
+        // so a successful stack.pop() guarantees a matching meta; the ok_or_else
+        // is a defensive desync guard, never expected to fire.
         let meta = self.meta_stack.pop().ok_or_else(|| AnamnesisError::Parse {
             reason: "pickle metadata stack desync".into(),
         })?;
