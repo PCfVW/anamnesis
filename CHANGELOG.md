@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] - 2026-06-13
+
+Phase 6.11 — pickle-VM working-set governance. Closes a P0 DoS an independent
+security audit surfaced in v0.6.3 (`docs/security-audit-{brief,findings}.md`,
+internal, not tracked in the repo).
+
+### Security
+
+- **The `.pth` pickle VM now governs its working set.** Previously the VM
+  bounded only the `data.pkl` opcode-stream length (`MAX_PKL_SIZE`, 100 MiB)
+  and individual string/bytes payloads; the value stack, memo clones, and
+  nesting depth were charged to nothing, so a small crafted pickle could drive
+  multi-GiB heap (an `N`-flood, or `BINGET` replay of a large memoised
+  subtree) or a recursive-`Drop` stack overflow — a process abort under the
+  crate's `panic = "abort"`, reachable from `parse_pth` **and** the cheap
+  `inspect_pth_from_reader` pre-filter the README recommends for untrusted
+  input. The VM now routes every value-creating opcode through a single
+  accounting choke point that:
+  - charges each pushed value's heap (enum slot + owned payload) and the deep
+    size of every memo clone to a permanent `MAX_PICKLE_WORKING_SET` floor
+    (512 MiB) **and** the caller's `ParseLimits::max_total_bytes`, bounding the
+    stack-flood and memo-replay amplification vectors; and
+  - caps construction nesting depth at a permanent `MAX_PICKLE_VM_DEPTH` (256),
+    so an over-deep value never forms and recursive `Drop` (and every recursive
+    walk) stays shallow.
+
+  Both floors are always-on (enforced even under `ParseLimits::default()`), in
+  `O(1)` per opcode (a parallel depth/size metadata stack — a per-push deep
+  walk would itself be an `O(n²)` CPU-DoS). No public API change; honest files
+  are unaffected (the floors are ~3 orders of magnitude above any real
+  `state_dict`). The `data.pkl` allowlist, opcode set, and tensor extraction
+  are unchanged.
+
+### Changed
+
+- **`ParseLimits::max_total_bytes` now also counts the `.pth` pickle VM's
+  working set** (every pushed value + memo-clone deep size), not just the
+  string/bytes payloads it charged before. A caller who set a pathologically
+  tight `max_total_bytes` calibrated to the old payload-only accounting may see
+  it bite earlier; realistic budgets are unaffected. This is the intended
+  effect of the Security fix above (the old accounting under-counted the real
+  VM heap).
+
+### Fixed
+
+- **BnB4 dequant/encode now reject an odd `block_size`.** Two 4-bit values pack
+  into one byte, so `bytes_per_block = block_size / 2`; an odd `block_size`
+  truncated that division and mis-aligned every block after the first, yielding
+  wrong (not out-of-bounds) output. The decode (`dequantize_bnb4_to_bf16`,
+  `dequantize_bnb4_double_quant_to_bf16`) and encode (`encode_bnb4`,
+  `encode_bnb4_compute_absmax`, `encode_bnb4_double_quant`) entry points now
+  return `AnamnesisError::Parse` for an odd `block_size`. (Bundled defense-in-
+  depth nit from the same audit.)
+
 ## [0.6.5] - 2026-06-10
 
 Phase 6.10 — the second candle-mi dogfooding fix. Full post-mortem:
