@@ -150,10 +150,17 @@
 //!
 //! # `PyTorch` `.pth` Parsing
 //!
-//! Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with
-//! security allowlist. Memory-mapped I/O with zero-copy `Cow::Borrowed`
-//! tensor data. Lossless `.pth` → `.safetensors` conversion.
-//! **11–31× faster** than `torch.load()` on torchvision models.
+//! Feature-gated behind `pth`. Minimal pickle VM (~36 opcodes) with a
+//! security allowlist (only `PyTorch` tensor-reconstruction globals are
+//! permitted — the VM never invokes callables, so there is no code-execution
+//! path) and **working-set governance**: the value stack, memo clones, and
+//! nesting depth are charged against permanent floors
+//! (`MAX_PICKLE_WORKING_SET`, `MAX_PICKLE_VM_DEPTH`) and the caller's
+//! [`ParseLimits`], so a crafted `.pth` cannot drive multi-GiB heap or a
+//! recursive-`Drop` stack overflow even on the cheap `inspect_pth_from_reader`
+//! pre-filter. Memory-mapped I/O with zero-copy `Cow::Borrowed` tensor data.
+//! Lossless `.pth` → `.safetensors` conversion. **11–31× faster** than
+//! `torch.load()` on torchvision models.
 //!
 //! # Quick Start
 //!

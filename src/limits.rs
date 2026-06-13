@@ -71,8 +71,13 @@ pub struct ParseLimits {
     /// drive — the running sum of every eager allocation [`max_single_alloc_bytes`]
     /// gates. Closes the many-small-items blow-up: a file declaring thousands
     /// of buffers each just under the single-allocation cap is rejected once
-    /// their total crosses this budget, before the host `OOM`s. [`u64::MAX`]
-    /// means unbounded.
+    /// their total crosses this budget, before the host `OOM`s. Since Phase
+    /// 6.11 the running sum also includes the `.pth` pickle VM's working set —
+    /// every value it pushes plus the deep size of each memo clone — so a
+    /// crafted pickle that amplifies a small opcode stream into multi-GiB heap
+    /// is bounded here too (and, independently of this caller budget, by the
+    /// VM's permanent `MAX_PICKLE_WORKING_SET` floor). [`u64::MAX`] means
+    /// unbounded.
     max_total_bytes: u64,
 
     /// Upper bound on the total number of declared items in a file — `GGUF`

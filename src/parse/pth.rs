@@ -56,6 +56,35 @@ use crate::ParseLimits;
 /// attacker-controlled input.
 const MAX_PKL_SIZE: u64 = 100 * 1024 * 1024;
 
+/// Permanent ceiling on the pickle VM's cumulative working-set heap (512 MiB).
+///
+/// `MAX_PKL_SIZE` bounds the opcode *stream*, not the heap each opcode
+/// produces: a small crafted pickle can drive the value stack, memo clones,
+/// and nested values to multi-GiB heap (`N`-floods, `BINGET` replay of a
+/// memoised subtree). This cap charges every value the VM allocates — pushed
+/// values, container backings, and the deep size of each memo clone — to a
+/// running total and rejects before crossing it. A non-amplifying pickle's
+/// VM heap is `O(data.pkl size)`, so at 5× the 100 MiB `MAX_PKL_SIZE` disk
+/// cap this is roughly three orders of magnitude above any realistic
+/// `state_dict` and invisible to honest files. Always-on (enforced even under
+/// `ParseLimits::default()`); the caller's `max_total_bytes` tightens it.
+const MAX_PICKLE_WORKING_SET: u64 = 512 * 1024 * 1024;
+
+/// Permanent ceiling on the structural nesting depth of any pickle value the
+/// VM constructs (256).
+///
+/// `BINPERSID` / `REDUCE` / `BUILD` each wrap their operand one `Box` deeper
+/// for a single opcode byte, so an unbounded `Q`-chain builds an
+/// arbitrarily deep value whose derived recursive `Drop` overflows the call
+/// stack (a `panic = "abort"` process kill). Capping construction depth means
+/// a value deeper than this is never built, which keeps `Drop` — and every
+/// recursive walk (`Clone`, deep-size accounting, the post-execution
+/// extraction traversal) — bounded to at most this many frames. Real torch
+/// `state_dict` values nest ~6 deep; the post-execution
+/// [`MAX_PICKLE_NESTING`] cap is 32; 256 is generous headroom and far below
+/// any stack-overflow threshold. Always-on, independent of [`ParseLimits`].
+const MAX_PICKLE_VM_DEPTH: u32 = 256;
+
 /// Maximum declared size for a `.pth` archive's `byteorder` entry.
 ///
 /// The entry contains literally `"little"` or `"big"` (≤6 bytes). 64 B is
@@ -640,14 +669,18 @@ fn is_ordered_dict_constructor(callable: &PickleValue, args: &PickleValue) -> bo
 const MAX_PICKLE_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// Rejects a single pickle string/bytes payload whose declared length exceeds
-/// [`MAX_PICKLE_PAYLOAD`].
+/// the permanent [`MAX_PICKLE_PAYLOAD`] per-item cap, **before** the payload is
+/// read or allocated.
+///
+/// This is the pre-allocation guard only. The cumulative charge (the caller's
+/// `max_total_bytes` aggregate and the permanent [`MAX_PICKLE_WORKING_SET`]
+/// floor) happens once, when the resulting value is pushed through
+/// [`PickleVm::push_value`], so there is a single working-set accounting point.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`], the
-/// caller's per-allocation cap, or the cumulative-byte aggregate (each payload
-/// is an owned clone, so it counts toward the parse-time-heap total).
-fn enforce_pickle_payload_cap(len: usize, opcode: &str, budget: &mut Budget) -> crate::Result<()> {
+/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`].
+fn enforce_pickle_payload_cap(len: usize, opcode: &str) -> crate::Result<()> {
     if len > MAX_PICKLE_PAYLOAD {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -656,13 +689,17 @@ fn enforce_pickle_payload_cap(len: usize, opcode: &str, budget: &mut Budget) -> 
             ),
         });
     }
-    // Caller-supplied ceiling (per-item single-alloc + cumulative aggregate),
-    // layered on top of the permanent cap above. Each payload is an owned
-    // String/Vec clone, so it counts toward the parse-time-heap total.
-    // CAST: usize → u64, lossless widening on all supported targets
-    #[allow(clippy::as_conversions)]
-    budget.charge_alloc(len as u64, "PTH pickle payload")?;
     Ok(())
+}
+
+/// Per-stack-slot bookkeeping, maintained in lockstep with [`PickleVm::stack`]
+/// so the VM can bound nesting depth in `O(1)` per opcode (a per-push deep
+/// walk would be `O(n²)` on a `BINPERSID` chain — a CPU-DoS in the guard
+/// itself).
+#[derive(Clone, Copy)]
+struct SlotMeta {
+    /// Structural nesting depth of the value in this slot (leaf = 1).
+    depth: u32,
 }
 
 /// Minimal pickle VM state.
@@ -673,15 +710,27 @@ struct PickleVm<'a> {
     pos: usize,
     /// Value stack.
     stack: Vec<PickleValue>,
+    /// Per-slot metadata, kept length-synced with [`PickleVm::stack`]. The
+    /// invariant `stack.len() == meta_stack.len()` is preserved by routing
+    /// every growth through [`PickleVm::push_value`] and every shrink through
+    /// [`PickleVm::pop`] / [`PickleVm::pop_mark`].
+    meta_stack: Vec<SlotMeta>,
     /// Mark stack (positions in the value stack).
     mark_stack: Vec<usize>,
     /// Memo table (protocol 2+ `BINPUT`/`BINGET`, protocol 4+ `MEMOIZE`).
-    memo: HashMap<u32, PickleValue>,
+    /// Stores each value with its [`SlotMeta`] so `BINGET` restores depth in
+    /// `O(1)` without re-walking the cloned subtree.
+    memo: HashMap<u32, (PickleValue, SlotMeta)>,
     /// Auto-incrementing memo key for `MEMOIZE` opcode.
     next_memo_id: u32,
+    /// Cumulative heap charged to the VM working set this parse (bytes),
+    /// bounded by [`MAX_PICKLE_WORKING_SET`] and the caller's
+    /// [`ParseLimits::max_total_bytes`]. Monotonic — a conservative
+    /// over-approximation of live heap (peak ≤ cumulative).
+    working_set: u64,
     /// Caller-supplied allocation budget — the per-item single-allocation cap
-    /// and the cumulative parse-time-heap aggregate, charged on each pickle
-    /// string/bytes payload.
+    /// and the cumulative parse-time-heap aggregate, charged on every value
+    /// the VM allocates (pushed values and memo clones).
     budget: Budget,
 }
 
@@ -691,11 +740,159 @@ impl<'a> PickleVm<'a> {
             data,
             pos: 0,
             stack: Vec::new(),
+            meta_stack: Vec::new(),
             mark_stack: Vec::new(),
             memo: HashMap::new(),
             next_memo_id: 0,
+            working_set: 0,
             budget: Budget::new(limits),
         }
+    }
+
+    /// Shallow heap footprint of a single value node (bytes): the enum slot
+    /// plus the immediately-owned `String` / `Bytes` payload, but **not** its
+    /// children (which are charged when they are themselves pushed).
+    fn shallow_size(v: &PickleValue) -> u64 {
+        // CAST: usize → u64, lossless widening on all supported targets
+        #[allow(clippy::as_conversions)]
+        let base = std::mem::size_of::<PickleValue>() as u64;
+        // EXHAUSTIVE: only String/Bytes carry an immediate owned payload; every
+        // other variant's heap is its children, charged when they are pushed.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let payload = match v {
+            PickleValue::String(s) => s.len(),
+            PickleValue::Bytes(b) => b.len(),
+            _ => 0,
+        };
+        // CAST: usize → u64, lossless widening
+        #[allow(clippy::as_conversions)]
+        let payload = payload as u64;
+        base.saturating_add(payload)
+    }
+
+    /// Deep heap footprint of a value and all its children (bytes). Recursive,
+    /// but bounded to [`MAX_PICKLE_VM_DEPTH`] frames because no value deeper
+    /// than that is ever constructed. Used only on memo-clone opcodes, where
+    /// the whole subtree is freshly allocated.
+    fn deep_size(v: &PickleValue) -> u64 {
+        let mut total = Self::shallow_size(v);
+        // EXPLICIT: structural recursion over the value tree; depth is capped
+        // at construction so this cannot overflow the call stack.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match v {
+            PickleValue::Tuple(items) | PickleValue::List(items) => {
+                for item in items {
+                    total = total.saturating_add(Self::deep_size(item));
+                }
+            }
+            PickleValue::Dict(pairs) => {
+                for (k, val) in pairs {
+                    total = total
+                        .saturating_add(Self::deep_size(k))
+                        .saturating_add(Self::deep_size(val));
+                }
+            }
+            PickleValue::PersistentId(inner) => {
+                total = total.saturating_add(Self::deep_size(inner));
+            }
+            PickleValue::Reduced { callable, args } => {
+                total = total
+                    .saturating_add(Self::deep_size(callable))
+                    .saturating_add(Self::deep_size(args));
+            }
+            PickleValue::Built { obj, state } => {
+                total = total
+                    .saturating_add(Self::deep_size(obj))
+                    .saturating_add(Self::deep_size(state));
+            }
+            _ => {}
+        }
+        total
+    }
+
+    /// Charges `bytes` to the VM working set, enforcing both the permanent
+    /// [`MAX_PICKLE_WORKING_SET`] floor and the caller's
+    /// [`ParseLimits::max_total_bytes`] aggregate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the running total would exceed the
+    /// permanent floor, or if [`Budget::charge_alloc`] rejects the caller's
+    /// aggregate.
+    fn charge(&mut self, bytes: u64, context: &str) -> crate::Result<()> {
+        self.working_set =
+            self.working_set
+                .checked_add(bytes)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: "pickle working-set byte counter overflow".into(),
+                })?;
+        if self.working_set > MAX_PICKLE_WORKING_SET {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "pickle VM working set exceeds the {MAX_PICKLE_WORKING_SET}-byte cap \
+                     ({context})"
+                ),
+            });
+        }
+        self.budget.charge_alloc(bytes, context)
+    }
+
+    /// Pushes a value and its depth onto the stack, the **only** way the value
+    /// stack grows. Charges the value's shallow heap cost and rejects a depth
+    /// past [`MAX_PICKLE_VM_DEPTH`], so vectors (a) flat-stack and (c) nesting
+    /// are bounded at the single choke point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if `depth` exceeds
+    /// [`MAX_PICKLE_VM_DEPTH`] or the working-set charge is rejected.
+    fn push_value(&mut self, v: PickleValue, depth: u32) -> crate::Result<()> {
+        if depth > MAX_PICKLE_VM_DEPTH {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "pickle value nesting depth {depth} exceeds the \
+                     {MAX_PICKLE_VM_DEPTH} cap"
+                ),
+            });
+        }
+        self.charge(Self::shallow_size(&v), "PTH pickle value")?;
+        self.stack.push(v);
+        self.meta_stack.push(SlotMeta { depth });
+        Ok(())
+    }
+
+    /// Pushes a leaf value (depth 1). Convenience over [`PickleVm::push_value`]
+    /// for the constant- and payload-sized opcodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the working-set charge is rejected.
+    fn push_leaf(&mut self, v: PickleValue) -> crate::Result<()> {
+        self.push_value(v, 1)
+    }
+
+    /// Raises the top slot's depth to at least `child_depth` after an in-place
+    /// container mutation (`APPEND(S)` / `SETITEM(S)` grow the top `List` /
+    /// `Dict` without a fresh push), re-enforcing [`MAX_PICKLE_VM_DEPTH`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the updated depth exceeds
+    /// [`MAX_PICKLE_VM_DEPTH`].
+    fn bump_top_depth(&mut self, child_depth: u32) -> crate::Result<()> {
+        if let Some(meta) = self.meta_stack.last_mut() {
+            meta.depth = meta.depth.max(child_depth);
+            if meta.depth > MAX_PICKLE_VM_DEPTH {
+                return Err(AnamnesisError::Parse {
+                    reason: format!(
+                        "pickle value nesting depth {} exceeds the \
+                         {MAX_PICKLE_VM_DEPTH} cap",
+                        meta.depth
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     // -- byte reading helpers ------------------------------------------------
@@ -792,18 +989,111 @@ impl<'a> PickleVm<'a> {
 
     // -- stack helpers -------------------------------------------------------
 
-    fn pop(&mut self) -> crate::Result<PickleValue> {
-        self.stack.pop().ok_or_else(|| AnamnesisError::Parse {
+    /// Pops the top value and its [`SlotMeta`], keeping the value and metadata
+    /// stacks length-synced.
+    fn pop(&mut self) -> crate::Result<(PickleValue, SlotMeta)> {
+        let v = self.stack.pop().ok_or_else(|| AnamnesisError::Parse {
             reason: "pickle stack underflow".into(),
-        })
+        })?;
+        // INDEX: meta_stack.len() == stack.len() invariant (every push goes
+        // through push_value); a successful stack.pop() guarantees a meta to pop.
+        let meta = self.meta_stack.pop().ok_or_else(|| AnamnesisError::Parse {
+            reason: "pickle metadata stack desync".into(),
+        })?;
+        Ok((v, meta))
     }
 
-    fn pop_mark(&mut self) -> crate::Result<Vec<PickleValue>> {
+    /// Pops everything above the latest mark as parallel value + metadata
+    /// vectors (same length).
+    fn pop_mark(&mut self) -> crate::Result<(Vec<PickleValue>, Vec<SlotMeta>)> {
         let mark_pos = self.mark_stack.pop().ok_or_else(|| AnamnesisError::Parse {
             reason: "pickle mark stack underflow".into(),
         })?;
+        if mark_pos > self.stack.len() {
+            return Err(AnamnesisError::Parse {
+                reason: "pickle mark position out of range".into(),
+            });
+        }
         let items = self.stack.split_off(mark_pos);
-        Ok(items)
+        let metas = self.meta_stack.split_off(mark_pos);
+        Ok((items, metas))
+    }
+
+    /// Maximum `depth` over a slice of [`SlotMeta`] (0 for an empty slice).
+    fn max_depth(metas: &[SlotMeta]) -> u32 {
+        metas.iter().map(|m| m.depth).max().unwrap_or(0)
+    }
+
+    /// Clones the top value (and its [`SlotMeta`]) for memoisation, charging
+    /// the clone's deep heap size **before** the clone so an over-budget memo
+    /// is rejected without allocating the duplicate. Bounds vector (b) on the
+    /// `BINPUT` / `MEMOIZE` side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] on empty stack or if the charge is
+    /// rejected.
+    fn memoize_top(&mut self, opcode: &str) -> crate::Result<(PickleValue, SlotMeta)> {
+        let bytes = match self.stack.last() {
+            Some(v) => Self::deep_size(v),
+            None => {
+                return Err(AnamnesisError::Parse {
+                    reason: format!("{opcode}: empty stack"),
+                })
+            }
+        };
+        self.charge(bytes, "PTH pickle memo clone")?;
+        // The immutable borrow above has ended; charge() does not touch the
+        // stack, so the top is still present. `.last().cloned()` avoids both
+        // indexing and unwrap.
+        let val = self
+            .stack
+            .last()
+            .cloned()
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("{opcode}: empty stack"),
+            })?;
+        let meta = self
+            .meta_stack
+            .last()
+            .copied()
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "pickle metadata stack desync".into(),
+            })?;
+        Ok((val, meta))
+    }
+
+    /// Clones a memoised value for `BINGET` replay, charging its children's
+    /// deep heap **before** the clone (the root's shallow size is charged when
+    /// [`PickleVm::push_value`] re-pushes it, so the total is the exact deep
+    /// size). Bounds vector (b) on the `BINGET` side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the key is absent or the charge is
+    /// rejected.
+    fn memo_get_clone(&mut self, key: u32, opcode: &str) -> crate::Result<(PickleValue, u32)> {
+        let (children, depth) = match self.memo.get(&key) {
+            Some((v, m)) => (
+                Self::deep_size(v).saturating_sub(Self::shallow_size(v)),
+                m.depth,
+            ),
+            None => {
+                return Err(AnamnesisError::Parse {
+                    reason: format!("{opcode}: memo key {key} not found"),
+                })
+            }
+        };
+        self.charge(children, "PTH pickle memo replay")?;
+        let val = match self.memo.get(&key) {
+            Some((v, _)) => v.clone(),
+            None => {
+                return Err(AnamnesisError::Parse {
+                    reason: format!("{opcode}: memo key {key} not found"),
+                })
+            }
+        };
+        Ok((val, depth))
     }
 
     // -- main execution loop -------------------------------------------------
@@ -827,14 +1117,14 @@ impl<'a> PickleVm<'a> {
                     let _frame_len = self.read_u64_le()?;
                 }
                 // STOP — end of pickle, return top of stack
-                b'.' => return self.pop(),
+                b'.' => return self.pop().map(|(v, _)| v),
 
                 // -- push constants ------------------------------------------
-                b'N' => self.stack.push(PickleValue::None),
+                b'N' => self.push_leaf(PickleValue::None)?,
                 // NEWTRUE
-                0x88 => self.stack.push(PickleValue::Bool(true)),
+                0x88 => self.push_leaf(PickleValue::Bool(true))?,
                 // NEWFALSE
-                0x89 => self.stack.push(PickleValue::Bool(false)),
+                0x89 => self.push_leaf(PickleValue::Bool(false))?,
 
                 // -- integers ------------------------------------------------
 
@@ -842,19 +1132,19 @@ impl<'a> PickleVm<'a> {
                 b'J' => {
                     let v = self.read_i32_le()?;
                     // CAST: i32 → i64, lossless widening
-                    self.stack.push(PickleValue::Int(i64::from(v)));
+                    self.push_leaf(PickleValue::Int(i64::from(v)))?;
                 }
                 // BININT1 (1-byte unsigned)
                 b'K' => {
                     let v = self.read_u8()?;
                     // CAST: u8 → i64, lossless widening
-                    self.stack.push(PickleValue::Int(i64::from(v)));
+                    self.push_leaf(PickleValue::Int(i64::from(v)))?;
                 }
                 // BININT2 (2-byte unsigned)
                 b'M' => {
                     let v = self.read_u16_le()?;
                     // CAST: u16 → i64, lossless widening
-                    self.stack.push(PickleValue::Int(i64::from(v)));
+                    self.push_leaf(PickleValue::Int(i64::from(v)))?;
                 }
                 // LONG1 (arbitrary-precision int, 1-byte size prefix)
                 0x8a => {
@@ -862,7 +1152,7 @@ impl<'a> PickleVm<'a> {
                     // CAST: u8 → usize, lossless on all platforms
                     let bytes = self.read_bytes(usize::from(n))?;
                     let val = long1_to_i64(bytes)?;
-                    self.stack.push(PickleValue::Int(val));
+                    self.push_leaf(PickleValue::Int(val))?;
                 }
 
                 // -- strings -------------------------------------------------
@@ -876,7 +1166,7 @@ impl<'a> PickleVm<'a> {
                         reason: format!("non-UTF-8 pickle string: {e}"),
                     })?;
                     // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
-                    self.stack.push(PickleValue::String(s.to_owned()));
+                    self.push_leaf(PickleValue::String(s.to_owned()))?;
                 }
                 // BINUNICODE (4-byte length prefix)
                 b'X' => {
@@ -884,13 +1174,13 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINUNICODE length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINUNICODE", &mut self.budget)?;
+                    enforce_pickle_payload_cap(len, "BINUNICODE")?;
                     let bytes = self.read_bytes(len)?;
                     let s = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
                         reason: format!("non-UTF-8 pickle string: {e}"),
                     })?;
                     // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
-                    self.stack.push(PickleValue::String(s.to_owned()));
+                    self.push_leaf(PickleValue::String(s.to_owned()))?;
                 }
                 // SHORT_BINSTRING (1-byte length, protocol 2 — bytes, not str)
                 b'U' => {
@@ -901,9 +1191,9 @@ impl<'a> PickleVm<'a> {
                     // treat as UTF-8 string if valid, otherwise keep as bytes.
                     match std::str::from_utf8(bytes) {
                         // BORROW: .to_owned() converts &str to owned String
-                        Ok(s) => self.stack.push(PickleValue::String(s.to_owned())),
+                        Ok(s) => self.push_leaf(PickleValue::String(s.to_owned()))?,
                         // BORROW: .to_vec() converts &[u8] to owned Vec<u8>
-                        Err(_) => self.stack.push(PickleValue::Bytes(bytes.to_vec())),
+                        Err(_) => self.push_leaf(PickleValue::Bytes(bytes.to_vec()))?,
                     }
                 }
                 // BINSTRING (4-byte length, protocol 2)
@@ -917,13 +1207,13 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINSTRING length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINSTRING", &mut self.budget)?;
+                    enforce_pickle_payload_cap(len, "BINSTRING")?;
                     let bytes = self.read_bytes(len)?;
                     match std::str::from_utf8(bytes) {
                         // BORROW: .to_owned() converts &str to owned String
-                        Ok(s) => self.stack.push(PickleValue::String(s.to_owned())),
+                        Ok(s) => self.push_leaf(PickleValue::String(s.to_owned()))?,
                         // BORROW: .to_vec() converts &[u8] to owned Vec<u8>
-                        Err(_) => self.stack.push(PickleValue::Bytes(bytes.to_vec())),
+                        Err(_) => self.push_leaf(PickleValue::Bytes(bytes.to_vec()))?,
                     }
                 }
 
@@ -935,10 +1225,10 @@ impl<'a> PickleVm<'a> {
                     let len = usize::try_from(n).map_err(|_| AnamnesisError::Parse {
                         reason: "BINBYTES length overflow".into(),
                     })?;
-                    enforce_pickle_payload_cap(len, "BINBYTES", &mut self.budget)?;
+                    enforce_pickle_payload_cap(len, "BINBYTES")?;
                     let bytes = self.read_bytes(len)?;
                     // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
-                    self.stack.push(PickleValue::Bytes(bytes.to_vec()));
+                    self.push_leaf(PickleValue::Bytes(bytes.to_vec()))?;
                 }
                 // SHORT_BINBYTES (1-byte length, protocol 3+)
                 b'C' => {
@@ -946,52 +1236,56 @@ impl<'a> PickleVm<'a> {
                     // CAST: u8 → usize, lossless
                     let bytes = self.read_bytes(usize::from(n))?;
                     // BORROW: .to_vec() converts &[u8] (borrowed from pickle stream) to owned Vec<u8>
-                    self.stack.push(PickleValue::Bytes(bytes.to_vec()));
+                    self.push_leaf(PickleValue::Bytes(bytes.to_vec()))?;
                 }
 
                 // -- containers ----------------------------------------------
 
                 // EMPTY_DICT
-                b'}' => self.stack.push(PickleValue::Dict(Vec::new())),
+                b'}' => self.push_leaf(PickleValue::Dict(Vec::new()))?,
                 // EMPTY_LIST
-                b']' => self.stack.push(PickleValue::List(Vec::new())),
+                b']' => self.push_leaf(PickleValue::List(Vec::new()))?,
                 // EMPTY_TUPLE
-                b')' => self.stack.push(PickleValue::Tuple(Vec::new())),
+                b')' => self.push_leaf(PickleValue::Tuple(Vec::new()))?,
                 // MARK
                 b'(' => self.mark_stack.push(self.stack.len()),
 
                 // TUPLE (pop to mark → tuple)
                 b't' => {
-                    let items = self.pop_mark()?;
-                    self.stack.push(PickleValue::Tuple(items));
+                    let (items, metas) = self.pop_mark()?;
+                    let depth = Self::max_depth(&metas).saturating_add(1);
+                    self.push_value(PickleValue::Tuple(items), depth)?;
                 }
                 // TUPLE1
                 0x85 => {
-                    let a = self.pop()?;
-                    self.stack.push(PickleValue::Tuple(vec![a]));
+                    let (a, ma) = self.pop()?;
+                    self.push_value(PickleValue::Tuple(vec![a]), ma.depth.saturating_add(1))?;
                 }
                 // TUPLE2
                 0x86 => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(PickleValue::Tuple(vec![a, b]));
+                    let (b, mb) = self.pop()?;
+                    let (a, ma) = self.pop()?;
+                    let depth = ma.depth.max(mb.depth).saturating_add(1);
+                    self.push_value(PickleValue::Tuple(vec![a, b]), depth)?;
                 }
                 // TUPLE3
                 0x87 => {
-                    let c = self.pop()?;
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(PickleValue::Tuple(vec![a, b, c]));
+                    let (c, mc) = self.pop()?;
+                    let (b, mb) = self.pop()?;
+                    let (a, ma) = self.pop()?;
+                    let depth = ma.depth.max(mb.depth).max(mc.depth).saturating_add(1);
+                    self.push_value(PickleValue::Tuple(vec![a, b, c]), depth)?;
                 }
 
                 // SETITEMS (pop mark → alternating key/value pairs → dict)
                 b'u' => {
-                    let items = self.pop_mark()?;
+                    let (items, metas) = self.pop_mark()?;
                     if items.len() % 2 != 0 {
                         return Err(AnamnesisError::Parse {
                             reason: "SETITEMS: odd number of items on stack".into(),
                         });
                     }
+                    let child_depth = Self::max_depth(&metas).saturating_add(1);
                     let dict = self.stack.last_mut().ok_or_else(|| AnamnesisError::Parse {
                         reason: "SETITEMS: empty stack (no dict)".into(),
                     })?;
@@ -1010,11 +1304,13 @@ impl<'a> PickleVm<'a> {
                             reason: "SETITEMS: top of stack is not a dict".into(),
                         });
                     }
+                    self.bump_top_depth(child_depth)?;
                 }
                 // SETITEM (pop value, key → dict)
                 b's' => {
-                    let value = self.pop()?;
-                    let key = self.pop()?;
+                    let (value, mv) = self.pop()?;
+                    let (key, mk) = self.pop()?;
+                    let child_depth = mk.depth.max(mv.depth).saturating_add(1);
                     let dict = self.stack.last_mut().ok_or_else(|| AnamnesisError::Parse {
                         reason: "SETITEM: empty stack (no dict)".into(),
                     })?;
@@ -1025,10 +1321,12 @@ impl<'a> PickleVm<'a> {
                             reason: "SETITEM: top of stack is not a dict".into(),
                         });
                     }
+                    self.bump_top_depth(child_depth)?;
                 }
                 // APPEND
                 b'a' => {
-                    let item = self.pop()?;
+                    let (item, mi) = self.pop()?;
+                    let child_depth = mi.depth.saturating_add(1);
                     let list = self.stack.last_mut().ok_or_else(|| AnamnesisError::Parse {
                         reason: "APPEND: empty stack (no list)".into(),
                     })?;
@@ -1039,10 +1337,12 @@ impl<'a> PickleVm<'a> {
                             reason: "APPEND: top of stack is not a list".into(),
                         });
                     }
+                    self.bump_top_depth(child_depth)?;
                 }
                 // APPENDS
                 b'e' => {
-                    let new_items = self.pop_mark()?;
+                    let (new_items, metas) = self.pop_mark()?;
+                    let child_depth = Self::max_depth(&metas).saturating_add(1);
                     let list = self.stack.last_mut().ok_or_else(|| AnamnesisError::Parse {
                         reason: "APPENDS: empty stack (no list)".into(),
                     })?;
@@ -1053,6 +1353,7 @@ impl<'a> PickleVm<'a> {
                             reason: "APPENDS: top of stack is not a list".into(),
                         });
                     }
+                    self.bump_top_depth(child_depth)?;
                 }
 
                 // -- object construction -------------------------------------
@@ -1071,12 +1372,12 @@ impl<'a> PickleVm<'a> {
                             ),
                         });
                     }
-                    self.stack.push(PickleValue::Global { module, name });
+                    self.push_leaf(PickleValue::Global { module, name })?;
                 }
                 // STACK_GLOBAL (protocol 4+: pop name, pop module from stack)
                 0x93 => {
-                    let name_val = self.pop()?;
-                    let module_val = self.pop()?;
+                    let (name_val, _) = self.pop()?;
+                    let (module_val, _) = self.pop()?;
                     let (module, name) = match (&module_val, &name_val) {
                         (PickleValue::String(m), PickleValue::String(n)) => {
                             (m.as_str(), n.as_str())
@@ -1095,43 +1396,54 @@ impl<'a> PickleVm<'a> {
                             ),
                         });
                     }
-                    self.stack.push(PickleValue::Global {
+                    self.push_leaf(PickleValue::Global {
                         // BORROW: .to_owned() converts &str to owned String
                         module: module.to_owned(),
                         // BORROW: .to_owned() converts &str to owned String
                         name: name.to_owned(),
-                    });
+                    })?;
                 }
                 // REDUCE (pop args, pop callable → Reduced)
                 // NEWOBJ (pop args, pop cls → Reduced) — same semantics
                 b'R' | 0x81 => {
-                    let args = self.pop()?;
-                    let callable = self.pop()?;
+                    let (args, m_args) = self.pop()?;
+                    let (callable, m_callable) = self.pop()?;
                     // Semantic interpretation: REDUCE(OrderedDict, ()) → empty Dict.
                     // Python actually calls OrderedDict() here, producing a real dict
                     // that SETITEMS will later populate. Without this, SETITEMS fails.
                     if is_ordered_dict_constructor(&callable, &args) {
-                        self.stack.push(PickleValue::Dict(Vec::new()));
+                        self.push_leaf(PickleValue::Dict(Vec::new()))?;
                     } else {
-                        self.stack.push(PickleValue::Reduced {
-                            callable: Box::new(callable),
-                            args: Box::new(args),
-                        });
+                        let depth = m_args.depth.max(m_callable.depth).saturating_add(1);
+                        self.push_value(
+                            PickleValue::Reduced {
+                                callable: Box::new(callable),
+                                args: Box::new(args),
+                            },
+                            depth,
+                        )?;
                     }
                 }
                 // BUILD (pop state, peek obj → Built)
                 b'b' => {
-                    let state = self.pop()?;
-                    let obj = self.pop()?;
-                    self.stack.push(PickleValue::Built {
-                        obj: Box::new(obj),
-                        state: Box::new(state),
-                    });
+                    let (state, m_state) = self.pop()?;
+                    let (obj, m_obj) = self.pop()?;
+                    let depth = m_obj.depth.max(m_state.depth).saturating_add(1);
+                    self.push_value(
+                        PickleValue::Built {
+                            obj: Box::new(obj),
+                            state: Box::new(state),
+                        },
+                        depth,
+                    )?;
                 }
                 // BINPERSID (pop id → PersistentId)
                 b'Q' => {
-                    let pid = self.pop()?;
-                    self.stack.push(PickleValue::PersistentId(Box::new(pid)));
+                    let (pid, m_pid) = self.pop()?;
+                    self.push_value(
+                        PickleValue::PersistentId(Box::new(pid)),
+                        m_pid.depth.saturating_add(1),
+                    )?;
                 }
 
                 // -- memo operations -----------------------------------------
@@ -1139,63 +1451,33 @@ impl<'a> PickleVm<'a> {
                 // BINPUT (1-byte key)
                 b'q' => {
                     let key = self.read_u8()?;
-                    let val = self
-                        .stack
-                        .last()
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: "BINPUT: empty stack".into(),
-                        })?
-                        .clone();
+                    let entry = self.memoize_top("BINPUT")?;
                     // CAST: u8 → u32, lossless
-                    self.memo.insert(u32::from(key), val);
+                    self.memo.insert(u32::from(key), entry);
                 }
                 // LONG_BINPUT (4-byte key)
                 b'r' => {
                     let key = self.read_u32_le()?;
-                    let val = self
-                        .stack
-                        .last()
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: "LONG_BINPUT: empty stack".into(),
-                        })?
-                        .clone();
-                    self.memo.insert(key, val);
+                    let entry = self.memoize_top("LONG_BINPUT")?;
+                    self.memo.insert(key, entry);
                 }
                 // BINGET (1-byte key)
                 b'h' => {
                     let key = self.read_u8()?;
                     // CAST: u8 → u32, lossless
-                    let val = self
-                        .memo
-                        .get(&u32::from(key))
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("BINGET: memo key {key} not found"),
-                        })?
-                        .clone();
-                    self.stack.push(val);
+                    let (val, depth) = self.memo_get_clone(u32::from(key), "BINGET")?;
+                    self.push_value(val, depth)?;
                 }
                 // LONG_BINGET (4-byte key)
                 b'j' => {
                     let key = self.read_u32_le()?;
-                    let val = self
-                        .memo
-                        .get(&key)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("LONG_BINGET: memo key {key} not found"),
-                        })?
-                        .clone();
-                    self.stack.push(val);
+                    let (val, depth) = self.memo_get_clone(key, "LONG_BINGET")?;
+                    self.push_value(val, depth)?;
                 }
                 // MEMOIZE (protocol 4+: auto-assigns next key)
                 0x94 => {
-                    let val = self
-                        .stack
-                        .last()
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: "MEMOIZE: empty stack".into(),
-                        })?
-                        .clone();
-                    self.memo.insert(self.next_memo_id, val);
+                    let entry = self.memoize_top("MEMOIZE")?;
+                    self.memo.insert(self.next_memo_id, entry);
                     self.next_memo_id =
                         self.next_memo_id
                             .checked_add(1)
@@ -1767,12 +2049,18 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 /// `limits` can only tighten them. [`parse_pth`] is the `ParseLimits::default()`
 /// (unbounded) special case.
 ///
-/// The cumulative-byte aggregate covers the pickle string/bytes payloads. The
-/// pickle VM's own working set — the value stack and any assembled lists /
-/// dicts / tuples — is *not* charged to `max_total_bytes`; it is bounded
-/// instead by the `data.pkl` size cap (`MAX_PKL_SIZE`, which `max_single_alloc`
-/// tightens), since every value the VM builds is driven by an opcode in that
-/// bounded stream.
+/// The pickle VM's **working set** — the value stack, memoised clones, and
+/// nested values — is governed (Phase 6.11): every value the VM allocates is
+/// charged through the same `Budget` the payloads use, so the cumulative-byte
+/// aggregate covers the whole heap the VM builds, not just the string/bytes
+/// payloads. Two always-on permanent floors back this independently of the
+/// caller's limits: `MAX_PICKLE_WORKING_SET` (total VM heap) bounds
+/// value-stack and memo-replay amplification (`N`-floods, `BINGET` replay of a
+/// large memoised subtree), and `MAX_PICKLE_VM_DEPTH` (construction nesting
+/// depth) prevents an over-deep value whose recursive `Drop` would overflow
+/// the stack. The `MAX_PKL_SIZE` opcode-stream cap bounds the *stream*; these
+/// caps bound the *heap each opcode produces* — which the stream cap alone
+/// does not.
 ///
 /// # Errors
 ///
@@ -2810,26 +3098,31 @@ mod tests {
         );
     }
 
-    /// Phase 6.8 Step 2: the aggregate `max_total_bytes` rejects a pickle whose
-    /// individual payloads each pass `max_single_alloc` but whose cumulative
-    /// owned-clone heap crosses the budget.
+    /// Phase 6.8 Step 2 + Phase 6.11: the aggregate `max_total_bytes` rejects a
+    /// pickle whose individual payloads each pass `max_single_alloc` but whose
+    /// cumulative working-set heap crosses the budget. Since Phase 6.11 the
+    /// charge is the full per-value working set — the enum slot
+    /// (`size_of::<PickleValue>()`) plus the owned `String`/`Bytes` payload —
+    /// not the raw payload alone, so two 3-byte strings cost
+    /// `2 × (size_of::<PickleValue>() + 3)`.
     #[test]
     fn pth_aggregate_budget() {
-        // PROTO 2, BINUNICODE "abc" (3), BINUNICODE "def" (3), STOP — 6 bytes
-        // of owned String payloads, each well under any per-item cap.
+        // PROTO 2, BINUNICODE "abc" (3), BINUNICODE "def" (3), STOP.
         let pkl: &[u8] = &[
             0x80, 0x02, b'X', 0x03, 0x00, 0x00, 0x00, b'a', b'b', b'c', b'X', 0x03, 0x00, 0x00,
             0x00, b'd', b'e', b'f', b'.',
         ];
-        // 5-byte aggregate budget < 3 + 3 → the second payload crosses it.
-        let tight = ParseLimits::default().with_max_total_bytes(5);
+        // CAST: usize → u64, lossless widening
+        let value_cost = std::mem::size_of::<PickleValue>() as u64 + 3;
+        // A budget one byte short of both values rejects on the second push.
+        let tight = ParseLimits::default().with_max_total_bytes(2 * value_cost - 1);
         let err = PickleVm::new(pkl, &tight).execute().unwrap_err();
         assert!(
             matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
             "expected aggregate limit error, got: {err}"
         );
-        // A 6-byte budget exactly fits both payloads.
-        let fits = ParseLimits::default().with_max_total_bytes(6);
+        // A budget covering both values exactly fits.
+        let fits = ParseLimits::default().with_max_total_bytes(2 * value_cost);
         assert!(PickleVm::new(pkl, &fits).execute().is_ok());
     }
 
@@ -3037,6 +3330,83 @@ mod tests {
         let leaf = PickleValue::Int(0);
         let result = unwrap_to_rebuild(&leaf, MAX_PICKLE_NESTING + 1);
         assert!(result.is_none(), "should reject nesting beyond limit");
+    }
+
+    // -- Phase 6.11: pickle-VM working-set governance ------------------------
+
+    /// Vector (c): an over-deep `BINPERSID` (`Q`) chain is rejected at
+    /// construction by the permanent [`MAX_PICKLE_VM_DEPTH`] floor — under
+    /// *unbounded* caller limits — so a value whose recursive `Drop` would
+    /// overflow the stack never forms. The input is a few hundred bytes; no
+    /// large allocation occurs.
+    #[test]
+    fn vm_rejects_overdeep_persid_chain() {
+        // PROTO 2, BININT1 0, then one BINPERSID per byte (each +1 depth).
+        let mut pkl = vec![0x80, 0x02, b'K', 0x00];
+        pkl.resize(pkl.len() + MAX_PICKLE_VM_DEPTH as usize + 8, b'Q');
+        pkl.push(b'.'); // STOP (unreached — the cap trips mid-stream)
+        let err = PickleVm::new(&pkl, &UNBOUNDED_LIMITS)
+            .execute()
+            .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("nesting depth")),
+            "expected depth-cap rejection, got: {err}"
+        );
+    }
+
+    /// Vector (a): a flood of `NONE` opcodes is now charged per value, so a
+    /// tight `max_total_bytes` rejects it after a handful of pushes — the
+    /// value-stack heap is budgeted, not free.
+    #[test]
+    fn vm_charges_none_flood() {
+        let mut pkl = vec![0x80, 0x02]; // PROTO 2
+        pkl.resize(pkl.len() + 64, b'N'); // 64 × NONE
+        pkl.push(b'.');
+        // Each NONE charges size_of::<PickleValue>() (dozens of bytes); a
+        // 200-byte aggregate budget cannot hold 64 of them.
+        let tight = ParseLimits::default().with_max_total_bytes(200);
+        let err = PickleVm::new(&pkl, &tight).execute().unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected working-set budget rejection, got: {err}"
+        );
+    }
+
+    /// Vector (b): memoised-subtree replay is charged the clone's deep heap, so
+    /// repeated `BINGET` of a list is bounded by `max_total_bytes` (the
+    /// construction fits; the clones do not).
+    #[test]
+    fn vm_charges_memo_replay() {
+        // PROTO 2, EMPTY_LIST, MARK, BININT1 1/2/3, APPENDS, BINPUT 0,
+        // then BINGET 0 × 16, STOP.
+        let mut pkl = vec![
+            0x80, 0x02, b']', b'(', b'K', 1, b'K', 2, b'K', 3, b'e', b'q', 0x00,
+        ];
+        for _ in 0..16 {
+            pkl.push(b'h'); // BINGET
+            pkl.push(0x00); // memo key 0
+        }
+        pkl.push(b'.');
+        let tight = ParseLimits::default().with_max_total_bytes(1500);
+        let err = PickleVm::new(&pkl, &tight).execute().unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            "expected memo-replay budget rejection, got: {err}"
+        );
+    }
+
+    /// The permanent [`MAX_PICKLE_WORKING_SET`] floor is enforced even under
+    /// unbounded caller limits — exercised on the accounting helper directly so
+    /// no real multi-hundred-MB allocation is needed.
+    #[test]
+    fn vm_permanent_working_set_floor() {
+        let mut vm = PickleVm::new(&[], &UNBOUNDED_LIMITS);
+        assert!(vm.charge(MAX_PICKLE_WORKING_SET, "test").is_ok());
+        let err = vm.charge(1, "test").unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("working set")),
+            "expected permanent working-set floor rejection, got: {err}"
+        );
     }
 
     // G28: copy_to_contiguous with transposed 2D tensor
