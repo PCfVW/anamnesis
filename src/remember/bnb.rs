@@ -220,6 +220,17 @@ pub fn dequantize_bnb4_to_bf16(
             reason: "BnB block_size must be > 0".into(),
         });
     }
+    // An odd block_size silently truncates `bytes_per_block = block_size / 2`,
+    // mis-aligning every block after the first and producing wrong (not
+    // out-of-bounds) output. Two nibbles pack into one byte, so a real BnB4
+    // block_size is always even (64 in practice).
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 block_size must be even (two nibbles per byte), got {block_size}"
+            ),
+        });
+    }
     let expected_weight_bytes = if total_elements.is_multiple_of(2) {
         Some(total_elements / 2)
     } else {
@@ -349,6 +360,15 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
     if block_size == 0 || nested_block_size == 0 {
         return Err(AnamnesisError::Parse {
             reason: "BnB block_size and nested_block_size must be > 0".into(),
+        });
+    }
+    // Odd block_size truncates `bytes_per_block = block_size / 2` → mis-aligned
+    // blocks → wrong output (see the plain-decode guard above).
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 block_size must be even (two nibbles per byte), got {block_size}"
+            ),
         });
     }
     if !total_elements.is_multiple_of(block_size) {
@@ -759,6 +779,15 @@ mod tests {
 
         // Wrong quant_map size
         assert!(dequantize_bnb4_to_bf16(&[0], &absmax_bytes, &[0; 32], 2, 2).is_err());
+
+        // Odd block_size truncates bytes_per_block → rejected with an
+        // even-ness message (fires before the weight/absmax checks).
+        let err =
+            dequantize_bnb4_to_bf16(&[0; 4], &absmax_bytes, &quant_map_bytes, 8, 3).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("even")),
+            "expected even-block_size rejection, got: {err}"
+        );
     }
 
     // --- Double-quant tests ---

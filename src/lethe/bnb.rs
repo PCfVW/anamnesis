@@ -434,6 +434,16 @@ pub fn encode_bnb4(
             reason: "BnB encode block_size must be > 0".into(),
         });
     }
+    // Odd block_size truncates `bytes_per_block = block_size / 2` in
+    // `encode_bnb4_core` → mis-aligned blocks → wrong packed output. Mirror of
+    // the decode-side guard in `remember::bnb`.
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 encode block_size must be even (two nibbles per byte), got {block_size}"
+            ),
+        });
+    }
     if !total_elements.is_multiple_of(2) {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -503,6 +513,16 @@ pub fn encode_bnb4_compute_absmax(
     if block_size == 0 {
         return Err(AnamnesisError::Parse {
             reason: "BnB encode block_size must be > 0".into(),
+        });
+    }
+    // Odd block_size truncates `bytes_per_block = block_size / 2` in
+    // `encode_bnb4_core` → mis-aligned blocks → wrong packed output. Mirror of
+    // the decode-side guard in `remember::bnb`.
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 encode block_size must be even (two nibbles per byte), got {block_size}"
+            ),
         });
     }
     if !total_elements.is_multiple_of(block_size) {
@@ -716,6 +736,16 @@ pub fn encode_bnb4_double_quant(
     if block_size == 0 {
         return Err(AnamnesisError::Parse {
             reason: "BnB encode block_size must be > 0".into(),
+        });
+    }
+    // Odd block_size truncates `bytes_per_block = block_size / 2` in
+    // `encode_bnb4_core` → mis-aligned blocks → wrong packed output. Mirror of
+    // the decode-side guard in `remember::bnb`.
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 encode block_size must be even (two nibbles per byte), got {block_size}"
+            ),
         });
     }
     if !total_elements.is_multiple_of(2) {
@@ -1220,6 +1250,12 @@ mod tests {
         assert!(encode_bnb4(&[0; 8], &absmax_bytes, &[0; 32], 4, 4).is_err());
         // odd total_elements
         assert!(encode_bnb4(&[0; 6], &absmax_bytes, &cb_bytes, 3, 3).is_err());
+        // odd block_size — rejected with an even-ness message
+        let err = encode_bnb4(&[0; 4], &absmax_bytes, &cb_bytes, 8, 3).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("even")),
+            "expected even-block_size rejection, got: {err}"
+        );
     }
 
     // --- encode_bnb4_double_quant ---
