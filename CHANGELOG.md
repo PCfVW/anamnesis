@@ -26,10 +26,15 @@ internal, not tracked in the repo).
   - charges each pushed value's heap (enum slot + owned payload) and the deep
     size of every memo clone to a permanent `MAX_PICKLE_WORKING_SET` floor
     (512 MiB) **and** the caller's `ParseLimits::max_total_bytes`, bounding the
-    stack-flood and memo-replay amplification vectors; and
+    stack-flood and memo-replay amplification vectors (CWE-1325, improperly
+    controlled sequential memory allocation); and
   - caps construction nesting depth at a permanent `MAX_PICKLE_VM_DEPTH` (256),
     so an over-deep value never forms and recursive `Drop` (and every recursive
-    walk) stays shallow.
+    walk) stays shallow (CWE-674, uncontrolled recursion).
+
+  Those two weaknesses fall under the CWE-770 / CWE-400 umbrella the
+  header-allocation caps (v0.6.1–v0.6.3) already address, but the amplification
+  and recursion shapes are distinct from a single oversized-field allocation.
 
   Both floors are always-on (enforced even under `ParseLimits::default()`), in
   `O(1)` per opcode (a parallel depth/size metadata stack — a per-push deep
