@@ -29,7 +29,7 @@
 - [GGUF Inspection](#gguf-inspection)
 - [PyTorch `.pth` Parsing](#pytorch-pth-parsing)
 - [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
-- [Parser robustness (Phases 6.6–6.8, v0.6.1–v0.6.3)](#parser-robustness-phases-6668-v061v063)
+- [Parser robustness (untrusted-input hardening)](#parser-robustness-untrusted-input-hardening)
 - [Performance validation (Phase 6.5)](#performance-validation-phase-65)
 - [Used by](#used-by)
 - [License](#license)
@@ -147,7 +147,7 @@ built-in cap and are pure caller-supplied bounds. The inspection totals
 pre-filter — they omit per-entry header overhead — so they are for the early
 reject; `parse_*_with_limits` is the authoritative enforcement.
 
-See also [Parser robustness](#parser-robustness-phases-6668-v061v063) for the
+See also [Parser robustness](#parser-robustness-untrusted-input-hardening) for the
 underlying per-format caps.
 
 ## Tested Models
@@ -332,13 +332,15 @@ PyTorch has no separate inspect-only primitive — `torch.load(weights_only=True
 
 `Read + Seek` (not just `Read`) is required because the ZIP format keeps its central directory at the end of the file, then seeks back to each local-file header to read entry payloads. `zip::ZipArchive::new` already requires `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits the constraint verbatim. The pickle interpreter itself runs over an owned `Vec<u8>` (the materialised `data.pkl`) — same security allowlist as the path-based `parse_pth`, shared by construction so the two entry points cannot diverge. Anamnesis itself takes on no network or TLS dependency; downstream crates plug in their own adapter when remote inspection is needed. See the rustdoc on `inspect_pth_from_reader` for the full access pattern.
 
-### Parser robustness (Phases 6.6–6.8, v0.6.1–v0.6.3)
+### Parser robustness (untrusted-input hardening)
 
 Every parser bounds its header-derived allocations against the [`candle #3533`](https://github.com/huggingface/candle/issues/3533) unguarded-allocation DoS class (CWE-770 / CWE-1284 / CWE-400): a length / count / dimension field read from a file header is validated against an explicit cap *before* it reaches `vec!` / `Vec::with_capacity` / the pickle VM. GGUF and safetensors were already capped; v0.6.1 closes the NPZ `header_len` window (NPY v2/v3 decode it as a `u32`, reachable to 4 GiB) and the PyTorch `.pth` mmap-path `data.pkl` size gate (previously bounded only by file size), and adds NPZ array-byte and per-opcode pickle payload caps as defence in depth. Malformed or malicious inputs fail fast with a clear `AnamnesisError::Parse`; legitimate files are unaffected, and there is no API change. This matters because remote header inspection over an `HTTP`-range adapter parses bytes from arbitrary, untrusted repositories.
 
 **v0.6.2** follows up with a full pre-Phase-7 security audit (all four parsers plus the dequant/encode layers) and adds a *container-size cross-check* — a third defence beyond constant caps and checked arithmetic. NPZ rejects a declared array size larger than the ZIP entry's own uncompressed `size()` before allocating, and the GGUF reader validates each variable-length read against the bytes physically remaining before allocating, so a tiny file can no longer drive an eager allocation up to a type cap. A shared checked shape-product helper removes a debug-panic / release-wrap on adversarial shapes. Backing the audit is a coverage-guided [`cargo fuzz`](fuzz/README.md) harness — one libFuzzer target per parser, dev-only and excluded from the published crate, focused on the pickle VM (the deepest state machine) — run with zero crashes across the parser surface.
 
 **v0.6.3** makes those fixed, server-scale caps *caller-configurable* (Phase 6.8). A new `ParseLimits` budget — `max_single_alloc`, `max_total_bytes` (the cumulative-heap aggregate), `max_item_count`, and `max_decompression_ratio` (the `DEFLATE` zip-bomb cap) — threads through every parser via `parse_*_with_limits`, enforced fail-fast and tighten-only, so a memory-constrained edge board or per-slot MLaaS worker can tighten the parser to *its* environment; `ParseLimits::default()` is unbounded, so default behaviour is byte-for-byte unchanged. The recommended **inspect → check policy → parse-under-limits** recipe is documented under [Parsing untrusted input](#parsing-untrusted-input), and the `cargo fuzz` harness gains targets that co-explore malformed files against tightened limits, exercising the enforcement branches with zero crashes. v0.6.3 also drops the unused `zopfli` DEFLATE *compressor* from the dependency tree (`zip` set to inflate-only).
+
+**v0.6.6** governs the `.pth` pickle VM's *working set* (Phase 6.11), closing a P0 an independent audit surfaced after v0.6.3. The earlier caps bounded the `data.pkl` opcode-stream length and individual string/bytes payloads, but the VM's **value stack, memoised clones, and nesting depth were charged to nothing** — so a small crafted pickle could amplify into multi-GiB heap (a `NONE`-flood, or `BINGET` replay of a large memoised subtree) or a recursive-`Drop` stack overflow, aborting the process (the crate builds `panic = "abort"`) even on the cheap `inspect_pth_from_reader` pre-filter the recipe above recommends for untrusted input. Every value-creating opcode now flows through one `O(1)`-per-opcode accounting choke point: each pushed value and the deep size of each memo clone is charged to a permanent **512 MiB working-set floor** *and* the caller's `max_total_bytes`, and construction nesting is capped at a permanent **depth of 256** so an over-deep value never forms (recursive `Drop` and every recursive walk stay shallow). Both floors are always-on — they bite even under `ParseLimits::default()` — and the accounting is `O(1)` per opcode by design (a per-push deep walk would itself be an `O(n²)` CPU-DoS). A 385k-run RSS-limited `fuzz_pth` campaign runs clean. The same audit prompted a bundled defence-in-depth fix: BnB4 dequant/encode now reject an odd `block_size` (which truncated `bytes_per_block = block_size / 2` into mis-aligned output). No API change; honest files are unaffected.
 
 ### Performance validation (Phase 6.5)
 
@@ -351,6 +353,7 @@ Three dev-only validation tracks ship alongside v0.6.0 — none of them affect t
 ## Used by
 
 - [candle-mi](https://github.com/PCfVW/candle-mi) — Mechanistic interpretability toolkit for language models
+- [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) — Download, inspect, and compare HuggingFace models from Rust; uses anamnesis to parse cached tensor-file metadata (`.safetensors` / GGUF / NPZ / PyTorch `.pth`) for `hf-fm inspect --cached`
 
 ## License
 

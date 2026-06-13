@@ -14,6 +14,7 @@ docs/dogfooding-feedbacks/
 
 # External audit reports (private, not published)
 docs/EXTERNAL AUDIT/
+docs/security-audit-*.md
 
 # Investigation folders (large binary artifacts from format spelunking)
 docs/investigations/
