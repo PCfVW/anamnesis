@@ -55,7 +55,7 @@ fn build_safetensors(tensors: &[(&str, safetensors::Dtype, Vec<usize>, Vec<u8>)]
             (*name, view)
         })
         .collect();
-    safetensors::tensor::serialize(views, &None).unwrap()
+    safetensors::tensor::serialize(views, None).unwrap()
 }
 
 /// Write `bytes` to a uniquely named temp file and return its path.

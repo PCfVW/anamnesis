@@ -195,6 +195,21 @@ impl TryFrom<safetensors::Dtype> for Dtype {
             safetensors::Dtype::I32 => Ok(Self::I32),
             safetensors::Dtype::U64 => Ok(Self::U64),
             safetensors::Dtype::I64 => Ok(Self::I64),
+            // safetensors 0.8 added sub-8-bit floats (`F4`/`F6_*`), the MXFP8
+            // block scale (`F8_E8M0`), the fp8 "fnuz" variants, and `C64`
+            // (complex64). anamnesis has no dequant path for any of these, so
+            // reject them explicitly (Rule 7: exhaustive matching) rather than
+            // letting the future-proofing wildcard below absorb known variants.
+            safetensors::Dtype::F4
+            | safetensors::Dtype::F6_E2M3
+            | safetensors::Dtype::F6_E3M2
+            | safetensors::Dtype::F8_E8M0
+            | safetensors::Dtype::F8_E4M3FNUZ
+            | safetensors::Dtype::F8_E5M2FNUZ
+            | safetensors::Dtype::C64 => Err(AnamnesisError::Unsupported {
+                format: "safetensors".into(),
+                detail: format!("unsupported safetensors dtype {st:?}"),
+            }),
             // safetensors::Dtype is #[non_exhaustive]; handle future additions.
             unknown => Err(AnamnesisError::Unsupported {
                 format: "safetensors".into(),
@@ -1534,7 +1549,7 @@ mod tests {
             safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2], &data)
                 .unwrap_or_else(|e| panic!("failed to create TensorView: {e}")),
         )];
-        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+        let buffer = serialize(tensors, None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
         let header = parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("parse: {e}"));
 
@@ -1558,7 +1573,7 @@ mod tests {
             TensorView::new(safetensors::Dtype::BF16, vec![2], &data)
                 .unwrap_or_else(|e| panic!("TensorView: {e}")),
         )];
-        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+        let buffer = serialize(tensors, None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
         // Default (unbounded) parses on both the slice and reader paths.
         assert!(parse_safetensors_header_with_limits(&buffer, &ParseLimits::default()).is_ok());
@@ -1638,7 +1653,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("scale TensorView: {e}")),
             ),
         ];
-        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+        let buffer = serialize(tensors, None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
         let header = parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("parse: {e}"));
 
@@ -1674,7 +1689,7 @@ mod tests {
             TensorView::new(safetensors::Dtype::BF16, vec![2], &data)
                 .unwrap_or_else(|e| panic!("TensorView: {e}")),
         )];
-        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+        let buffer = serialize(tensors, None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
         let slice_header =
             parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("slice parse: {e}"));
@@ -1721,7 +1736,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("scale TensorView: {e}")),
             ),
         ];
-        let buffer = serialize(tensors, &None).unwrap_or_else(|e| panic!("serialize: {e}"));
+        let buffer = serialize(tensors, None).unwrap_or_else(|e| panic!("serialize: {e}"));
 
         let slice_header =
             parse_safetensors_header(&buffer).unwrap_or_else(|e| panic!("slice parse: {e}"));

@@ -947,7 +947,7 @@ impl ParsedModel {
         // a time, so the file path's peak stays at the dequantised set — unlike
         // `remember_to_bytes`, which holds the whole serialized `Vec`.
         let metadata = self.header.metadata.clone();
-        safetensors::tensor::serialize_to_file(views, &metadata, output_path).map_err(
+        safetensors::tensor::serialize_to_file(views, metadata, output_path).map_err(
             // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
             // we extract IoError and treat everything else as a parse/format error.
             #[allow(clippy::wildcard_enum_match_arm)]
@@ -968,7 +968,7 @@ impl ParsedModel {
         let views = self.build_views(&dequantized_data, &passthrough_refs)?;
 
         let metadata = self.header.metadata.clone();
-        safetensors::tensor::serialize(views, &metadata).map_err(|e| AnamnesisError::Parse {
+        safetensors::tensor::serialize(views, metadata).map_err(|e| AnamnesisError::Parse {
             reason: format!("failed to serialize safetensors bytes: {e}"),
         })
     }
@@ -1106,7 +1106,7 @@ mod tests {
                 (*name, view)
             })
             .collect();
-        safetensors::tensor::serialize(views, &None).unwrap()
+        safetensors::tensor::serialize(views, None).unwrap()
     }
 
     #[test]

@@ -273,7 +273,7 @@ pub fn write_bnb_nf4_safetensors_bytes(inputs: &[BnbWriteInput<'_>]) -> crate::R
 
     // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
     #[allow(clippy::wildcard_enum_match_arm)]
-    safetensors::tensor::serialize(views, &None).map_err(|e| AnamnesisError::Parse {
+    safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
         reason: format!("failed to serialize BnB-NF4 safetensors: {e}"),
     })
 }

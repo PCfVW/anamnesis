@@ -166,12 +166,16 @@ fn roundtrip_to_safetensors(pth_name: &str, json_name: &str) {
     let parsed = parse_pth(&pth_path).unwrap();
     let tensors = parsed.tensors().unwrap();
 
-    // Write to a temporary .safetensors file.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    anamnesis::pth_to_safetensors(&tensors, tmp.path()).unwrap();
+    // Write to a temporary .safetensors file. Use a TempDir + fresh path
+    // rather than NamedTempFile.path(): safetensors' `serialize_to_file` opens
+    // the path itself, which on Windows collides with the handle a
+    // NamedTempFile keeps open on the same file.
+    let dir = tempfile::tempdir().unwrap();
+    let st_path = dir.path().join("out.safetensors");
+    anamnesis::pth_to_safetensors(&tensors, &st_path).unwrap();
 
     // Read the .safetensors back.
-    let st_data = std::fs::read(tmp.path()).unwrap();
+    let st_data = std::fs::read(&st_path).unwrap();
     let st = safetensors::SafeTensors::deserialize(&st_data).unwrap();
 
     // Compare against Python reference.

@@ -73,7 +73,7 @@ fn build_safetensors_bf16(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
             (*name, view)
         })
         .collect();
-    safetensors::tensor::serialize(views, &None).unwrap()
+    safetensors::tensor::serialize(views, None).unwrap()
 }
 
 /// Builds an in-memory mixed-dtype safetensors file. Each tuple is
@@ -86,7 +86,7 @@ fn build_safetensors_mixed(tensors: &[(&str, safetensors::Dtype, &[usize], &[u8]
             (*name, view)
         })
         .collect();
-    safetensors::tensor::serialize(views, &None).unwrap()
+    safetensors::tensor::serialize(views, None).unwrap()
 }
 
 fn write_temp(bytes: &[u8], ext: &str) -> (tempfile::TempDir, PathBuf) {

@@ -111,7 +111,7 @@ fn build_safetensors_fixture() -> (tempfile::TempDir, PathBuf) {
                 .expect("build tensor view");
         views.push((name.clone(), view));
     }
-    safetensors::tensor::serialize_to_file(views, &None, &path)
+    safetensors::tensor::serialize_to_file(views, None, &path)
         .expect("serialize safetensors fixture");
     (dir, path)
 }

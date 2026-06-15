@@ -779,7 +779,7 @@ fn run_remember_gguf(
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-    safetensors::tensor::serialize_to_file(views, &None, output_path.as_ref()).map_err(
+    safetensors::tensor::serialize_to_file(views, None, output_path.as_ref()).map_err(
         // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
         #[allow(clippy::wildcard_enum_match_arm)]
         |e| match e {

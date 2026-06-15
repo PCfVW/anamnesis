@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Bumped the `safetensors` dependency from `0.4` to `0.8`** (latest at
+  0.8.0, 2026-06-09). anamnesis uses `safetensors` only as the output writer
+  (and a test-side reader) — production header parsing is anamnesis's own
+  `parse::safetensors` — so the surface is small. Three upstream changes were
+  accommodated:
+  - **Metadata is now passed by value.** `serialize` / `serialize_to_file`
+    take `Option<HashMap<String, String>>` instead of `&Option<…>` (since
+    0.5), letting the writer move the map straight into the output header
+    rather than cloning it. All call sites updated (`&None` → `None`,
+    `&metadata` → `metadata`); the `remember_to_bytes` path now hands its
+    metadata clone to the writer by value instead of cloning it a second time.
+  - **New `Dtype` variants** (`F4`, `F6_E2M3`, `F6_E3M2`, `F8_E8M0`, the fp8
+    `*FNUZ` variants, `C64`). `TryFrom<safetensors::Dtype> for Dtype` now
+    rejects them explicitly with `AnamnesisError::Unsupported` — anamnesis has
+    no dequant path for sub-8-bit floats / fp8-fnuz / complex64 yet — keeping
+    the match exhaustive (the future-proofing wildcard no longer absorbs known
+    variants).
+  - **`SafeTensors::names()` now returns `Vec<&str>`** (was `Vec<&String>`); a
+    test helper dropped its now-redundant `String::as_str` map.
+
+  No public API or behaviour change for supported dtypes; output `.safetensors`
+  bytes are unchanged. A Windows-only test adjustment came with the bump:
+  safetensors' `serialize_to_file` opens the destination path itself, which
+  collides with the open handle a `NamedTempFile` keeps on the same file, so
+  the three tests that wrote through a temp **file** now write into a temp
+  **dir** + fresh path.
+
 ## [0.6.7] - 2026-06-15
 
 Phase 6.12 — vendored ZIP container reader. Replaces `zip::ZipArchive` (the

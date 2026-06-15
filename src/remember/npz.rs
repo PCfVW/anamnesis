@@ -95,7 +95,7 @@ pub fn npz_to_safetensors<S: BuildHasher>(
         views.push(((*name).to_owned(), view));
     }
 
-    safetensors::tensor::serialize_to_file(views, &None, output.as_ref()).map_err(
+    safetensors::tensor::serialize_to_file(views, None, output.as_ref()).map_err(
         // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
         // we extract IoError and treat everything else as a parse/format error.
         #[allow(clippy::wildcard_enum_match_arm)]
@@ -153,7 +153,7 @@ pub fn npz_to_safetensors_bytes<S: BuildHasher>(
 
     // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
     #[allow(clippy::wildcard_enum_match_arm)]
-    safetensors::tensor::serialize(views, &None).map_err(|e| AnamnesisError::Parse {
+    safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
         reason: format!("failed to serialize safetensors: {e}"),
     })
 }

@@ -54,7 +54,7 @@ pub fn pth_to_safetensors(
         views.push((tensor.name.clone(), view));
     }
 
-    safetensors::tensor::serialize_to_file(views, &None, output.as_ref()).map_err(
+    safetensors::tensor::serialize_to_file(views, None, output.as_ref()).map_err(
         // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
         // we extract IoError and treat everything else as a parse/format error.
         #[allow(clippy::wildcard_enum_match_arm)]
@@ -108,7 +108,7 @@ pub fn pth_to_safetensors_bytes(tensors: &[PthTensor<'_>]) -> crate::Result<Vec<
 
     // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
     #[allow(clippy::wildcard_enum_match_arm)]
-    safetensors::tensor::serialize(views, &None).map_err(|e| AnamnesisError::Parse {
+    safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
         reason: format!("failed to serialize safetensors: {e}"),
     })
 }
@@ -147,11 +147,15 @@ mod tests {
             },
         ];
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        pth_to_safetensors(&tensors, tmp.path()).unwrap();
+        // Use a TempDir + fresh path (not NamedTempFile.path()): safetensors'
+        // `serialize_to_file` opens/maps the path itself, and on Windows that
+        // collides with the open handle a NamedTempFile keeps on the same file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.safetensors");
+        pth_to_safetensors(&tensors, &path).unwrap();
 
         // Read back with safetensors crate and verify.
-        let data = std::fs::read(tmp.path()).unwrap();
+        let data = std::fs::read(&path).unwrap();
         let st = safetensors::SafeTensors::deserialize(&data).unwrap();
 
         assert_eq!(st.len(), 2);
@@ -170,10 +174,11 @@ mod tests {
     #[test]
     fn empty_tensors() {
         let tensors: Vec<PthTensor<'_>> = vec![];
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        pth_to_safetensors(&tensors, tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.safetensors");
+        pth_to_safetensors(&tensors, &path).unwrap();
 
-        let data = std::fs::read(tmp.path()).unwrap();
+        let data = std::fs::read(&path).unwrap();
         let st = safetensors::SafeTensors::deserialize(&data).unwrap();
         assert_eq!(st.len(), 0);
     }

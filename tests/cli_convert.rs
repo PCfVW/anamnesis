@@ -59,7 +59,7 @@ fn build_safetensors_bf16(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
             (*name, view)
         })
         .collect();
-    safetensors::tensor::serialize(views, &None).unwrap()
+    safetensors::tensor::serialize(views, None).unwrap()
 }
 
 /// Builds a tiny F32 NPZ archive in-memory.
@@ -157,7 +157,7 @@ fn convert_npz_to_safetensors_smokes() {
     // Re-parse the safetensors output and confirm both tensors landed.
     let bytes = std::fs::read(&out_path).unwrap();
     let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
-    let mut names: Vec<&str> = parsed.names().into_iter().map(String::as_str).collect();
+    let mut names: Vec<&str> = parsed.names();
     names.sort_unstable();
     assert_eq!(names, vec!["b", "w"]);
 }
