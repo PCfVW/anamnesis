@@ -1,6 +1,6 @@
 [package]
 name = "anamnesis"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2021"
 rust-version = "1.88"
 description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ/BnB dequantization, NPZ parsing, and PyTorch .pth conversion for Rust"
@@ -98,6 +98,12 @@ tempfile = "3"
 # is checked against (`fuzz_zip` + the in-crate `differential_*` tests). Same
 # inflate-only feature set the runtime dep carried (no `zopfli` compressor).
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
+# The runtime `flate2` dependency above is `optional` (off unless `npz`/`pth`)
+# and pins `default-features = false`, which suppresses flate2's backend. When a
+# default-feature `--all-targets` test build pulls `flate2` via the `zip`
+# dev-dependency, that suppression would leave it backend-less, so re-assert the
+# pure-Rust `rust_backend` (miniz_oxide) here for the test/bench build.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # Phase 6.5: dequantisation throughput benchmarks (decode side).
 # Will gain `benches/encode.rs` at Phase 7.5 when the encode kernels
