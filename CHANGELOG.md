@@ -56,6 +56,24 @@ unreachable through `zip`'s API and unbounded by `ParseLimits`).
   ~12×, but the `zip` crate measures 337 B/entry on short entry names, not the
   estimated ~500, so ~8× is the real ceiling.)
 
+### Security
+
+- **Bounded `DEFLATE` inflation on the `.pth` reader path.** A self-review of
+  the new `.pth` reader path (`inspect_pth_from_reader`) found that
+  `read_pth_entry_bytes` read a `DEFLATE`-compressed `data.pkl` / `byteorder`
+  entry with `read_to_end`, which expands the entire compressed stream
+  regardless of the declared `uncompressed_size` — a few-KiB entry could inflate
+  to gigabytes (a zip bomb, [CWE-409](https://cwe.mitre.org/data/definitions/409.html)
+  / the [CWE-400](https://cwe.mitre.org/data/definitions/400.html) umbrella), and
+  the `Vec::with_capacity(uncompressed_size)` could eagerly commit up to the
+  100 MiB `MAX_PKL_SIZE` from a tiny file that merely *declares* that size. The
+  read is now bounded with `Read::take(uncompressed_size)` (the caller already
+  caps that value) and grows the buffer lazily, so neither the inflation nor the
+  allocation can exceed the declared, capped size. `STORED` entries and honest
+  `DEFLATE` entries are unaffected (real `.pth` `data.pkl` is `STORED`); the
+  `.npz` path was already bounded (it reads an exact, cross-checked array length,
+  never `read_to_end`).
+
 ## [0.6.6] - 2026-06-13
 
 Phase 6.11 — pickle-VM working-set governance. Closes a P0 DoS an independent

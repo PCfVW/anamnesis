@@ -2577,31 +2577,34 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
     Ok((big_endian, pkl_bytes))
 }
 
-/// Reads a `.pth` ZIP entry's full contents into a `Vec`, inflating `DEFLATE`
+/// Reads a `.pth` ZIP entry's contents into a `Vec`, inflating `DEFLATE`
 /// entries on the fly (the codec stays in this consumer; the vendored container
 /// reader returns the raw bytes).
 ///
-/// The caller has already bounded the entry's declared size (the `MAX_PKL_SIZE`
-/// / `MAX_BYTEORDER_SIZE` caps), so the `with_capacity` hint is bounded.
+/// The read is bounded to the entry's declared `uncompressed_size`, which the
+/// caller has already capped (`MAX_PKL_SIZE` / `MAX_BYTEORDER_SIZE`). This is a
+/// **zip-bomb guard**: an unbounded `read_to_end` on a `DEFLATE` decoder would
+/// expand the entire compressed stream regardless of the declared size, so a
+/// few-KiB entry could inflate to gigabytes. `Read::take` caps both the bytes
+/// buffered and the inflation work; the `Vec` grows as bytes arrive, so a tiny
+/// file that merely *declares* a 100 `MiB` size cannot drive a 100 `MiB` eager
+/// allocation either.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Unsupported`] if the entry uses a compression
 /// method other than `STORED` or `DEFLATE`, [`AnamnesisError::Parse`] if the
-/// declared size overflows `usize` or the local header is malformed, or
-/// [`AnamnesisError::Io`] if a read fails.
+/// local header is malformed, or [`AnamnesisError::Io`] if a read fails.
 fn read_pth_entry_bytes<R: Read + Seek>(
     src: &mut crate::parse::zip::ReaderSource<R>,
     entry: &crate::parse::zip::ZipEntry,
 ) -> crate::Result<Vec<u8>> {
-    let cap = usize::try_from(entry.uncompressed_size).map_err(|_| AnamnesisError::Parse {
-        reason: format!("ZIP entry `{}`: declared size overflows usize", entry.name),
-    })?;
+    // Already capped by the caller (`enforce_pkl_size_cap` / the byteorder cap).
+    let limit = entry.uncompressed_size;
     let raw = src.entry_data_reader(entry)?;
-    let mut buf = Vec::with_capacity(cap);
     // TRAIT_OBJECT: STORED vs DEFLATE entry readers differ in concrete type; a
-    // boxed `dyn Read` unifies them for the full-entry read.
-    let mut reader: Box<dyn Read + '_> = match entry.method {
+    // boxed `dyn Read` unifies them for the bounded full-entry read.
+    let reader: Box<dyn Read + '_> = match entry.method {
         crate::parse::zip::Compression::Stored => Box::new(raw),
         crate::parse::zip::Compression::Deflate => Box::new(flate2::read::DeflateDecoder::new(raw)),
         crate::parse::zip::Compression::Unsupported(method) => {
@@ -2614,7 +2617,13 @@ fn read_pth_entry_bytes<R: Read + Seek>(
             });
         }
     };
-    reader.read_to_end(&mut buf).map_err(AnamnesisError::Io)?;
+    // Grows as bytes arrive, bounded by `take` — never an eager declared-size
+    // allocation, never an unbounded inflation.
+    let mut buf = Vec::new();
+    reader
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(AnamnesisError::Io)?;
     Ok(buf)
 }
 
@@ -3859,6 +3868,27 @@ mod tests {
             msg.contains("data.pkl") && msg.contains("not found"),
             "expected `data.pkl not found`, got: {msg}"
         );
+    }
+
+    /// A `DEFLATE`-compressed `data.pkl` still parses through the reader path:
+    /// the zip-bomb guard in `read_pth_entry_bytes` bounds the inflation to the
+    /// declared `uncompressed_size`, which for an honest entry equals the real
+    /// size, so the full pickle is recovered (`take` must not truncate it).
+    #[test]
+    fn inspect_from_reader_accepts_deflate_data_pkl() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            // PROTO 2, EMPTY_DICT, STOP — a valid empty state_dict.
+            zip.write_all(&[0x80, 0x02, b'}', b'.']).unwrap();
+            zip.finish().unwrap();
+        }
+        let info = inspect_pth_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(info.tensor_count, 0);
     }
 
     /// The reader-generic path strips the archive prefix the same way as
