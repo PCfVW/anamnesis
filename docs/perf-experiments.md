@@ -35,6 +35,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 5 | `inspect_gguf_from_reader`: internal `BufReader<R>` | **~52× faster on `File` substrate, mmap parity** | Shipped |
 | 6 | `inspect_pth_from_reader` vs `parse_pth(path).inspect()` vs `torch.load` | **Reader 1.36× mmap median across 6 960 AlgZoo files; mmap 4.07× / reader 2.99× faster than `torch.load`** | Shipped |
 | 7 | Sign-of-zero preservation rule (`BnB FP4` decode tweak) — *correctness experiment* | **"Impossible" was conditional, not absolute** — narrow tweak recovers byte-exact round-trip on 0.2 % of FP4 elements with no NF4/INT8 side-effect | Shipped commits `a5c452d` / `24cba42` / `ab4e735` (v0.5.0) |
+| 8 | Vendored `ZIP` reader: container-metadata footprint vs `zip::ZipArchive::new` | **337 → 41 B/entry resident, 8.07×** (3.12× peak) on a 50 001-entry archive — projected ~12×, ceiling was ~8.4× | Shipped (v0.6.7, Phase 6.12) |
 
 ---
 
@@ -686,3 +687,64 @@ The downstream cost of dropping the constraint is bounded:
 **Cross-reference:** The full design discussion that led to this rule is summarised in [`ROADMAP.md`](../ROADMAP.md)'s Phase 5 "Boundary-pushing finding (sign-of-zero preservation)" paragraph and in commit `a5c452d`'s commit-message body.
 
 **Template for future encode-side correctness findings:** when adding a new encode kernel family in Phase 7.5 (FP8, GGUF legacy/K/IQ/TQ/MXFP4), check whether the on-disk codebook has any collapsed-entry pairs of the form `codebook[i].to_bits() == codebook[j].to_bits()` for `i != j`. If so, the same template applies: (1) measure baseline round-trip error, (2) identify whether decode could disambiguate via some carrier the existing kernel ignores, (3) apply the narrowest possible decode + encode tweak pair, (4) verify on cross-architecture fixtures.
+
+---
+
+## Experiment 8 — Vendored `ZIP` reader: container-metadata footprint
+
+**Hypothesis (Phase 6.8 "reopened by measurement" → Phase 6.12).** `zip::ZipArchive::new`
+eagerly materialises the whole central directory into a fat per-entry
+`ZipFileData` record, estimated at **~500 B/entry (~5.7× the file)** for a
+many-tiny-entry archive, versus the **~40 B/entry** anamnesis needs (a
+`name → (offset, size)` index). Replacing it with a vendored, read-only
+central-directory reader was projected to cut resident container metadata
+**~12×** (500 → 40 B/entry).
+
+**Method.** `tests/peak_heap_zip_metadata.rs` (dev-only, `#[ignore]`), `dhat`
+global allocator, release build, on a 50 001-entry archive (50 000 tiny STORED
+`archive/data/N` entries + an empty-`state_dict` `data.pkl`). Both readers go
+through what they actually expose: the vendored reader via the public
+`parse_pth` (mmap path, empty pickle so the pickle VM contributes ~nothing),
+the `zip` crate via `ZipArchive::new`. `dhat` tracks the global allocator, so
+the mmap'd file body is not counted — only container metadata heap.
+Run: `cargo test --release --features pth --test peak_heap_zip_metadata -- --ignored --nocapture`.
+
+**Result — Shipped (v0.6.7).**
+
+| Reader | Resident | B/entry | Peak |
+|---|---:|---:|---:|
+| `zip::ZipArchive::new` | 16 856 982 B | **337** | 27 257 038 B |
+| vendored `parse_pth` | 2 088 930 B | **41** | 8 745 004 B |
+| **reduction** | | **8.07×** | **3.12×** |
+
+The realised resident figure (41 B/entry) **hits the ~40 B/entry target**. The
+projected ~12× did not materialise for one measured reason: the `zip` crate
+costs **337 B/entry on these short entry names**, not the estimated ~500 (the
+fixed `ZipFileData` fields dominate and are lighter than assumed), so the
+ceiling here is `337 / 40 ≈ 8.4×` — and the vendored index sits at it.
+
+**Getting to the ceiling took two index-representation iterations** (each
+re-measured against the same fixture):
+
+| Index representation | Resident B/entry | Reduction |
+|---|---:|---:|
+| `HashMap<String, (usize, usize)>` (first cut) | 63 | 5.31× |
+| `Vec<(Box<str>, usize, usize)>`, sorted, binary-searched | 51 | 6.52× |
+| … + `shrink_to_fit` (reclaim push-growth slack) | **41** | **8.07×** |
+
+The `HashMap` lost to (a) its power-of-two bucket array (65 536 buckets for
+50 001 entries — ~31 % slack) and (b) `String`'s 8-byte capacity word per key.
+A sorted `Vec` of `Box<str>` keys removes both; `shrink_to_fit` after the
+build (the index is immutable thereafter) reclaims the `Vec`'s own
+push-growth over-allocation — that last step alone moved 51 → 41 B/entry.
+
+**Peak (3.12×) is unaffected by the later micro-optimisations** (it stays
+8 745 004 B): the global peak lands during `EntryIndex` construction
+(`Vec<ZipEntry>` + the sorted index coexisting), so the zero-copy
+central-directory borrow added on the mmap path lowers an earlier, non-dominant
+transient without moving the headline peak — a real allocation-pressure win the
+peak metric simply doesn't capture.
+
+**Re-attempting this requires:** N/A — success case. The `#[ignore]` test is a
+committed regression guard (it asserts a resident reduction); re-run it against
+the parent commit to reproduce the before/after.
