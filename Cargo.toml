@@ -31,8 +31,8 @@ cli = ["dep:clap"]
 gptq = []
 awq = []
 bnb = []
-npz = ["dep:zip", "dep:flate2"]
-pth = ["dep:zip", "dep:flate2"]
+npz = ["dep:flate2"]
+pth = ["dep:flate2"]
 gguf = []
 # Ollama model-cache path resolver — turns `ollama:llama3.2:1b` into
 # the local GGUF blob path by reading the Ollama manifest. Adds NO
@@ -50,15 +50,11 @@ indicatif = { version = "0.18", optional = true }
 # to avoid eagerly reading the full file into a `Vec<u8>` (`fs::read`).
 # See `docs/perf-experiments.md` entry on audit finding #2.
 memmap2 = "0.9"
-# Inflate-only DEFLATE: the umbrella `deflate` feature also pulls `zopfli` (a
-# DEFLATE *compressor*) plus `bumpalo`/`log` that this read-only consumer never
-# runs. `deflate-flate2` enables zip's inflate *code* but not zip's optional
-# `flate2` *dependency*; the implicit `flate2` feature flips the dep, and the
-# direct `flate2` below supplies the pure-Rust `miniz_oxide` backend via feature
-# unification — keeping inflate, dropping the compressor. (Phase 6.8 Step 4)
-zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"], optional = true }
-# Pure-Rust DEFLATE backend (`miniz_oxide`) for `zip`'s inflate path; only
-# pulled in when `zip` is (the `npz`/`pth` features enable both).
+# Pure-Rust DEFLATE inflate backend (`miniz_oxide`) for `.npz` DEFLATE entries.
+# Since Phase 6.12 the `.pth` / `.npz` container parsing is owned by the
+# vendored `src/parse/zip.rs` reader (the `zip` crate is dev-only now — see
+# `[dev-dependencies]`); `flate2` remains the runtime codec the vendored reader
+# delegates inflate to. Enabled by the `npz` / `pth` features.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -96,6 +92,12 @@ criterion = "0.5"
 # rationale + calibration tables.
 dhat = "0.3"
 tempfile = "3"
+# Phase 6.12: `zip` is dev-only now — the runtime container parsing is owned by
+# the vendored `src/parse/zip.rs` reader. The crate is retained here for the
+# `ZipWriter` test fixtures and as the differential oracle the vendored reader
+# is checked against (`fuzz_zip` + the in-crate `differential_*` tests). Same
+# inflate-only feature set the runtime dep carried (no `zopfli` compressor).
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 # Phase 6.5: dequantisation throughput benchmarks (decode side).
 # Will gain `benches/encode.rs` at Phase 7.5 when the encode kernels

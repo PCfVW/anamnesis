@@ -42,6 +42,19 @@ unreachable through `zip`'s API and unbounded by `ParseLimits`).
   bytes and the consumer wraps them in the decoder, so the codec surface is
   unchanged. `.npy` entries with a non-`STORED`/`DEFLATE` method now fail fast
   with `AnamnesisError::Unsupported`.
+- **`zip` is no longer a runtime dependency** (Step 3) — moved to
+  `[dev-dependencies]` (kept for `ZipWriter` test fixtures + the differential
+  oracle). The `npz` / `pth` features now pull only `flate2` (the inflate
+  codec). The dead `From<zip::result::ZipError>` bridge is removed.
+- **`.pth` entry index is now a sorted, trimmed `Vec<(Box<str>, …)>`**
+  (binary-searched) instead of a `HashMap<String, …>`, removing the hash
+  table's power-of-two bucket slack and `String`'s capacity word. Measured on a
+  50 001-entry archive (`tests/peak_heap_zip_metadata.rs`, `dhat`): resident
+  container metadata drops from **337 B/entry** (`zip` crate) to **41 B/entry**
+  (vendored `parse_pth`) — an **8.07× resident reduction** (3.12× on peak),
+  hitting the Phase 6.8 analysis's ~40 B/entry target. (That analysis projected
+  ~12×, but the `zip` crate measures 337 B/entry on short entry names, not the
+  estimated ~500, so ~8× is the real ceiling.)
 
 ## [0.6.6] - 2026-06-13
 

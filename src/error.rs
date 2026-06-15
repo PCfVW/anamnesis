@@ -33,14 +33,11 @@ impl From<safetensors::SafeTensorError> for AnamnesisError {
     }
 }
 
-#[cfg(any(feature = "npz", feature = "pth"))]
-impl From<zip::result::ZipError> for AnamnesisError {
-    fn from(e: zip::result::ZipError) -> Self {
-        Self::Parse {
-            reason: format!("failed to read ZIP archive: {e}"),
-        }
-    }
-}
+// Note: as of Phase 6.12 the `.pth` / `.npz` parsers no longer call the `zip`
+// crate at runtime (they use the vendored `crate::parse::zip` reader, which
+// returns `AnamnesisError` directly), so there is no `From<zip::result::ZipError>`
+// bridge. `zip` is a dev-dependency only (test fixtures + the differential
+// oracle).
 
 /// A convenience alias for `Result<T, AnamnesisError>`.
 pub type Result<T> = std::result::Result<T, AnamnesisError>;

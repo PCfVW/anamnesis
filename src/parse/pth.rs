@@ -308,9 +308,44 @@ pub struct ParsedPth {
     /// Per-tensor metadata (name, shape, dtype, storage location).
     meta: Vec<TensorMeta>,
     /// ZIP entry index: suffix → `(data_start, data_len)` in the mmap.
-    entry_index: HashMap<String, (usize, usize)>,
+    entry_index: EntryIndex,
     /// Whether the file uses big-endian storage.
     big_endian: bool,
+}
+
+/// Compact, sorted `suffix → (data_start, data_len)` index over a `.pth`
+/// archive's STORED entries.
+///
+/// A sorted `Vec` queried by binary search, rather than a `HashMap`: for a
+/// many-tiny-entry archive the hash table's power-of-two bucket array (≈31%
+/// slack at 50 000 entries) and `String`'s 8-byte capacity word per key
+/// dominate the resident metadata. The `Vec` is exact-sized and keys are
+/// `Box<str>` (no capacity word), roughly halving resident bytes/entry. The
+/// handful of lookups per parse (`data.pkl`, `byteorder`, one per tensor) are
+/// `O(log n)` — negligible.
+#[derive(Debug)]
+struct EntryIndex {
+    /// `(suffix, data_start, data_len)` triples, sorted ascending by `suffix`.
+    entries: Vec<(Box<str>, usize, usize)>,
+}
+
+impl EntryIndex {
+    /// Looks up an entry suffix, returning its `(data_start, data_len)`.
+    #[must_use]
+    fn get(&self, name: &str) -> Option<(usize, usize)> {
+        match self
+            .entries
+            .binary_search_by(|(key, _, _)| key.as_ref().cmp(name))
+        {
+            // INDEX: `binary_search_by` returns an in-bounds index on `Ok`.
+            #[allow(clippy::indexing_slicing)]
+            Ok(idx) => {
+                let (_, start, len) = self.entries[idx];
+                Some((start, len))
+            }
+            Err(_) => None,
+        }
+    }
 }
 
 impl ParsedPth {
@@ -337,7 +372,7 @@ impl ParsedPth {
         let mut tensors = Vec::with_capacity(self.meta.len());
         for m in &self.meta {
             let storage_suffix = format!("data/{}", m.storage_key);
-            let &(storage_start, storage_len) = self
+            let (storage_start, storage_len) = self
                 .entry_index
                 .get(storage_suffix.as_str())
                 .ok_or_else(|| AnamnesisError::Parse {
@@ -2123,7 +2158,7 @@ pub fn parse_pth_with_limits(
 
     // 2. Read byte order (default to little-endian).
     let big_endian = match entry_index.get("byteorder") {
-        Some(&(start, len)) => {
+        Some((start, len)) => {
             let bytes = raw
                 .get(start..start + len)
                 .ok_or_else(|| AnamnesisError::Parse {
@@ -2149,7 +2184,7 @@ pub fn parse_pth_with_limits(
 
     // 3. Read and execute the pickle stream, then extract tensor metadata.
     //    Data is NOT copied here — `tensors()` will borrow from the mmap.
-    let &(pkl_start, pkl_len) =
+    let (pkl_start, pkl_len) =
         entry_index
             .get("data.pkl")
             .ok_or_else(|| AnamnesisError::Parse {
@@ -2609,14 +2644,15 @@ fn read_pth_entry_bytes<R: Read + Seek>(
 /// Returns [`AnamnesisError::Parse`] if the central directory is malformed, a
 /// local-header data offset cannot be resolved, `data_start` or `size`
 /// overflows `usize`, or an entry's byte range exceeds the file size.
-fn build_entry_index(raw: &[u8]) -> crate::Result<HashMap<String, (usize, usize)>> {
+fn build_entry_index(raw: &[u8]) -> crate::Result<EntryIndex> {
     let mut src = crate::parse::zip::SliceSource::new(raw);
     let entries = crate::parse::zip::read_central_directory(&mut src)?;
 
     // Clamp the pre-allocation hint: a many-entries zip would otherwise drive
-    // an eager `with_capacity` ~proportional to the file size. The map grows as
-    // entries are inserted. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP`.
-    let mut index = HashMap::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
+    // an eager `with_capacity` ~proportional to the file size. The Vec grows as
+    // entries are pushed. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP`.
+    let mut index: Vec<(Box<str>, usize, usize)> =
+        Vec::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
 
     for entry in &entries {
         // EXPLICIT: PyTorch ZIP archives use STORED (no compression)
@@ -2644,13 +2680,28 @@ fn build_entry_index(raw: &[u8]) -> crate::Result<HashMap<String, (usize, usize)
         // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0".
         let suffix = crate::parse::zip::strip_archive_prefix(&entry.name);
         if !suffix.is_empty() {
-            // BORROW: .into_owned() materialises the borrowed suffix as the
-            // owned HashMap key, which must outlive the `entries` vector.
-            index.insert(suffix.into_owned(), (data_start, data_len));
+            // BORROW: `Box::from(&str)` copies the borrowed suffix into an
+            // exact-sized owned key (no `String` capacity slack), which must
+            // outlive the `entries` vector.
+            index.push((Box::from(suffix.as_ref()), data_start, data_len));
         }
     }
 
-    Ok(index)
+    // Sort for binary-search lookup. On a duplicate suffix (pathological —
+    // real `.pth` entry names are unique) keep the last-pushed, matching the
+    // prior `HashMap` insert semantics: a stable sort leaves equal keys in push
+    // order, so reversing puts the last-pushed first, `dedup_by` keeps that
+    // first-of-run, and reversing again restores ascending order.
+    index.sort_by(|a, b| a.0.cmp(&b.0));
+    index.reverse();
+    index.dedup_by(|a, b| a.0 == b.0);
+    index.reverse();
+    // Reclaim the `push`-growth capacity slack (a `Vec` over-allocates up to ~2×
+    // while growing): the index is now immutable, so trim it to exact length —
+    // this is what keeps resident bytes/entry near the theoretical floor.
+    index.shrink_to_fit();
+
+    Ok(EntryIndex { entries: index })
 }
 
 // ---------------------------------------------------------------------------
