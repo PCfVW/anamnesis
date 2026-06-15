@@ -42,6 +42,7 @@ use std::io::{Read, Seek};
 
 use crate::error::AnamnesisError;
 use crate::parse::utils::PREALLOC_SOFT_CAP;
+use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
 // Signatures and fixed record sizes (APPNOTE.TXT 6.3.x)
@@ -128,6 +129,14 @@ pub(crate) trait ZipSource {
     /// Returns [`AnamnesisError::Parse`] if the requested range lies outside
     /// the source, or [`AnamnesisError::Io`] if an underlying read fails.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::Result<()>;
+
+    /// Returns the whole source as a borrowed slice when it is already in
+    /// memory (the mmap path), enabling a zero-copy central-directory read.
+    /// Streaming sources return `None` (the caller reads the directory into a
+    /// transient buffer instead). Defaults to `None`.
+    fn as_slice(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// A [`ZipSource`] backed by an in-memory byte slice (the `.pth` memory-mapped
@@ -170,6 +179,10 @@ impl ZipSource for SliceSource<'_> {
             })?;
         buf.copy_from_slice(src);
         Ok(())
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        Some(self.data)
     }
 }
 
@@ -472,14 +485,26 @@ struct CentralDirInfo {
 ///
 /// Returns [`AnamnesisError::Io`] if an underlying `read` on the source fails.
 ///
+/// `limits` is the caller's [`ParseLimits`]: the declared entry count is
+/// checked against `max_item_count` and the central-directory byte read against
+/// `max_single_alloc_bytes` — both **before** any allocation, fail-fast — so a
+/// tight-budget caller bounds the container metadata, not just the permanent
+/// [`ZIP_MAX_ENTRIES`] floor (CWE-770). The inspect paths pass
+/// [`ParseLimits::unbounded`].
+///
 /// # Memory
 ///
-/// Reads the trailing EOCD scan window (≤ ~64 `KiB`) and the central directory
-/// (typically a few `KiB`; bounded by the file size) into transient buffers
-/// that are dropped before returning. The returned `Vec<ZipEntry>` holds only
-/// the distilled per-entry fields (name + three integers + method tag) — no
-/// fat per-entry record persists.
-pub(crate) fn read_central_directory<S: ZipSource>(src: &mut S) -> crate::Result<Vec<ZipEntry>> {
+/// Reads the trailing EOCD scan window (≤ ~64 `KiB`) into a transient buffer.
+/// The central directory is read zero-copy when the source is already in memory
+/// (the mmap path borrows it via [`ZipSource::as_slice`]); a streaming source
+/// reads it into a transient buffer (charged to `limits`) that is dropped before
+/// returning. The returned `Vec<ZipEntry>` holds only the distilled per-entry
+/// fields (name + three integers + method tag) — no fat per-entry record
+/// persists.
+pub(crate) fn read_central_directory<S: ZipSource>(
+    src: &mut S,
+    limits: &ParseLimits,
+) -> crate::Result<Vec<ZipEntry>> {
     let total_len = src.total_len();
     let info = find_central_dir(src, total_len)?;
 
@@ -505,12 +530,14 @@ pub(crate) fn read_central_directory<S: ZipSource>(src: &mut S) -> crate::Result
             ),
         });
     }
+    // Caller's item-count budget, enforced before the entry vector is sized
+    // (the permanent cap above is the floor; this can only tighten it).
+    limits.check_item_count(info.entries, "ZIP central directory entry count")?;
 
     let cd_size = usize::try_from(info.size).map_err(|_| AnamnesisError::Parse {
         reason: "ZIP central directory size overflows usize".into(),
     })?;
-    let mut cd_bytes = vec![0u8; cd_size];
-    src.read_at(info.offset, &mut cd_bytes)?;
+    let cd_bytes = read_cd_bytes(src, info.offset, cd_size, limits)?;
 
     // Clamp the pre-allocation hint: the declared count is attacker-influenced,
     // so trusting it for `with_capacity` would commit ~1–2× the file size
@@ -522,6 +549,56 @@ pub(crate) fn read_central_directory<S: ZipSource>(src: &mut S) -> crate::Result
     let mut entries = Vec::with_capacity(cap);
     parse_cd_entries(&cd_bytes, info.entries, &mut entries)?;
     Ok(entries)
+}
+
+/// Obtains the central-directory bytes: a zero-copy borrow from an in-memory
+/// source (the mmap path), or a transient read into an owned buffer for a
+/// streaming source.
+///
+/// The owned-buffer path charges its `cd_size` allocation to the caller's
+/// `limits` (`max_single_alloc_bytes`) before allocating; the borrow path
+/// allocates nothing, so it needs no charge.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the central-directory range is out of
+/// bounds or the owned read exceeds the caller's single-allocation budget, or
+/// [`AnamnesisError::Io`] if a streaming read fails.
+fn read_cd_bytes<'a, S: ZipSource>(
+    src: &'a mut S,
+    offset: u64,
+    cd_size: usize,
+    limits: &ParseLimits,
+) -> crate::Result<Cow<'a, [u8]>> {
+    // Probe with `is_some()` first so its borrow ends before the branches: the
+    // borrow path re-borrows immutably, the streaming path borrows mutably, and
+    // the two must not overlap.
+    if src.as_slice().is_some() {
+        let start = usize::try_from(offset).map_err(|_| AnamnesisError::Parse {
+            reason: "ZIP central directory offset overflows usize".into(),
+        })?;
+        let end = start
+            .checked_add(cd_size)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "ZIP central directory range overflow".into(),
+            })?;
+        let file = src.as_slice().ok_or_else(|| AnamnesisError::Parse {
+            reason: "internal: ZIP in-memory source slice unavailable".into(),
+        })?;
+        let slice = file.get(start..end).ok_or_else(|| AnamnesisError::Parse {
+            reason: "ZIP central directory range exceeds file size".into(),
+        })?;
+        return Ok(Cow::Borrowed(slice));
+    }
+    // Streaming source: read the directory into a transient owned buffer, after
+    // charging the allocation to the caller's single-allocation budget.
+    // CAST: usize → u64, lossless widening on all supported targets
+    #[allow(clippy::as_conversions)]
+    let cd_size_u64 = cd_size as u64;
+    limits.check_alloc(cd_size_u64, "ZIP central directory")?;
+    let mut buf = vec![0u8; cd_size];
+    src.read_at(offset, &mut buf)?;
+    Ok(Cow::Owned(buf))
 }
 
 /// Locates the central directory: finds the EOCD record by scanning the tail,
@@ -912,7 +989,8 @@ mod tests {
     /// STORED entry (the differential oracle).
     fn assert_matches_zip_crate(archive: &[u8]) {
         let mut src = SliceSource::new(archive);
-        let entries = read_central_directory(&mut src).expect("vendored reader failed");
+        let entries = read_central_directory(&mut src, &ParseLimits::unbounded())
+            .expect("vendored reader failed");
 
         let cursor = std::io::Cursor::new(archive);
         let mut zip = ::zip::ZipArchive::new(cursor).expect("zip crate failed");
@@ -1005,7 +1083,7 @@ mod tests {
         assert_matches_zip_crate(&archive);
 
         let mut src = SliceSource::new(&archive);
-        let entries = read_central_directory(&mut src).unwrap();
+        let entries = read_central_directory(&mut src, &ParseLimits::unbounded()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].method, Compression::Deflate);
         assert!(entries[0].compressed_size < entries[0].uncompressed_size);
@@ -1024,7 +1102,7 @@ mod tests {
     fn empty_archive_has_no_entries() {
         let archive = build_zip(&[]);
         let mut src = SliceSource::new(&archive);
-        let entries = read_central_directory(&mut src).unwrap();
+        let entries = read_central_directory(&mut src, &ParseLimits::unbounded()).unwrap();
         assert!(entries.is_empty());
         assert_matches_zip_crate(&archive);
     }
@@ -1040,14 +1118,14 @@ mod tests {
     #[test]
     fn too_small_is_rejected() {
         let mut src = SliceSource::new(b"PK");
-        assert!(read_central_directory(&mut src).is_err());
+        assert!(read_central_directory(&mut src, &ParseLimits::unbounded()).is_err());
     }
 
     #[test]
     fn not_a_zip_is_rejected() {
         let junk = vec![0u8; 256];
         let mut src = SliceSource::new(&junk);
-        assert!(read_central_directory(&mut src).is_err());
+        assert!(read_central_directory(&mut src, &ParseLimits::unbounded()).is_err());
     }
 
     #[test]
@@ -1057,7 +1135,7 @@ mod tests {
         let mut archive = build_zip(&[("data.pkl", ::zip::CompressionMethod::Stored, b"abc")]);
         archive.truncate(archive.len() - 1);
         let mut src = SliceSource::new(&archive);
-        let _ = read_central_directory(&mut src); // Ok or Err, never a panic
+        let _ = read_central_directory(&mut src, &ParseLimits::unbounded()); // Ok or Err, never a panic
     }
 
     #[test]
@@ -1104,6 +1182,54 @@ mod tests {
             let archive = build_zip(&refs);
             assert_matches_zip_crate(&archive);
         }
+    }
+
+    #[test]
+    fn item_count_limit_rejects_container() {
+        // A caller's `max_item_count` bounds the declared entry count fail-fast,
+        // before the entry vector is built (tighter than the permanent cap).
+        let archive = build_zip(&[
+            ("a.npy", ::zip::CompressionMethod::Stored, b"x"),
+            ("b.npy", ::zip::CompressionMethod::Stored, b"y"),
+            ("c.npy", ::zip::CompressionMethod::Stored, b"z"),
+        ]);
+        let mut src = SliceSource::new(&archive);
+        let limits = ParseLimits::default().with_max_item_count(2);
+        let err = read_central_directory(&mut src, &limits).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("entry count")),
+            "expected item-count rejection, got: {err}"
+        );
+        // Unbounded accepts all three.
+        let ok = read_central_directory(&mut src, &ParseLimits::unbounded()).unwrap();
+        assert_eq!(ok.len(), 3);
+    }
+
+    #[test]
+    fn cd_single_alloc_limit_rejects_reader_path() {
+        // The streaming (reader) path charges the central-directory read to
+        // `max_single_alloc`; a tiny cap rejects it before allocating. (The
+        // mmap path borrows the directory zero-copy, so it is not charged.)
+        let archive = build_zip(&[
+            (
+                "archive/data.pkl",
+                ::zip::CompressionMethod::Stored,
+                b"data",
+            ),
+            (
+                "archive/data/0",
+                ::zip::CompressionMethod::Stored,
+                &[0u8; 32],
+            ),
+        ]);
+        let mut src = ReaderSource::new(std::io::Cursor::new(&archive)).unwrap();
+        let limits = ParseLimits::default().with_max_single_alloc(8);
+        let err = read_central_directory(&mut src, &limits).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::Parse { ref reason }
+                if reason.contains("central directory") || reason.contains("max_single_alloc")),
+            "expected central-directory single-alloc rejection, got: {err}"
+        );
     }
 
     #[test]

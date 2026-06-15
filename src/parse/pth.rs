@@ -2153,8 +2153,9 @@ pub fn parse_pth_with_limits(
 
     // 1. Pre-index all ZIP entry names → (data_start, size) for O(1) lookup,
     //    over the vendored central-directory reader (Phase 6.12). This replaces
-    //    the O(n) find_entry_name scanning per tensor.
-    let entry_index = build_entry_index(&raw)?;
+    //    the O(n) find_entry_name scanning per tensor. `limits` bounds the
+    //    container metadata fail-fast.
+    let entry_index = build_entry_index(&raw, limits)?;
 
     // 2. Read byte order (default to little-endian).
     let big_endian = match entry_index.get("byteorder") {
@@ -2519,7 +2520,10 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
     // `data.pkl` and (optional) `byteorder` by suffix — same suffix-stripping
     // convention as `build_entry_index`, so both newer-style `archive/data.pkl`
     // and older-style `{model_name}/data.pkl` archives are accepted.
-    let entries = crate::parse::zip::read_central_directory(&mut src)?;
+    // Inspect path is intentionally limit-free (it reports totals for the
+    // host's inspect-before-parse gate); the permanent ZIP_MAX_ENTRIES floor
+    // still applies inside the reader.
+    let entries = crate::parse::zip::read_central_directory(&mut src, &ParseLimits::unbounded())?;
     let mut pkl_entry: Option<&crate::parse::zip::ZipEntry> = None;
     let mut byteorder_entry: Option<&crate::parse::zip::ZipEntry> = None;
     for entry in &entries {
@@ -2633,14 +2637,19 @@ fn read_pth_entry_bytes<R: Read + Seek>(
 /// Only indexes STORED entries (uncompressed). The suffix is the part after
 /// the archive prefix (e.g., `"data.pkl"`, `"data/0"`, `"byteorder"`).
 ///
+/// `limits` bounds the container metadata fail-fast (entry count +
+/// central-directory allocation) for the `parse_pth_with_limits` path; the
+/// permanent caps inside the reader are the floor.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the central directory is malformed, a
 /// local-header data offset cannot be resolved, `data_start` or `size`
-/// overflows `usize`, or an entry's byte range exceeds the file size.
-fn build_entry_index(raw: &[u8]) -> crate::Result<EntryIndex> {
+/// overflows `usize`, an entry's byte range exceeds the file size, or the
+/// declared entry count / central-directory size exceeds `limits`.
+fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryIndex> {
     let mut src = crate::parse::zip::SliceSource::new(raw);
-    let entries = crate::parse::zip::read_central_directory(&mut src)?;
+    let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
 
     // Clamp the pre-allocation hint: a many-entries zip would otherwise drive
     // an eager `with_capacity` ~proportional to the file size. The Vec grows as

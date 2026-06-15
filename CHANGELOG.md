@@ -58,6 +58,22 @@ unreachable through `zip`'s API and unbounded by `ParseLimits`).
 
 ### Security
 
+- **The vendored container reader now honours the caller's `ParseLimits`**
+  ([CWE-770](https://cwe.mitre.org/data/definitions/770.html), under the
+  [CWE-400](https://cwe.mitre.org/data/definitions/400.html) umbrella). A
+  self-review found that `read_central_directory` enforced only the permanent
+  `ZIP_MAX_ENTRIES` (1 M) floor, so `parse_*_with_limits`'s `max_item_count` /
+  `max_single_alloc` were not consulted for the *container* metadata — a
+  many-tiny-entry archive could drive a bounded but uncharged ~100 MB
+  (`Vec<ZipEntry>` + the central-directory read) past a tight caller budget.
+  The reader now takes `&ParseLimits` and rejects an over-budget declared entry
+  count and central-directory allocation **before** allocating, fail-fast — the
+  same invariant every other parser already upheld. On the mmap (`.pth`) path
+  the central directory is now also read **zero-copy** (borrowed from the
+  mapping via `ZipSource::as_slice`), dropping a transient full-directory copy.
+  The inspect paths stay deliberately limit-free (the permanent floor still
+  applies). No behaviour change for honest files under the default
+  (unbounded) limits.
 - **Bounded `DEFLATE` inflation on the `.pth` reader path.** A self-review of
   the new `.pth` reader path (`inspect_pth_from_reader`) found that
   `read_pth_entry_bytes` read a `DEFLATE`-compressed `data.pkl` / `byteorder`

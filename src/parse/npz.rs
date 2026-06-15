@@ -756,7 +756,10 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// `parse_npz`, which returns `Err` on the same overflow.
 pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzInspectInfo> {
     let mut src = crate::parse::zip::ReaderSource::new(reader)?;
-    let entries = crate::parse::zip::read_central_directory(&mut src)?;
+    // Inspect path is intentionally limit-free (it reports totals for the host's
+    // inspect-before-parse gate); the permanent ZIP_MAX_ENTRIES floor still
+    // applies inside the reader.
+    let entries = crate::parse::zip::read_central_directory(&mut src, &ParseLimits::unbounded())?;
 
     // Clamp the pre-allocation hint: the central-directory entry count is
     // attacker-influenced (a many-empty-entries zip), so trusting it for
@@ -884,12 +887,11 @@ pub fn parse_npz_with_limits(
 ) -> crate::Result<HashMap<String, NpzTensor>> {
     let file = std::fs::File::open(path.as_ref())?;
     let mut src = crate::parse::zip::ReaderSource::new(file)?;
-    let entries = crate::parse::zip::read_central_directory(&mut src)?;
-
-    // CAST: usize → u64, lossless widening on all supported targets
-    #[allow(clippy::as_conversions)]
-    let entry_count = entries.len() as u64;
-    limits.check_item_count(entry_count, "NPZ archive entry count")?;
+    // The reader enforces `limits` (item-count + the central-directory single
+    // allocation) fail-fast, before materialising the entry vector — so a
+    // tight-budget caller bounds the container metadata, not only the
+    // downstream array data.
+    let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
 
     // One accountant for the whole archive: `parse_npz` holds every array in
     // the returned map simultaneously, so the running total bounds peak heap.
@@ -1378,14 +1380,17 @@ mod tests {
         )
         .is_ok());
 
-        // NPY-header single-allocation ceiling: a 1-byte budget rejects the
-        // header before the array is reached.
+        // Container single-allocation ceiling: since Phase 6.12 the
+        // central-directory read on the streaming (reader) path is charged to
+        // `max_single_alloc` too, so a 1-byte budget rejects the container
+        // fail-fast — before any NPY header or array is reached.
         let err =
             parse_npz_with_limits(tmp.path(), &ParseLimits::default().with_max_single_alloc(1))
                 .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("NPY header")),
-            "expected NPY-header single-alloc limit error, got: {err}"
+            matches!(err, AnamnesisError::Parse { ref reason }
+                if reason.contains("central directory") || reason.contains("NPY header")),
+            "expected container/header single-alloc limit error, got: {err}"
         );
 
         // Item-count ceiling: 1 entry rejected at 0, accepted at 1.
