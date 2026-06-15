@@ -2592,7 +2592,9 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
 /// few-KiB entry could inflate to gigabytes. `Read::take` caps both the bytes
 /// buffered and the inflation work; the `Vec` grows as bytes arrive, so a tiny
 /// file that merely *declares* a 100 `MiB` size cannot drive a 100 `MiB` eager
-/// allocation either.
+/// allocation either. (A pathological `STORED` entry whose
+/// `uncompressed_size < compressed_size` is truncated at the declared size; the
+/// pickle VM then rejects the short stream — a clean error, never unsound.)
 ///
 /// # Errors
 ///

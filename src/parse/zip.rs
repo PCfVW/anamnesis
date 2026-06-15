@@ -35,7 +35,10 @@
 //! each entry name at [`ZIP_MAX_NAME_LEN`] **before** allocating; each entry's
 //! `data_start + compressed_size` is cross-checked against the source length;
 //! and compression methods are **allowlisted** (`Stored` / `Deflate`), never
-//! denylisted.
+//! denylisted. On top of those permanent floors, [`read_central_directory`]
+//! also honours the caller's [`ParseLimits`] (`max_item_count` and
+//! `max_single_alloc_bytes`) fail-fast, so a memory-constrained caller bounds
+//! the container metadata to *its* budget (CWE-770).
 
 use std::borrow::Cow;
 use std::io::{Read, Seek};
@@ -476,21 +479,23 @@ struct CentralDirInfo {
 /// anamnesis needs are retained; comments, timestamps, and attributes are
 /// skipped.
 ///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if the archive is too small, the EOCD or
-/// `ZIP64` records are missing/malformed, the central directory lies outside
-/// the file, the declared entry count exceeds [`ZIP_MAX_ENTRIES`], an entry
-/// name exceeds [`ZIP_MAX_NAME_LEN`], or any record is truncated.
-///
-/// Returns [`AnamnesisError::Io`] if an underlying `read` on the source fails.
-///
 /// `limits` is the caller's [`ParseLimits`]: the declared entry count is
 /// checked against `max_item_count` and the central-directory byte read against
 /// `max_single_alloc_bytes` — both **before** any allocation, fail-fast — so a
 /// tight-budget caller bounds the container metadata, not just the permanent
 /// [`ZIP_MAX_ENTRIES`] floor (CWE-770). The inspect paths pass
 /// [`ParseLimits::unbounded`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the archive is too small, the EOCD or
+/// `ZIP64` records are missing/malformed, the central directory lies outside
+/// the file, the declared entry count exceeds [`ZIP_MAX_ENTRIES`] or the
+/// caller's `max_item_count`, the central-directory allocation exceeds the
+/// caller's `max_single_alloc_bytes`, an entry name exceeds
+/// [`ZIP_MAX_NAME_LEN`], or any record is truncated.
+///
+/// Returns [`AnamnesisError::Io`] if an underlying `read` on the source fails.
 ///
 /// # Memory
 ///

@@ -208,11 +208,16 @@ impl ParseLimits {
     ///
     /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if
     /// `count` exceeds the configured maximum item count.
-    // Only the `npz` and `gguf` parse paths read a file-declared item count;
-    // with neither feature enabled this helper has no caller, which is correct
-    // (not dead code in the public sense). `check_alloc` always has a caller
-    // via the always-on safetensors path, so it needs no such guard.
-    #[cfg_attr(not(any(feature = "npz", feature = "gguf")), allow(dead_code))]
+    // Callers: the `gguf` parse path (tensor / KV counts) and the vendored ZIP
+    // central-directory reader (`crate::parse::zip`, compiled under `npz`/`pth`,
+    // for the entry count). With none of `npz`/`pth`/`gguf` enabled this helper
+    // has no caller, which is correct (not dead code in the public sense).
+    // `check_alloc` always has a caller via the always-on safetensors path, so
+    // it needs no such guard.
+    #[cfg_attr(
+        not(any(feature = "npz", feature = "pth", feature = "gguf")),
+        allow(dead_code)
+    )]
     pub(crate) fn check_item_count(&self, count: u64, context: &str) -> crate::Result<()> {
         if count > self.max_item_count {
             return Err(crate::AnamnesisError::Parse {
