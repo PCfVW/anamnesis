@@ -2330,16 +2330,14 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 ///    fetch.
 /// 2. **A short read of the local-file header magic at offset 0** —
 ///    4 bytes, used to separate *"legacy pre-1.6 raw pickle"* from
-///    *"not a valid ZIP"* before handing the reader to `zip::ZipArchive`.
-/// 3. **The end-of-central-directory (EOCD) scan** that
-///    `zip::ZipArchive::new` performs — up to ~64 KiB read near the end of
-///    the file.
+///    *"not a valid ZIP"* before the vendored reader walks the directory.
+/// 3. **The end-of-central-directory (EOCD) scan** the vendored reader
+///    performs — up to ~64 KiB read near the end of the file.
 /// 4. **The central directory** — typically a few KiB, also near the end of
 ///    the file.
-/// 5. **One bulk read of `data.pkl`** — `archive.by_name("…/data.pkl")`
-///    seeks to the local-file header, reads ~30 B of header, then reads the
-///    entry data (typically <100 KiB even on torchvision-class 300 MB
-///    models).
+/// 5. **One bulk read of `data.pkl`** — the vendored reader resolves the
+///    entry's local-file header (~30 B), then this function reads the entry
+///    data (typically <100 KiB even on torchvision-class 300 MB models).
 /// 6. **Optional one bulk read of `byteorder`** — usually 6 bytes
 ///    (`"little"`), 3 bytes (`"big"`), or absent.
 ///
@@ -2349,9 +2347,9 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 ///
 /// Why `Read + Seek` (and not just `Read`): the ZIP format reads the central
 /// directory at the end of the file, then seeks back to each local-file
-/// header to read entry payloads. `zip::ZipArchive::new` already requires
-/// `Read + Seek` for that reason, and `inspect_pth_from_reader` inherits
-/// the constraint verbatim.
+/// header to read entry payloads. The vendored reader requires `Read + Seek`
+/// for that reason, and `inspect_pth_from_reader` inherits the constraint
+/// verbatim.
 ///
 /// Anamnesis itself does not ship an `HTTP` transport; the network layer
 /// belongs in downstream crates (e.g., `hf-fm`'s `HttpRangeReader`
@@ -2378,8 +2376,8 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// deliberate: GGUF's parser issues many small `read_exact` calls (4–8 B
 /// per typed primitive) which collapse one syscall per primitive on a raw
 /// [`std::fs::File`] substrate; `inspect_pth_from_reader` only ever issues
-/// bulk reads (the ZIP central-directory scan inside `zip::ZipArchive`
-/// followed by one `read_to_end` per named entry). Adding a `BufReader`
+/// bulk reads (the vendored reader's ZIP central-directory scan followed by
+/// one `read_to_end` per named entry). Adding a `BufReader`
 /// would only insert one extra memcpy per buffer-fill without saving any
 /// syscalls. `HTTP`-range adapters that prefetch the EOCD + central
 /// directory + `data.pkl` regions on first access amortise away every
@@ -2426,26 +2424,14 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// for the per-family breakdown, the `longest_cycle` outlier analysis,
 /// and the full method.
 ///
-/// | Fixture | `torch.load` median | mmap median | reader median |
-/// |---|---:|---:|---:|
-/// | `algzoo_rnn_small.pth` (2.0 KiB) | 532.7 µs | 134.4 µs | 220.1 µs |
-/// | `algzoo_transformer_small.pth` (3.5 KiB) | 858.7 µs | 154.0 µs | 236.1 µs |
-/// | `algzoo_rnn_blog.pth` (3.3 KiB) | 530.6 µs | 133.1 µs | 151.5 µs |
-///
-/// The reader speedup vs `torch.load` is a **lower bound**: scaling to a
-/// torchvision-class 300 MB `.pth`, `torch.load`'s time grows linearly
-/// with total `data/N` size while `inspect_pth_from_reader`'s time stays
-/// bounded by `data.pkl` size (tens of KiB), so the ratio grows by orders
-/// of magnitude on large models.
-///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
-/// reader fails, or if the underlying [`zip`] crate fails to parse the
-/// archive structure.
+/// reader fails.
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is shorter than 4 bytes,
-/// the local-file header magic is not `PK\x03\x04`, the `data.pkl` entry
+/// the local-file header magic is not `PK\x03\x04`, the central directory is
+/// malformed, the `data.pkl` entry
 /// is missing, the `data.pkl` declared size exceeds the
 /// 100 MiB cap (defensive against adversarial central directories), the
 /// `byteorder` entry declared size exceeds its 64 B cap, the `byteorder`
@@ -2496,8 +2482,7 @@ pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthIn
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Io`] if reading or seeking fails, or if the
-/// `zip` crate cannot open the archive.
+/// Returns [`AnamnesisError::Io`] if reading or seeking fails.
 ///
 /// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::Unsupported`]
 /// under the same conditions documented on [`inspect_pth_from_reader`].
@@ -3835,7 +3820,7 @@ mod tests {
     }
 
     /// Non-ZIP, non-legacy bytes produce `AnamnesisError::Parse` — the
-    /// magic-byte check fires before `zip::ZipArchive::new` would.
+    /// magic-byte check fires before the vendored central-directory reader runs.
     #[test]
     fn inspect_from_reader_rejects_wrong_magic() {
         let data: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0x04];

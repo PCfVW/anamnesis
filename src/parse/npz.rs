@@ -8,9 +8,11 @@
 //! `NPY` file ARE the correct in-memory representation — no per-element
 //! processing is needed.
 //!
-//! The `ZIP` layer is handled by the `zip` crate directly. `NPZ` archives
-//! typically use the `STORE` method (no compression) for large arrays, making
-//! the `ZIP` layer a pure passthrough.
+//! The `ZIP` container is parsed by the vendored, read-only central-directory
+//! reader (`crate::parse::zip`, Phase 6.12); `DEFLATE` entries are inflated by
+//! `flate2` / `miniz_oxide`. `NPZ` archives typically use the `STORE` method
+//! (no compression) for large arrays, making the `ZIP` layer a pure
+//! passthrough.
 //!
 //! # Performance
 //!
@@ -705,14 +707,14 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// logical fetches to satisfy this function:
 ///
 /// 1. **End-of-file scan for the EOCD record** (~64 KiB worst case) — the
-///    `zip` crate seeks to the file's end and scans backwards for the
+///    vendored reader seeks to the file's end and scans backwards for the
 ///    end-of-central-directory signature.
 /// 2. **One read for the central directory** (a few KiB for typical ML
 ///    `NPZ` archives, since each `STORE`d entry produces one fixed-size
-///    record plus its UTF-8 name) — the `zip` crate seeks to the offset
+///    record plus its UTF-8 name) — the vendored reader seeks to the offset
 ///    recorded in the EOCD and reads the full directory.
 /// 3. **One read per entry for the local file header + `NPY` header**
-///    (~512 B per `.npy` entry) — for each entry, the `zip` crate seeks
+///    (~512 B per `.npy` entry) — for each entry, the vendored reader seeks
 ///    to the local file header offset, then this function reads the
 ///    `NPY` preamble + dict header (~128 B in practice).
 ///
