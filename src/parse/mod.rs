@@ -11,6 +11,12 @@ pub mod safetensors;
 #[cfg(feature = "pth")]
 pub mod pth;
 
+/// Vendored read-only `ZIP` central-directory reader shared by the `.pth` and
+/// `.npz` parsers (Phase 6.12). Owns the container parsing so the per-entry
+/// metadata footprint is bounded; `DEFLATE` inflate stays in `flate2`.
+#[cfg(any(feature = "npz", feature = "pth"))]
+pub(crate) mod zip;
+
 /// `GGUF` file parsing — header, metadata key-value pairs, and tensor info table.
 #[cfg(feature = "gguf")]
 pub mod gguf;

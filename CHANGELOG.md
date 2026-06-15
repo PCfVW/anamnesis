@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Phase 6.12 — vendored ZIP container reader. Replaces `zip::ZipArchive` (the
+`.pth` / `.npz` central-directory parser) with a lean, read-only, owned
+central-directory reader, closing the measured metadata-amplification gap from
+the Phase 6.8 "reopened by measurement" track (`ZipArchive::new` materialises
+the whole central directory as a fat per-entry record — ~500 B/entry,
+unreachable through `zip`'s API and unbounded by `ParseLimits`).
+
+### Changed
+
+- **New vendored ZIP central-directory reader** (`src/parse/zip.rs`,
+  `#[cfg(any(feature = "npz", feature = "pth"))]`): a read-only EOCD +
+  central-directory + local-header-offset parser with full `ZIP64` support
+  (EOCD record + locator + `0x0001` extra field), so `torch.save` checkpoints
+  larger than 4 GiB / 65 535 entries keep parsing. It owns only the container
+  parsing — `DEFLATE` inflate stays in `flate2` / `miniz_oxide` (the
+  upstream-fuzzed codec surface is untouched). The `.pth` mmap path
+  (`build_entry_index`, `parse_pth`) now runs on the vendored reader. Hardened
+  per `CONVENTIONS.md` "When Parsing Untrusted Input": bounds-checked cursor
+  reads, `checked_*` offset arithmetic, a permanent entry-count cap
+  (`ZIP_MAX_ENTRIES`, 1 048 576) and per-name cap (`ZIP_MAX_NAME_LEN`, 4 KiB),
+  a `data_start + compressed_size <= file_len` cross-check, and a compression
+  **allowlist** (`Stored` / `Deflate`). No public API or behaviour change for
+  legitimate files. A new `fuzz_zip` target plus an in-crate differential
+  oracle (every parse compared index-for-index against the `zip` crate across
+  STORED / DEFLATE / `ZIP64` / multi-entry archives, including a 256-archive
+  randomized sweep) back the migration.
+
 ## [0.6.6] - 2026-06-13
 
 Phase 6.11 — pickle-VM working-set governance. Closes a P0 DoS an independent

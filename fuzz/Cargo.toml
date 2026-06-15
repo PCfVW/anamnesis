@@ -52,6 +52,15 @@ test = false
 doc = false
 bench = false
 
+# Phase 6.12: the vendored ZIP central-directory reader, exercised over every
+# public entry point that routes through it (mmap + reader substrates).
+[[bin]]
+name = "fuzz_zip"
+path = "fuzz_targets/fuzz_zip.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "fuzz_npz_parse"
 path = "fuzz_targets/fuzz_npz_parse.rs"

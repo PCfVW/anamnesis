@@ -706,7 +706,7 @@ Steps 1–3 were unified into a **single `O(1)`-per-opcode accounting choke poin
 
 **Sequencing — one patch version (`v0.6.7`):**
 
-- [ ] **Step 1 — Vendored `.pth` central-directory reader:** STORED-only, builds the `name → (offset, size)` index bounds-checked against the mmap, behind the existing `parse_pth` API. Ship `fuzz_zip` alongside. — **commit**
+- [x] **Step 1 — Vendored `.pth` central-directory reader:** STORED-only, builds the `name → (offset, size)` index bounds-checked against the mmap, behind the existing `parse_pth` API. Ship `fuzz_zip` alongside. Delivered with **full ZIP64 support** (EOCD record + locator + `0x0001` extra field — no regression on >4 GiB / >65 535-entry checkpoints) and an in-crate **differential oracle** (vendored index vs the `zip` crate across STORED/DEFLATE/ZIP64/multi-entry + a 256-archive randomized sweep). — **commit**
 - [ ] **Step 2 — NPZ over the vendored reader,** keeping `miniz_oxide` inflate for DEFLATE entries (codec untouched). — **commit**
 - [ ] **Step 3 — Drop the `zip` runtime dependency** (move to `[dev-dependencies]`); measure the metadata reduction with `dhat` against the 50 000-tiny-entry fixture (projected ~12× from the measured ~500 → ~40 B/entry — confirm here) and record before/after in the commit. — **commit** — **PUSH + tag `v0.6.7`**
 

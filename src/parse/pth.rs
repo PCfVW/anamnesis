@@ -2113,13 +2113,10 @@ pub fn parse_pth_with_limits(
         });
     }
 
-    // INDEX: full-slice — raw is the complete mmap; [..] is always in bounds
-    let cursor = std::io::Cursor::new(&raw[..]);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-
-    // 1. Pre-index all ZIP entry names → (data_start, size) for O(1) lookup.
-    //    This replaces the O(n) find_entry_name scanning per tensor.
-    let entry_index = build_entry_index(&mut archive, &raw)?;
+    // 1. Pre-index all ZIP entry names → (data_start, size) for O(1) lookup,
+    //    over the vendored central-directory reader (Phase 6.12). This replaces
+    //    the O(n) find_entry_name scanning per tensor.
+    let entry_index = build_entry_index(&raw)?;
 
     // 2. Read byte order (default to little-endian).
     let big_endian = match entry_index.get("byteorder") {
@@ -2630,82 +2627,55 @@ fn locate_inspect_entries<R: Read + Seek>(
     Ok((pkl_name, pkl_size, byteorder_name, byteorder_size))
 }
 
-/// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`.
+/// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`,
+/// over the vendored central-directory reader ([`crate::parse::zip`]).
 ///
 /// Only indexes STORED entries (uncompressed). The suffix is the part after
 /// the archive prefix (e.g., `"data.pkl"`, `"data/0"`, `"byteorder"`).
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if a ZIP entry cannot be read,
-/// `data_start` or `size` overflows `usize`, or the entry's byte range
-/// exceeds the file size.
-fn build_entry_index(
-    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
-    raw: &[u8],
-) -> crate::Result<HashMap<String, (usize, usize)>> {
+/// Returns [`AnamnesisError::Parse`] if the central directory is malformed, a
+/// local-header data offset cannot be resolved, `data_start` or `size`
+/// overflows `usize`, or an entry's byte range exceeds the file size.
+fn build_entry_index(raw: &[u8]) -> crate::Result<HashMap<String, (usize, usize)>> {
+    let mut src = crate::parse::zip::SliceSource::new(raw);
+    let entries = crate::parse::zip::read_central_directory(&mut src)?;
+
     // Clamp the pre-allocation hint: a many-entries zip would otherwise drive
     // an eager `with_capacity` ~proportional to the file size. The map grows as
     // entries are inserted. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP`.
-    let mut index = HashMap::with_capacity(archive.len().min(PREALLOC_SOFT_CAP));
+    let mut index = HashMap::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
 
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to read ZIP entry {i}: {e}"),
-        })?;
-
+    for entry in &entries {
         // EXPLICIT: PyTorch ZIP archives use STORED (no compression)
         // exclusively. Compressed entries indicate a non-PyTorch ZIP or
         // manual re-compression — skip them rather than error, since they
         // are metadata entries (e.g., .format_version) that the parser
         // does not need. Tensor data entries are always STORED.
-        if entry.compression() != zip::CompressionMethod::Stored {
+        if !entry.method.is_stored() {
             continue;
         }
 
-        // BORROW: owned copy — entry name borrows from ZipArchive, but
-        // the HashMap key and error messages must outlive the entry borrow.
-        let full_name = entry.name().to_owned();
-
-        let data_start =
-            usize::try_from(entry.data_start()).map_err(|_| AnamnesisError::Parse {
-                reason: format!("ZIP entry `{full_name}`: data_start overflows usize"),
-            })?;
-        let data_len = usize::try_from(entry.size()).map_err(|_| AnamnesisError::Parse {
-            reason: format!("ZIP entry `{full_name}`: size overflows usize"),
+        // `data_start` reads the entry's local header and cross-checks
+        // `data_start + compressed_size <= raw.len()`, so the result is a
+        // validated in-bounds offset.
+        let data_start = crate::parse::zip::data_start(&mut src, entry)?;
+        let data_start = usize::try_from(data_start).map_err(|_| AnamnesisError::Parse {
+            reason: format!("ZIP entry `{}`: data_start overflows usize", entry.name),
         })?;
-
-        // Validate range.
-        let data_end = data_start
-            .checked_add(data_len)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: format!("ZIP entry `{full_name}`: data range overflow"),
+        let data_len =
+            usize::try_from(entry.compressed_size).map_err(|_| AnamnesisError::Parse {
+                reason: format!("ZIP entry `{}`: size overflows usize", entry.name),
             })?;
-        if data_end > raw.len() {
-            return Err(AnamnesisError::Parse {
-                reason: format!(
-                    "ZIP entry `{full_name}`: data range [{data_start}..{data_end}] \
-                     exceeds file size {}",
-                    raw.len()
-                ),
-            });
-        }
 
         // Strip the archive prefix to get the suffix key.
-        // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0"
-        // '/' is always byte 0x2F in UTF-8, so pos+1 is a valid char
-        // boundary. unwrap_or(&full_name) is a defensive fallback for
-        // non-ASCII names (impossible in PyTorch archives, but safe).
-        // BORROW: .as_str() explicit String → &str; .to_owned() converts &str → owned String
-        let suffix = full_name
-            .find('/')
-            .map_or(full_name.as_str(), |pos| {
-                full_name.get(pos + 1..).unwrap_or(&full_name)
-            })
-            .to_owned();
-
+        // "archive/data.pkl" → "data.pkl", "my_model/data/0" → "data/0".
+        let suffix = crate::parse::zip::strip_archive_prefix(&entry.name);
         if !suffix.is_empty() {
-            index.insert(suffix, (data_start, data_len));
+            // BORROW: .into_owned() materialises the borrowed suffix as the
+            // owned HashMap key, which must outlive the `entries` vector.
+            index.insert(suffix.into_owned(), (data_start, data_len));
         }
     }
 

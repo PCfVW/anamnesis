@@ -24,6 +24,7 @@ so the fuzzer co-explores `(malformed file × tightened limits)`.
 | `fuzz_npz` | `inspect_npz_from_reader` | ZIP central-directory walk + NPY header parser (`NPY_MAX_HEADER_BYTES`) |
 | `fuzz_gguf` | `inspect_gguf_from_reader` | metadata KV / typed-array readers + `read_bytes`/`ensure_remaining` |
 | `fuzz_pth` | `inspect_pth_from_reader` | **ZIP walk + the pickle VM** (opcodes, `GLOBAL` allowlist, memo/mark stacks, recursion) — the highest-value target |
+| `fuzz_zip` | `parse_pth` + `parse_npz` + `inspect_pth_from_reader` | the **vendored ZIP central-directory reader** (Phase 6.12): EOCD scan, `ZIP64` resolution, local-header data-offset, per-entry caps — over both mmap and reader substrates. Index-level differential vs the `zip` crate lives in the in-crate unit tests |
 | `fuzz_npz_parse` | `parse_npz` (via temp file) | the **data-extraction path**: `read_array_data` + the `entry.size()` cross-check |
 | `fuzz_pth_parse` | `parse_pth` + `tensors()` (via temp file) | the **mmap path + tensor extraction**: `build_entry_index`, the `MAX_PKL_SIZE` mmap guard, stride/offset resolution |
 | `fuzz_npz_limits` | `parse_npz_with_limits` (via temp file) | **all four `ParseLimits` axes**: single-alloc, cumulative `Budget` (`checked_add`), item-count, decompression-ratio (`checked_mul`) |
