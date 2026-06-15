@@ -100,7 +100,20 @@ path targets 30 s seeded each (`fuzz_npz_parse` 102 k runs, `fuzz_pth_parse`
 runs (cov 643, RSS 415 MB) — **~957 k executions, zero crashes**, confirming the
 `ParseLimits` enforcement branches (`check_alloc` / `Budget::charge_alloc`
 `checked_add` / `check_item_count` / `check_decompression_ratio` `checked_mul`)
-reject panic-free under input-derived limits. Not yet wired into CI; a scheduled
-Linux fuzz job is a candidate follow-up (it needs nightly + `cargo-fuzz`
-install in the runner, so it is intentionally kept out of the stable-only
-push/PR matrix).
+reject panic-free under input-derived limits.
+
+**Phase 6.12 (v0.6.7, vendored ZIP reader)** — re-run under WSL2 Ubuntu 24.04
+(nightly + `cargo-fuzz` 0.13.1): all 10 targets compile (the new `fuzz_zip`
+included). Seeded campaigns: `fuzz_zip` 668 k runs / 181 s, `fuzz_npz` 2.85 M,
+`fuzz_npz_limits` 995 k, `fuzz_npz_parse` 503 k, `fuzz_pth` 381 k,
+`fuzz_pth_parse` 316 k, `fuzz_pth_limits` 193 k — **≈5.9 M executions**, RSS
+steady (~440 MB). The campaign **found one crash**: `fuzz_npz_limits` reached a
+panic in the `NPY` dtype-descriptor parser (`parse_descr` sliced `&descr[1..]`,
+which panics when the first character is a multi-byte UTF-8 codepoint —
+pre-existing since the v0.3.0 NPZ parser, `bb58cd4`). Fixed (`descr.get(1..)` →
+clean `Unsupported`) with a regression unit test
+(`parse_descr_multibyte_first_char_is_clean_error`); the crash input now parses
+cleanly and the full re-sweep above is **zero-crash** post-fix. Not yet wired
+into CI; a scheduled Linux fuzz job is a candidate follow-up (it needs nightly +
+`cargo-fuzz` install in the runner, so it is intentionally kept out of the
+stable-only push/PR matrix).

@@ -58,6 +58,19 @@ unreachable through `zip`'s API and unbounded by `ParseLimits`).
 
 ### Security
 
+- **Fixed a panic (DoS) in the `NPY` dtype-descriptor parser** found by the
+  Phase 6.12 fuzzing campaign ([CWE-248](https://cwe.mitre.org/data/definitions/248.html),
+  under the [CWE-400](https://cwe.mitre.org/data/definitions/400.html) umbrella).
+  `parse_descr` sliced the descriptor string as `&descr[1..]`; when the `descr`
+  field's first character was a multi-byte UTF-8 codepoint, byte index 1 fell
+  inside that character and the `str` slice **panicked** (process abort under
+  `panic = "abort"`) on a malformed `.npy` / `.npz`. Now uses `descr.get(1..)`,
+  returning a clean `AnamnesisError::Unsupported` instead. This bug is
+  **pre-existing** — introduced in the v0.3.0 custom NPZ parser (`bb58cd4`,
+  2026-03-24) and latent in every release since; the longer, differently-seeded
+  `fuzz_npz_limits` campaign reached it where the shorter v0.6.2/v0.6.3 runs had
+  not. Verified fixed: the crash input now parses cleanly, and a 5.9 M-execution
+  re-sweep across all ZIP/NPZ/PTH fuzz targets runs clean.
 - **The vendored container reader now honours the caller's `ParseLimits`**
   ([CWE-770](https://cwe.mitre.org/data/definitions/770.html), under the
   [CWE-400](https://cwe.mitre.org/data/definitions/400.html) umbrella). A

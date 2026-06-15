@@ -357,11 +357,19 @@ fn parse_descr(descr: &str) -> crate::Result<(NpzDtype, bool)> {
         });
     }
 
-    // INDEX: bytes.len() >= 2, so [0] and [1..] are safe
+    // INDEX: bytes.len() >= 2 guarantees byte 0 exists; the endianness prefix in
+    // any valid descriptor is ASCII (`<`, `>`, `|`, `=`), so byte 0 is the whole
+    // first character (a non-ASCII first byte simply won't match `>` below).
     #[allow(clippy::indexing_slicing)]
     let endian_char = bytes[0];
-    #[allow(clippy::indexing_slicing)]
-    let type_str = &descr[1..];
+    // `descr.get(1..)` — NOT `&descr[1..]`: a `str` slice panics when byte index
+    // 1 is not a UTF-8 char boundary (a descriptor whose first character is a
+    // multi-byte codepoint). `.get` yields `None` there → a clean error, never a
+    // panic on attacker-controlled `NPY` header bytes.
+    let type_str = descr.get(1..).ok_or_else(|| AnamnesisError::Unsupported {
+        format: "NPY".into(),
+        detail: format!("dtype descriptor is not ASCII: '{descr}'"),
+    })?;
 
     // EXPLICIT: '=' (native endian) is treated as little-endian. All modern ML
     // platforms (x86-64, ARM64) are LE; a BE-native machine would need '>' explicitly.
@@ -1048,6 +1056,17 @@ mod tests {
         assert!(parse_descr("<c8").is_err()); // complex
         assert!(parse_descr("<U4").is_err()); // unicode string
         assert!(parse_descr("x").is_err()); // too short
+    }
+
+    // Regression (fuzz_npz_limits crash, 2026-06-15): a descriptor whose first
+    // character is a multi-byte UTF-8 codepoint must yield a clean error, never
+    // panic on the `&descr[1..]` str-slice char boundary. `bytes.len() >= 2`
+    // here, but byte index 1 lands inside the first character.
+    #[test]
+    fn parse_descr_multibyte_first_char_is_clean_error() {
+        assert!(parse_descr("\u{359}f4").is_err()); // U+0359 is 2 bytes (CD 99)
+        assert!(parse_descr("é4").is_err()); // 'é' is 2 bytes (C3 A9)
+        assert!(parse_descr("\u{1F600}").is_err()); // 4-byte emoji
     }
 
     // -- extract_descr -------------------------------------------------------
