@@ -31,13 +31,16 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
 use crate::parse::utils::{byteswap_inplace, PREALLOC_SOFT_CAP};
+// `ZipSource` is in scope for the reader-path `total_len` / `read_at` calls on
+// the vendored `ReaderSource`; the trait methods are otherwise unreachable.
+use crate::parse::zip::ZipSource;
 use crate::ParseLimits;
 
 /// Maximum declared size for a `.pth` archive's `data.pkl` entry that the
@@ -2463,22 +2466,21 @@ pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthIn
 ///
 /// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::Unsupported`]
 /// under the same conditions documented on [`inspect_pth_from_reader`].
-fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<(bool, Vec<u8>)> {
-    // Probe the local-file header magic to keep the *"legacy pre-1.6 raw
-    // pickle"* diagnostic distinct from the generic *"not a ZIP"* diagnostic
-    // — same precedent as the mmap-backed `parse_pth`. We rewind after the
-    // probe so `zip::ZipArchive::new` sees the archive from offset 0.
-    let total_len = reader.seek(SeekFrom::End(0)).map_err(AnamnesisError::Io)?;
+fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(bool, Vec<u8>)> {
+    let mut src = crate::parse::zip::ReaderSource::new(reader)?;
+    let total_len = src.total_len();
     if total_len < 4 {
         return Err(AnamnesisError::Parse {
             reason: "file too small to be a .pth archive".into(),
         });
     }
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(AnamnesisError::Io)?;
+    // Probe the local-file header magic to keep the *"legacy pre-1.6 raw
+    // pickle"* diagnostic distinct from the generic *"not a ZIP"* diagnostic —
+    // same precedent as the mmap-backed `parse_pth`.
     let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic).map_err(AnamnesisError::Io)?;
+    src.read_at(0, &mut magic)?;
+    // INDEX: `magic` is a fixed 4-byte array; [0]/[1] are always in bounds.
+    #[allow(clippy::indexing_slicing)]
     if magic[0] == 0x80 && magic[1] <= 0x05 {
         return Err(AnamnesisError::Unsupported {
             format: "pth".into(),
@@ -2492,48 +2494,47 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<
             reason: "file is not a ZIP archive (missing PK\\x03\\x04 magic)".into(),
         });
     }
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(AnamnesisError::Io)?;
 
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| AnamnesisError::Parse {
-        reason: format!("failed to open ZIP archive: {e}"),
+    // Walk the central directory once over the vendored reader to locate
+    // `data.pkl` and (optional) `byteorder` by suffix — same suffix-stripping
+    // convention as `build_entry_index`, so both newer-style `archive/data.pkl`
+    // and older-style `{model_name}/data.pkl` archives are accepted.
+    let entries = crate::parse::zip::read_central_directory(&mut src)?;
+    let mut pkl_entry: Option<&crate::parse::zip::ZipEntry> = None;
+    let mut byteorder_entry: Option<&crate::parse::zip::ZipEntry> = None;
+    for entry in &entries {
+        let suffix = crate::parse::zip::strip_archive_prefix(&entry.name);
+        if suffix == "data.pkl" && pkl_entry.is_none() {
+            pkl_entry = Some(entry);
+        } else if suffix == "byteorder" && byteorder_entry.is_none() {
+            byteorder_entry = Some(entry);
+        }
+    }
+    let pkl_entry = pkl_entry.ok_or_else(|| AnamnesisError::Parse {
+        reason: "ZIP entry `data.pkl` not found".into(),
     })?;
-
-    // Walk the central directory once to locate `data.pkl` and (optional)
-    // `byteorder` by suffix — same suffix-stripping convention as
-    // `build_entry_index` so we accept both newer-style `archive/data.pkl`
-    // and older-style `{model_name}/data.pkl` archives.
-    let (pkl_name, pkl_size, byteorder_name, byteorder_size) =
-        locate_inspect_entries(&mut archive)?;
 
     // Inspect path is intentionally limit-free (it reports totals for the host's
     // inspect-before-parse gate); unbounded default keeps the permanent
     // MAX_PKL_SIZE cap as the only bound here.
-    enforce_pkl_size_cap(pkl_size, &pkl_name, &ParseLimits::default())?;
+    enforce_pkl_size_cap(
+        pkl_entry.uncompressed_size,
+        "data.pkl",
+        &ParseLimits::default(),
+    )?;
 
-    let big_endian = match byteorder_name {
-        Some(name) => {
-            // `byteorder_size` was matched in `locate_inspect_entries`; if
-            // we got `Some(name)` we also got `Some(size)` in the same
-            // tuple slot — see the helper's return shape.
-            let size = byteorder_size.unwrap_or(0);
-            if size > MAX_BYTEORDER_SIZE {
+    let big_endian = match byteorder_entry {
+        Some(entry) => {
+            if entry.uncompressed_size > MAX_BYTEORDER_SIZE {
                 return Err(AnamnesisError::Parse {
                     reason: format!(
-                        "ZIP entry `{name}`: declared size {size} bytes exceeds \
-                         the {MAX_BYTEORDER_SIZE}-byte byteorder cap"
+                        "ZIP entry `{}`: declared size {} bytes exceeds the \
+                         {MAX_BYTEORDER_SIZE}-byte byteorder cap",
+                        entry.name, entry.uncompressed_size
                     ),
                 });
             }
-            let mut entry = archive.by_name(&name).map_err(|e| AnamnesisError::Parse {
-                reason: format!("failed to open ZIP entry `{name}`: {e}"),
-            })?;
-            let cap = usize::try_from(size).map_err(|_| AnamnesisError::Parse {
-                reason: format!("ZIP entry `{name}`: declared size overflows usize"),
-            })?;
-            let mut buf = Vec::with_capacity(cap);
-            entry.read_to_end(&mut buf).map_err(AnamnesisError::Io)?;
+            let buf = read_pth_entry_bytes(&mut src, entry)?;
             let text = std::str::from_utf8(&buf).map_err(|e| AnamnesisError::Parse {
                 reason: format!("byteorder entry is not UTF-8: {e}"),
             })?;
@@ -2552,79 +2553,49 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(mut reader: R) -> crate::Result<
         None => false, // default: little-endian
     };
 
-    let cap = usize::try_from(pkl_size).map_err(|_| AnamnesisError::Parse {
-        reason: format!("ZIP entry `{pkl_name}`: declared size overflows usize"),
-    })?;
-    let mut entry = archive
-        .by_name(&pkl_name)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to open ZIP entry `{pkl_name}`: {e}"),
-        })?;
-    let mut pkl_bytes = Vec::with_capacity(cap);
-    entry
-        .read_to_end(&mut pkl_bytes)
-        .map_err(AnamnesisError::Io)?;
-
+    let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry)?;
     Ok((big_endian, pkl_bytes))
 }
 
-/// Locates the `data.pkl` and optional `byteorder` entries in a `.pth`
-/// archive, returning `(pkl_full_name, pkl_size, byteorder_full_name,
-/// byteorder_size)`.
+/// Reads a `.pth` ZIP entry's full contents into a `Vec`, inflating `DEFLATE`
+/// entries on the fly (the codec stays in this consumer; the vendored container
+/// reader returns the raw bytes).
 ///
-/// The archive's prefix (e.g., `archive/` on `PyTorch ≥ 1.6` or
-/// `{model_name}/` on older saves) is preserved in the returned names so
-/// the caller can pass them to `archive.by_name(...)` verbatim. The
-/// `byteorder` slot is `(None, None)` when the entry is absent.
+/// The caller has already bounded the entry's declared size (the `MAX_PKL_SIZE`
+/// / `MAX_BYTEORDER_SIZE` caps), so the `with_capacity` hint is bounded.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if a `data.pkl` entry is not present
-/// in the archive, or if reading any central-directory entry fails.
-fn locate_inspect_entries<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-) -> crate::Result<(String, u64, Option<String>, Option<u64>)> {
-    let mut pkl: Option<(String, u64)> = None;
-    let mut byteorder: Option<(String, u64)> = None;
-
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to read ZIP entry {i}: {e}"),
-        })?;
-        // BORROW: owned copy — entry name borrows from `ZipArchive`, but
-        // the candidate names must outlive the entry borrow so the caller
-        // can re-open the entry by name.
-        let full_name = entry.name().to_owned();
-        let size = entry.size();
-
-        // Strip the archive prefix to get the suffix; same logic as
-        // `build_entry_index`. `find('/')` returns `Some(idx)` for every
-        // realistic `.pth` archive (both `archive/data.pkl` and
-        // `{model_name}/data.pkl`); files without a prefix are treated
-        // verbatim.
-        let suffix = match full_name.find('/') {
-            Some(pos) => match full_name.get(pos + 1..) {
-                Some(s) => s,
-                None => full_name.as_str(),
-            },
-            None => full_name.as_str(),
-        };
-
-        if suffix == "data.pkl" && pkl.is_none() {
-            pkl = Some((full_name.clone(), size));
-        } else if suffix == "byteorder" && byteorder.is_none() {
-            byteorder = Some((full_name.clone(), size));
-        }
-    }
-
-    let (pkl_name, pkl_size) = pkl.ok_or_else(|| AnamnesisError::Parse {
-        reason: "ZIP entry `data.pkl` not found".into(),
+/// Returns [`AnamnesisError::Unsupported`] if the entry uses a compression
+/// method other than `STORED` or `DEFLATE`, [`AnamnesisError::Parse`] if the
+/// declared size overflows `usize` or the local header is malformed, or
+/// [`AnamnesisError::Io`] if a read fails.
+fn read_pth_entry_bytes<R: Read + Seek>(
+    src: &mut crate::parse::zip::ReaderSource<R>,
+    entry: &crate::parse::zip::ZipEntry,
+) -> crate::Result<Vec<u8>> {
+    let cap = usize::try_from(entry.uncompressed_size).map_err(|_| AnamnesisError::Parse {
+        reason: format!("ZIP entry `{}`: declared size overflows usize", entry.name),
     })?;
-    let (byteorder_name, byteorder_size) = match byteorder {
-        Some((n, s)) => (Some(n), Some(s)),
-        None => (None, None),
+    let raw = src.entry_data_reader(entry)?;
+    let mut buf = Vec::with_capacity(cap);
+    // TRAIT_OBJECT: STORED vs DEFLATE entry readers differ in concrete type; a
+    // boxed `dyn Read` unifies them for the full-entry read.
+    let mut reader: Box<dyn Read + '_> = match entry.method {
+        crate::parse::zip::Compression::Stored => Box::new(raw),
+        crate::parse::zip::Compression::Deflate => Box::new(flate2::read::DeflateDecoder::new(raw)),
+        crate::parse::zip::Compression::Unsupported(method) => {
+            return Err(AnamnesisError::Unsupported {
+                format: "pth".into(),
+                detail: format!(
+                    "ZIP entry `{}` uses unsupported compression method {method}",
+                    entry.name
+                ),
+            });
+        }
     };
-    Ok((pkl_name, pkl_size, byteorder_name, byteorder_size))
+    reader.read_to_end(&mut buf).map_err(AnamnesisError::Io)?;
+    Ok(buf)
 }
 
 /// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`,

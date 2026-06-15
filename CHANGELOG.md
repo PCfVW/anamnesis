@@ -33,6 +33,15 @@ unreachable through `zip`'s API and unbounded by `ParseLimits`).
   oracle (every parse compared index-for-index against the `zip` crate across
   STORED / DEFLATE / `ZIP64` / multi-entry archives, including a 256-archive
   randomized sweep) back the migration.
+- **`.npz` and the `.pth` reader path now run on the vendored reader too**
+  (Step 2). A `ReaderSource` (`Read + Seek` substrate) and a `BoundedReader`
+  (the entry's raw byte window) join `SliceSource`; `inspect_npz`, `parse_npz`,
+  and `inspect_pth_from_reader` all parse the container through
+  `read_central_directory`. `DEFLATE` `.npz` entries still inflate through
+  `flate2` / `miniz_oxide` — the vendored reader hands back the raw compressed
+  bytes and the consumer wraps them in the decoder, so the codec surface is
+  unchanged. `.npy` entries with a non-`STORED`/`DEFLATE` method now fail fast
+  with `AnamnesisError::Unsupported`.
 
 ## [0.6.6] - 2026-06-13
 

@@ -551,6 +551,40 @@ fn read_array_data(
     Ok(buf)
 }
 
+/// Opens a [`Read`] over an `NPZ` entry's bytes, inflating `DEFLATE` entries on
+/// the fly while leaving `STORED` entries as a direct byte window.
+///
+/// The codec lives here, in the `.npz` consumer — the vendored container reader
+/// (`crate::parse::zip`) stays codec-free and hands back the raw (possibly
+/// compressed) entry bytes.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if the entry uses a compression
+/// method other than `STORED` or `DEFLATE`, or [`AnamnesisError::Parse`] /
+/// [`AnamnesisError::Io`] if the entry's local header / data offset cannot be
+/// resolved.
+fn open_npz_entry_reader<'a, R: Read + Seek>(
+    src: &'a mut crate::parse::zip::ReaderSource<R>,
+    entry: &crate::parse::zip::ZipEntry,
+    name: &str,
+) -> crate::Result<Box<dyn Read + 'a>> {
+    let raw = src.entry_data_reader(entry)?;
+    // TRAIT_OBJECT: STORED and DEFLATE entry readers have different concrete
+    // types; a boxed `dyn Read` unifies them for the NPY header/array parser
+    // without duplicating the parse logic per compression method.
+    match entry.method {
+        crate::parse::zip::Compression::Stored => Ok(Box::new(raw)),
+        crate::parse::zip::Compression::Deflate => {
+            Ok(Box::new(flate2::read::DeflateDecoder::new(raw)))
+        }
+        crate::parse::zip::Compression::Unsupported(method) => Err(AnamnesisError::Unsupported {
+            format: "NPZ".into(),
+            detail: format!("array '{name}' uses unsupported ZIP compression method {method}"),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NpzTensorInfo / NpzInspectInfo (lightweight, header-only)
 // ---------------------------------------------------------------------------
@@ -719,25 +753,21 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// `u64::MAX`. Behaviour matches [`inspect_npz`] and differs from
 /// `parse_npz`, which returns `Err` on the same overflow.
 pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzInspectInfo> {
-    let mut archive = zip::ZipArchive::new(reader)?;
+    let mut src = crate::parse::zip::ReaderSource::new(reader)?;
+    let entries = crate::parse::zip::read_central_directory(&mut src)?;
 
-    // Clamp the pre-allocation hint: `archive.len()` is attacker-influenced
-    // (a many-empty-entries zip), so trusting it for `with_capacity` would
-    // commit ~1–2× the file size eagerly. The Vec still grows as entries are
-    // pushed. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP` clamp.
-    let mut tensors = Vec::with_capacity(archive.len().min(PREALLOC_SOFT_CAP));
+    // Clamp the pre-allocation hint: the central-directory entry count is
+    // attacker-influenced (a many-empty-entries zip), so trusting it for
+    // `with_capacity` would commit ~1–2× the file size eagerly. The Vec still
+    // grows as entries are pushed. Mirrors the `GGUF` parser's
+    // `PREALLOC_SOFT_CAP` clamp.
+    let mut tensors = Vec::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
     let mut total_bytes: u64 = 0;
     let mut dtypes: Vec<NpzDtype> = Vec::new();
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to read ZIP entry {i}: {e}"),
-        })?;
-
+    for entry in &entries {
         // Strip .npy suffix; skip non-.npy entries (e.g., __MACOSX/).
-        // BORROW: .to_owned() converts &str from zip entry to owned String
-        let full_name = entry.name().to_owned();
-        let name = match full_name.strip_suffix(".npy") {
+        let name = match entry.name.strip_suffix(".npy") {
             // BORROW: .to_owned() converts &str slice to owned String
             Some(n) => n.to_owned(),
             None => continue,
@@ -747,7 +777,8 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
         // checks against its policy (the inspect-before-parse gate), then calls
         // `parse_npz_with_limits` for enforcement. Unbounded budget keeps the
         // permanent NPY_MAX_HEADER_BYTES cap as the only bound here.
-        let header = parse_npy_header(&mut entry, &mut Budget::unbounded())?;
+        let mut entry_reader = open_npz_entry_reader(&mut src, entry, &name)?;
+        let header = parse_npy_header(&mut entry_reader, &mut Budget::unbounded())?;
 
         if header.fortran_order {
             return Err(AnamnesisError::Unsupported {
@@ -850,11 +881,12 @@ pub fn parse_npz_with_limits(
     limits: &ParseLimits,
 ) -> crate::Result<HashMap<String, NpzTensor>> {
     let file = std::fs::File::open(path.as_ref())?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    let mut src = crate::parse::zip::ReaderSource::new(file)?;
+    let entries = crate::parse::zip::read_central_directory(&mut src)?;
 
     // CAST: usize → u64, lossless widening on all supported targets
     #[allow(clippy::as_conversions)]
-    let entry_count = archive.len() as u64;
+    let entry_count = entries.len() as u64;
     limits.check_item_count(entry_count, "NPZ archive entry count")?;
 
     // One accountant for the whole archive: `parse_npz` holds every array in
@@ -863,17 +895,11 @@ pub fn parse_npz_with_limits(
     // Clamp the pre-allocation hint (see `inspect_npz_from_reader`): a
     // many-empty-entries zip would otherwise drive a ~1–2× file-size eager
     // `HashMap` allocation. The map grows as entries are inserted.
-    let mut result = HashMap::with_capacity(archive.len().min(PREALLOC_SOFT_CAP));
+    let mut result = HashMap::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to read ZIP entry {i}: {e}"),
-        })?;
-
+    for entry in &entries {
         // Strip .npy suffix; skip non-.npy entries (e.g., __MACOSX/).
-        // BORROW: .to_owned() converts &str from zip entry to owned String
-        let full_name = entry.name().to_owned();
-        let name = match full_name.strip_suffix(".npy") {
+        let name = match entry.name.strip_suffix(".npy") {
             // BORROW: .to_owned() converts &str slice to owned String for HashMap key
             Some(n) => n.to_owned(),
             None => continue,
@@ -882,9 +908,13 @@ pub fn parse_npz_with_limits(
         // Zip-bomb guard: reject an entry whose declared uncompressed size is an
         // absurd multiple of its compressed size, from archive metadata, before
         // reading or allocating anything. STORED entries have ratio 1 and pass.
-        limits.check_decompression_ratio(entry.size(), entry.compressed_size(), &name)?;
+        limits.check_decompression_ratio(entry.uncompressed_size, entry.compressed_size, &name)?;
 
-        let header = parse_npy_header(&mut entry, &mut budget)?;
+        // The uncompressed (declared) size is the cross-check bound passed to
+        // `read_array_data`: an entry cannot decode to more than it declares.
+        let entry_size = entry.uncompressed_size;
+        let mut entry_reader = open_npz_entry_reader(&mut src, entry, &name)?;
+        let header = parse_npy_header(&mut entry_reader, &mut budget)?;
 
         if header.fortran_order {
             return Err(AnamnesisError::Unsupported {
@@ -896,8 +926,7 @@ pub fn parse_npz_with_limits(
             });
         }
 
-        let entry_size = entry.size();
-        let data = read_array_data(&mut entry, &header, entry_size, &mut budget)?;
+        let data = read_array_data(&mut entry_reader, &header, entry_size, &mut budget)?;
 
         result.insert(
             name.clone(),
@@ -1482,6 +1511,47 @@ mod tests {
             &ParseLimits::default().with_max_decompression_ratio(1)
         )
         .is_ok());
+    }
+
+    /// Phase 6.12: a `DEFLATE` `.npy` entry inflates correctly through the
+    /// vendored reader's `BoundedReader` + `flate2` decoder — the bytes parsed
+    /// out must equal the original (not just `is_ok()`).
+    #[test]
+    fn parse_npz_deflate_roundtrip_values() {
+        let values: [f32; 6] = [1.5, -2.25, 3.0, 0.0, 42.5, -100.0];
+        let mut raw = Vec::new();
+        for v in &values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("w.npy", options).unwrap();
+            let npy = make_npy_v1(
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (6,), }",
+                &raw,
+            );
+            zip.write_all(&npy).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let tensors = parse_npz(tmp.path()).unwrap();
+        let t = tensors.get("w").expect("w not found");
+        assert_eq!(t.dtype, NpzDtype::F32);
+        assert_eq!(t.shape, vec![6]);
+        assert_eq!(
+            t.data, raw,
+            "inflated DEFLATE bytes must round-trip exactly"
+        );
+
+        // inspect_npz reports the same shape/dtype over the DEFLATE entry too.
+        let info = inspect_npz(tmp.path()).unwrap();
+        assert_eq!(info.tensors.len(), 1);
+        assert_eq!(info.tensors[0].shape, vec![6]);
+        assert_eq!(info.tensors[0].dtype, NpzDtype::F32);
     }
 
     /// The `PREALLOC_SOFT_CAP` clamp on the entry-count pre-allocation hint is

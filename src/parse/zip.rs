@@ -38,6 +38,7 @@
 //! denylisted.
 
 use std::borrow::Cow;
+use std::io::{Read, Seek};
 
 use crate::error::AnamnesisError;
 use crate::parse::utils::PREALLOC_SOFT_CAP;
@@ -169,6 +170,108 @@ impl ZipSource for SliceSource<'_> {
             })?;
         buf.copy_from_slice(src);
         Ok(())
+    }
+}
+
+/// A [`ZipSource`] backed by any `Read + Seek` substrate (the `.npz` and
+/// `.pth`-reader paths — a [`std::fs::File`], an in-memory [`std::io::Cursor`],
+/// or an `HTTP`-range adapter). `read_at` issues a `seek` + `read_exact` per
+/// region; the central-directory reader keeps those to a handful of bulk reads
+/// (EOCD scan, the directory, each named entry's local header).
+pub(crate) struct ReaderSource<R: Read + Seek> {
+    /// The underlying positional reader.
+    reader: R,
+    /// Total length, captured once at construction.
+    len: u64,
+}
+
+impl<R: Read + Seek> ReaderSource<R> {
+    /// Wraps `reader`, capturing its total length via a one-time
+    /// `seek(End(0))`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Io`] if the initial seek fails.
+    pub(crate) fn new(mut reader: R) -> crate::Result<Self> {
+        let len = reader
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(AnamnesisError::Io)?;
+        Ok(Self { reader, len })
+    }
+
+    /// Returns a [`Read`] over the raw (possibly compressed) bytes of `entry`,
+    /// bounded to the entry's `compressed_size`.
+    ///
+    /// Codec-free: a `DEFLATE` entry's bytes are returned **compressed**; the
+    /// caller wraps the result in `flate2`'s decoder (the codec stays out of
+    /// this container module). The reader is positioned at the entry's data
+    /// offset, resolved from its local header by [`data_start`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the local header is malformed or
+    /// the data range exceeds the source, or [`AnamnesisError::Io`] if a seek
+    /// fails.
+    pub(crate) fn entry_data_reader(
+        &mut self,
+        entry: &ZipEntry,
+    ) -> crate::Result<BoundedReader<'_, R>> {
+        let start = data_start(self, entry)?;
+        self.reader
+            .seek(std::io::SeekFrom::Start(start))
+            .map_err(AnamnesisError::Io)?;
+        Ok(BoundedReader {
+            inner: &mut self.reader,
+            remaining: entry.compressed_size,
+        })
+    }
+}
+
+impl<R: Read + Seek> ZipSource for ReaderSource<R> {
+    fn total_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::Result<()> {
+        self.reader
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(AnamnesisError::Io)?;
+        self.reader.read_exact(buf).map_err(AnamnesisError::Io)?;
+        Ok(())
+    }
+}
+
+/// A [`Read`] adapter that yields at most `remaining` bytes from a borrowed
+/// underlying reader — the raw byte window of a single `ZIP` entry.
+///
+/// Returned by [`ReaderSource::entry_data_reader`]. Bounding the read to the
+/// entry's `compressed_size` stops one entry's reader from running into the
+/// next entry's bytes (or the central directory) on a malformed archive.
+pub(crate) struct BoundedReader<'a, R> {
+    /// The borrowed underlying reader, positioned at the entry's data offset.
+    inner: &'a mut R,
+    /// Bytes still readable from this entry.
+    remaining: u64,
+}
+
+impl<R: Read> Read for BoundedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        // CAST: usize → u64 lossless, then u64 → usize after the `min` clamps
+        // the value to `buf.len()`, so the narrowing cannot truncate.
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let want = (buf.len() as u64).min(self.remaining) as usize;
+        // INDEX: `want <= buf.len()` by the `min` above, so the slice is in
+        // bounds; bounding the read keeps one entry from reading into the next.
+        #[allow(clippy::indexing_slicing)]
+        let n = self.inner.read(&mut buf[..want])?;
+        // CAST: usize → u64, lossless widening
+        #[allow(clippy::as_conversions)]
+        let read_u64 = n as u64;
+        self.remaining = self.remaining.saturating_sub(read_u64);
+        Ok(n)
     }
 }
 
