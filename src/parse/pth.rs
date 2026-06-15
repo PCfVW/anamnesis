@@ -2082,12 +2082,14 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 /// Parses a `.pth` archive under a caller-supplied [`ParseLimits`] budget.
 ///
 /// Identical to [`parse_pth`] but enforces the caller's [`ParseLimits`] —
-/// fail-fast, before allocation — over the declared `data.pkl` entry size (the
-/// per-allocation cap) and each 4-byte-length pickle payload (per-allocation
-/// **and** the cumulative-byte aggregate, since each payload is an owned
-/// clone). The built-in `MAX_PKL_SIZE` / `MAX_PICKLE_PAYLOAD` caps still apply;
-/// `limits` can only tighten them. [`parse_pth`] is the `ParseLimits::default()`
-/// (unbounded) special case.
+/// fail-fast, before allocation — over the `ZIP` container metadata (the
+/// declared central-directory entry count, via `max_item_count`), the declared
+/// `data.pkl` entry size (the per-allocation cap), and each 4-byte-length
+/// pickle payload (per-allocation **and** the cumulative-byte aggregate, since
+/// each payload is an owned clone). The built-in `ZIP_MAX_ENTRIES` /
+/// `MAX_PKL_SIZE` / `MAX_PICKLE_PAYLOAD` caps still apply; `limits` can only
+/// tighten them. [`parse_pth`] is the `ParseLimits::default()` (unbounded)
+/// special case.
 ///
 /// The pickle VM's **working set** — the value stack, memoised clones, and
 /// nested values — is governed (Phase 6.11): every value the VM allocates is
@@ -2106,7 +2108,8 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch`
 /// ZIP archive, uses unsupported pickle opcodes, contains non-allowlisted
-/// globals, or a declared `data.pkl` / pickle payload exceeds `limits`.
+/// globals, or a declared `ZIP` entry count / `data.pkl` / pickle payload
+/// exceeds `limits`.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
 /// files that are raw pickle without ZIP wrapping.

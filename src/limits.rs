@@ -59,7 +59,9 @@ pub struct ParseLimits {
     /// Upper bound, in bytes, on any single header-declared buffer a parser
     /// allocates eagerly: an `NPZ` array and `NPY` header, a `.pth` `data.pkl`
     /// entry and each pickle string/bytes payload, a `GGUF` variable-length
-    /// (string) read and scalar metadata array, and the safetensors header.
+    /// (string) read and scalar metadata array, the safetensors header, and the
+    /// `ZIP` central-directory read on the streaming (`.npz` / `.pth`-reader)
+    /// path (the mmap `.pth` path reads it zero-copy, so it is not charged).
     /// [`u64::MAX`] means unbounded — only the per-format constant cap applies.
     ///
     /// Not covered (by design): memory-mapped tensor bodies, which are never
@@ -81,7 +83,8 @@ pub struct ParseLimits {
     max_total_bytes: u64,
 
     /// Upper bound on the total number of declared items in a file — `GGUF`
-    /// tensors and metadata KV entries, or `NPZ` archive entries. [`u64::MAX`]
+    /// tensors and metadata KV entries, or `ZIP` central-directory entries (the
+    /// `.npz` and `.pth` containers, via the vendored reader). [`u64::MAX`]
     /// means unbounded — only the per-format constant cap applies.
     max_item_count: u64,
 

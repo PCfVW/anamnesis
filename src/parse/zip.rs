@@ -1211,6 +1211,30 @@ mod tests {
     }
 
     #[test]
+    fn mmap_borrow_path_skips_cd_single_alloc_charge() {
+        // The mmap (`SliceSource`) path reads the central directory zero-copy,
+        // so a tiny `max_single_alloc` that rejects the streaming path must NOT
+        // reject the borrow path — it allocates nothing for the directory.
+        let archive = build_zip(&[
+            (
+                "archive/data.pkl",
+                ::zip::CompressionMethod::Stored,
+                b"data",
+            ),
+            (
+                "archive/data/0",
+                ::zip::CompressionMethod::Stored,
+                &[0u8; 32],
+            ),
+        ]);
+        let mut src = SliceSource::new(&archive);
+        let limits = ParseLimits::default().with_max_single_alloc(8);
+        let entries = read_central_directory(&mut src, &limits)
+            .expect("mmap borrow path must not be charged for the directory read");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
     fn cd_single_alloc_limit_rejects_reader_path() {
         // The streaming (reader) path charges the central-directory read to
         // `max_single_alloc`; a tiny cap rejects it before allocating. (The

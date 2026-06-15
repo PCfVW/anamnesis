@@ -481,6 +481,10 @@ Exemplars in this crate:
   the captured `file_len` **before** the buffer is allocated (`src/parse/gguf.rs`).
 - `NPZ`: `read_array_data` rejects a shape-derived `data_bytes` exceeding the
   `ZIP` entry's declared `size()` before the `vec!` (`src/parse/npz.rs`).
+- Vendored `ZIP` reader: `data_start` cross-checks each entry's
+  `data_start + compressed_size` against the source length, and
+  `read_central_directory` validates `cd_offset + cd_size ≤ total_len`, before
+  any slice or read (`src/parse/zip.rs`).
 
 When the same bound guards two entry points (an mmap path and a reader path),
 factor it into one helper so the two cannot drift — as `enforce_pkl_size_cap`
