@@ -31,6 +31,7 @@
 - [PyTorch `.pth` Inspection](#pytorch-pth-inspection)
 - [Parser robustness (untrusted-input hardening)](#parser-robustness-untrusted-input-hardening)
 - [Performance validation (Phase 6.5)](#performance-validation-phase-65)
+- [Documentation](#documentation)
 - [Used by](#used-by)
 - [License](#license)
 - [Development](#development)
@@ -351,6 +352,16 @@ Three dev-only validation tracks ship alongside v0.6.0 — none of them affect t
 - **[Criterion runtime benchmarks](benches/README.md)** — `benches/dequant.rs` covers 7 synthetic-layer-sized kernel groups (FP8, GPTQ, AWQ, BnB NF4, BnB INT8, GGUF Q4_K, plus FP8 fine-grained) at `4096 × 11008`, reporting **657 Melem/s → 2.01 Gelem/s** on the dev machine. `benches/parsing.rs` covers header-only parses for all four formats vs an `fs::read` baseline. Plus a real-world group on the Ollama-cached `llama3.2:1b` `Q8_0` slice (**3.92 Gelem/s**). Run with `cargo bench --features gptq,awq,bnb,gguf,npz,pth`.
 - **[`dhat-rs` peak-heap assertions](tests/peak_heap_README.md)** — three `#[ignore]`d test binaries that wrap the global allocator and assert observed peak heap stays within the documented ceiling. **Every kernel's observed scratch matches the documented `# Memory` claim to the byte**: GPTQ/AWQ at `3 × out_features × 4`, BnB-DQ at `num_blocks × 4 + block_size × 4`. Run with `cargo test --release --features gptq --test peak_heap_gptq -- --ignored --nocapture` (and similarly for `awq` / `bnb_dq`).
 - **[Ollama cross-validation](tests/cross_validation_ollama.rs)** — bit-exact `Q8_0` dequant against the `gguf-py` reference on a slice extracted from the local Ollama cache's `llama3.2:1b` blob. Same kernel anamnesis already validates against bartowski / `TheBloke` quantisations, now on the dominant local-LLM distribution channel too. Result: **0 ULP mismatches**.
+
+## Documentation
+
+| Doc | |
+|-----|---|
+| [FAQ](docs/FAQ.md) | Common questions — install, feature flags, formats, `inspect` vs `parse`, dequantizing/converting, untrusted input |
+| [Tutorial: Inspect before you parse (untrusted input)](docs/tutorials/inspect-before-you-parse.md) | Walkthrough: the `inspect → check → parse` safety pattern, how a hostile file is rejected, and bounding memory with `ParseLimits` |
+| [Tutorial: Dequantize a GGUF model to BF16](docs/tutorials/dequantize-a-gguf-model.md) | Walkthrough (`inspect` → `remember` → verify): a GGUF k-quant becomes standard `BF16` safetensors, loadable in candle/burn/tch |
+
+More walkthroughs land under [docs/tutorials/](docs/tutorials/) as features ship; Python-specific docs (FAQ section + a `pip`-to-NumPy tutorial) arrive with the bindings in v0.8.0.
 
 ## Used by
 

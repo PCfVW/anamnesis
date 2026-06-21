@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **User documentation scaffold**, mirroring the sibling `hf-fetch-model`
+  `docs/` system: a [`docs/FAQ.md`](docs/FAQ.md) (install, feature flags,
+  supported formats, `inspect` vs `parse`, dequantizing/converting, parsing
+  untrusted input) and two [`docs/tutorials/`](docs/tutorials/) walkthroughs —
+  [Inspect before you parse (untrusted input)](docs/tutorials/inspect-before-you-parse.md)
+  and [Dequantize a GGUF model to BF16](docs/tutorials/dequantize-a-gguf-model.md)
+  — both with real captured output. Each doc carries a `STYLE CONVENTIONS`
+  block and a freshness marker, and they are discoverable from a new
+  **Documentation** table in the README.
+
 ### Changed
 
+- **Release builds now set `panic = "abort"`** (`[profile.release]` in
+  `Cargo.toml`). The untrusted-input DoS analysis (parser docs, `CHANGELOG`
+  Security notes) has long *assumed* abort-on-panic when arguing severity;
+  this makes that the committed, fail-closed behaviour rather than an unstated
+  assumption. Cargo auto-rebuilds test/bench targets with `unwind` (libtest
+  requires it), so the test suite is unaffected. (The future PyO3 extension
+  `cdylib` will override this back to `unwind` so panics surface as catchable
+  Python exceptions — see the roadmap's Phase 6.13.)
 - **Bumped the `safetensors` dependency from `0.4` to `0.8`** (latest at
   0.8.0, 2026-06-09). anamnesis uses `safetensors` only as the output writer
   (and a test-side reader) — production header parsing is anamnesis's own

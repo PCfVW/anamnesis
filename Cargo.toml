@@ -25,6 +25,22 @@ exclude = ["/fuzz"]
 [package.metadata.docs.rs]
 features = ["npz", "pth", "gguf", "awq", "gptq", "bnb", "ollama"]
 
+# Production release artefacts (the `anamnesis` / `amn` CLI binaries, and any
+# release build of the library) abort on panic. The untrusted-input DoS analysis
+# (`ROADMAP.md` Phases 6.6–6.13, `CHANGELOG.md` Security notes, `src/parse/pth.rs`)
+# treats a reachable panic as a process kill and argues severity on that basis;
+# `panic = "abort"` makes that the committed, fail-closed behaviour rather than an
+# unstated assumption. Cargo automatically rebuilds test/bench targets with
+# `unwind` (libtest requires it), so `cargo test` / `cargo test --release` are
+# unaffected.
+#
+# Phase 6.13 exception (lands with the Phase 7 `python` feature, not here): the
+# PyO3 extension `cdylib` must build `panic = "unwind"` so PyO3 converts a Rust
+# panic into a catchable Python `PanicException` instead of aborting the host
+# worker. That override belongs to the maturin/`python` build configuration.
+[profile.release]
+panic = "abort"
+
 [features]
 default = []
 cli = ["dep:clap"]
