@@ -34,6 +34,7 @@ use std::fmt;
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
@@ -299,12 +300,15 @@ struct TensorMeta {
 /// A parsed `.pth` file — owns the memory-mapped data and provides
 /// zero-copy tensor access.
 ///
-/// Created by [`parse_pth`]. Call [`tensors()`](ParsedPth::tensors) to get
-/// `PthTensor` views that borrow directly from the mapped file region.
+/// Created by [`parse_pth`] (memory-mapped) or by [`parse_pth_bytes`] /
+/// [`parse_pth_from_reader`] (owned copy). Call
+/// [`tensors()`](ParsedPth::tensors) to get `PthTensor` views that borrow
+/// directly from the backing bytes.
 #[derive(Debug)]
 pub struct ParsedPth {
-    /// Memory-mapped file.
-    mmap: memmap2::Mmap,
+    /// File bytes — a memory map (path-based [`parse_pth`]) or an owned
+    /// `Vec<u8>` (copy-based [`parse_pth_bytes`] / [`parse_pth_from_reader`]).
+    buffer: Backing,
     /// Per-tensor metadata (name, shape, dtype, storage location).
     meta: Vec<TensorMeta>,
     /// ZIP entry index: suffix → `(data_start, data_len)` in the mmap.
@@ -379,10 +383,10 @@ impl ParsedPth {
                     reason: format!("ZIP entry `{storage_suffix}` not found"),
                 })?;
             let storage = self
-                .mmap
+                .buffer
                 .get(storage_start..storage_start + storage_len)
                 .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("storage `{}`: mmap slice out of bounds", m.storage_key),
+                    reason: format!("storage `{}`: backing slice out of bounds", m.storage_key),
                 })?;
 
             let elem_size = m.dtype.byte_size();
@@ -2133,8 +2137,21 @@ pub fn parse_pth_with_limits(
     // mapped region if another process writes to the file concurrently.
     // Model files are read-only artifacts — this is the standard assumption
     // for all tensor format parsers (same as safetensors crate's mmap path).
+    // Untrusted callers that cannot make that assumption use `parse_pth_bytes`
+    // / `parse_pth_from_reader` instead (no mmap, no `SIGBUS`).
     let raw =
         unsafe { memmap2::MmapOptions::new().populate().map(&file) }.map_err(AnamnesisError::Io)?;
+    parsed_pth_from_backing(Backing::Mmap(raw), limits)
+}
+
+/// Builds a [`ParsedPth`] from an already-acquired byte backing — the single
+/// construction site shared by the mmap path ([`parse_pth_with_limits`]) and
+/// the copy-based paths ([`parse_pth_bytes_with_limits`] /
+/// [`parse_pth_from_reader_with_limits`]). All parsing runs over the backing as
+/// a `&[u8]`, so the logic cannot drift between paths; the backing is retained
+/// so [`ParsedPth::tensors`] can borrow tensor data from it.
+fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Result<ParsedPth> {
+    let raw: &[u8] = &buffer;
 
     // Legacy format detection: check ZIP magic before attempting to parse.
     let magic = raw.get(..4).ok_or_else(|| AnamnesisError::Parse {
@@ -2158,7 +2175,7 @@ pub fn parse_pth_with_limits(
     //    over the vendored central-directory reader (Phase 6.12). This replaces
     //    the O(n) find_entry_name scanning per tensor. `limits` bounds the
     //    container metadata fail-fast.
-    let entry_index = build_entry_index(&raw, limits)?;
+    let entry_index = build_entry_index(raw, limits)?;
 
     // 2. Read byte order (default to little-endian).
     let big_endian = match entry_index.get("byteorder") {
@@ -2187,7 +2204,7 @@ pub fn parse_pth_with_limits(
     };
 
     // 3. Read and execute the pickle stream, then extract tensor metadata.
-    //    Data is NOT copied here — `tensors()` will borrow from the mmap.
+    //    Data is NOT copied here — `tensors()` will borrow from the backing.
     let (pkl_start, pkl_len) =
         entry_index
             .get("data.pkl")
@@ -2215,11 +2232,109 @@ pub fn parse_pth_with_limits(
     let meta = interpret_pickle_to_meta(pkl_data, limits)?;
 
     Ok(ParsedPth {
-        mmap: raw,
+        buffer,
         meta,
         entry_index,
         big_endian,
     })
+}
+
+/// Parses `.pth` bytes already held in memory, returning a [`ParsedPth`] that
+/// **owns** them — the copy-based, mmap-free path.
+///
+/// **Recommended for untrusted input**: no mmap, so a truncated or hostile
+/// source is a clean `Err`, never a `SIGBUS`. [`parse_pth_bytes`] is the
+/// [`ParseLimits::default`] (unbounded) special case of
+/// [`parse_pth_bytes_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::Unsupported`] on the
+/// same conditions as [`parse_pth_with_limits`] (invalid ZIP, unsupported pickle
+/// opcodes, non-allowlisted globals, legacy format, or a declared size exceeding
+/// `limits`).
+///
+/// # Memory
+///
+/// Takes ownership of `bytes` (no copy); peak heap is the input size plus the
+/// per-tensor metadata.
+pub fn parse_pth_bytes(bytes: Vec<u8>) -> crate::Result<ParsedPth> {
+    parse_pth_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Parses owned `.pth` bytes under a caller-supplied [`ParseLimits`] budget —
+/// the bounded, mmap-free path for untrusted input.
+///
+/// Rejects an input larger than [`ParseLimits::max_single_alloc_bytes`] before
+/// parsing, then enforces every applicable `limits` ceiling exactly as
+/// [`parse_pth_with_limits`] does.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `bytes` exceeds `limits` or on the
+/// malformed-input conditions of [`parse_pth_with_limits`].
+/// Returns [`AnamnesisError::Unsupported`] for a legacy (pre-1.6) `.pth` file.
+///
+/// # Memory
+///
+/// Takes ownership of `bytes` (no copy); peak heap is the input size plus the
+/// per-tensor metadata.
+pub fn parse_pth_bytes_with_limits(
+    bytes: Vec<u8>,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedPth> {
+    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
+        reason: "pth bytes: length overflows u64".into(),
+    })?;
+    limits.check_alloc(len, "pth bytes")?;
+    parsed_pth_from_backing(Backing::Owned(bytes), limits)
+}
+
+/// Parses a `.pth` artefact from any reader, returning a [`ParsedPth`] that
+/// **owns** the bytes — the copy-based, mmap-free path.
+///
+/// **Recommended for untrusted streamed input.** [`parse_pth_from_reader`] is
+/// the [`ParseLimits::default`] (unbounded) special case of
+/// [`parse_pth_from_reader_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails, [`AnamnesisError::Parse`]
+/// on malformed input, or [`AnamnesisError::Unsupported`] for a legacy `.pth`
+/// file.
+///
+/// # Memory
+///
+/// Reads the whole stream into an owned `Vec<u8>`; peak heap is the artefact
+/// size plus the per-tensor metadata.
+pub fn parse_pth_from_reader<R: Read>(reader: R) -> crate::Result<ParsedPth> {
+    parse_pth_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses a `.pth` artefact from any reader under a caller-supplied
+/// [`ParseLimits`] budget — the bounded, mmap-free path for untrusted input.
+///
+/// The read is bounded by [`ParseLimits::max_single_alloc_bytes`] so an
+/// unbounded or hostile stream cannot exhaust memory.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails.
+/// Returns [`AnamnesisError::Parse`] if the bytes read exceed `limits` or on the
+/// malformed-input conditions of [`parse_pth_with_limits`].
+/// Returns [`AnamnesisError::Unsupported`] for a legacy `.pth` file.
+///
+/// # Memory
+///
+/// Reads the stream into an owned `Vec<u8>` of at most
+/// `max_single_alloc_bytes + 1` bytes; peak heap is the artefact size plus the
+/// per-tensor metadata.
+pub fn parse_pth_from_reader_with_limits<R: Read>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedPth> {
+    let bytes = limits.read_to_vec_bounded(reader, "pth file")?;
+    parse_pth_bytes_with_limits(bytes, limits)
 }
 
 /// Runs the pickle VM on `pkl_data` and extracts the per-tensor metadata

@@ -316,9 +316,18 @@ Each accepted use must satisfy all of:
 4. **Non-`unsafe` parity where it exists.** SIMD-shaped opt-ins keep a scalar
    fallback tested identically. mmap-based inspection paths expose a
    reader-generic alternative (`parse_safetensors_header_from_reader`,
-   `inspect_npz_from_reader`, …) parity-tested against the mmap path. Full
-   mmap-based parsing has no non-`unsafe` equivalent and is exempt — see
-   `ROADMAP.md` for the scope rationale.
+   `inspect_npz_from_reader`, …) parity-tested against the mmap path. As of
+   Phase 6.13, **full parsing has non-`unsafe` parity too**: every mmap `parse*`
+   entry point has a copy-based, zero-`unsafe`, zero-mmap sibling
+   (`parse_bytes` / `parse_from_reader` for safetensors, `parse_gguf_bytes` /
+   `parse_gguf_from_reader`, `parse_pth_bytes` / `parse_pth_from_reader`) that
+   reads the artefact into an owned `Backing::Owned` buffer and shares the same
+   structure parser — parity-tested against the mmap path in
+   `tests/parse_owned_path.rs`. The owned path is the recommended entry for
+   untrusted input (a faulting mmap raises an uncatchable `SIGBUS`); the mmap
+   path remains the trusted-local-file fast path. The `unsafe` `Mmap::map` call
+   itself still has no non-`unsafe` substitute and stays on the path-based
+   entries only.
 
 Adding a new accepted use requires updating this table and the `cfg_attr` lines
 in `lib.rs`.

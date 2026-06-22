@@ -280,6 +280,52 @@ impl ParseLimits {
             _ => Ok(()),
         }
     }
+
+    /// Reads an entire reader into an owned `Vec<u8>`, bounded by
+    /// [`ParseLimits::max_single_alloc_bytes`] so a hostile or unbounded stream
+    /// cannot exhaust memory before the parser sees it. The read is capped at
+    /// `max_single_alloc_bytes + 1` bytes; reaching that cap trips
+    /// [`check_alloc`](Self::check_alloc) and the read is rejected with a clean
+    /// `Err` instead of growing without bound. This is the copy-based
+    /// untrusted-input path's counterpart to the mmap path's lazy paging — both
+    /// route the size check through `check_alloc` so the bound cannot drift.
+    ///
+    /// `context` names the source for the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Io`](crate::AnamnesisError::Io) if the
+    /// underlying read fails.
+    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if the
+    /// bytes read exceed the caller's
+    /// [`ParseLimits::max_single_alloc_bytes`] budget.
+    ///
+    /// # Memory
+    ///
+    /// Allocates one `Vec<u8>` holding the whole stream (at most
+    /// `max_single_alloc_bytes + 1` bytes). With `ParseLimits::default()` the
+    /// bound is `u64::MAX`, i.e. effectively the file size — matching the mmap
+    /// path's no-inherent-limit behaviour.
+    // Used by the copy-based `parse_*_from_reader` entry points (always-on
+    // safetensors + the `gguf`/`pth` features); never dead in the public sense.
+    pub(crate) fn read_to_vec_bounded<R: std::io::Read>(
+        &self,
+        reader: R,
+        context: &str,
+    ) -> crate::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let cap = self.max_single_alloc_bytes.saturating_add(1);
+        let mut buf = Vec::new();
+        reader
+            .take(cap)
+            .read_to_end(&mut buf)
+            .map_err(crate::AnamnesisError::Io)?;
+        let read_len = u64::try_from(buf.len()).map_err(|_| crate::AnamnesisError::Parse {
+            reason: format!("{context}: read length overflows u64"),
+        })?;
+        self.check_alloc(read_len, context)?;
+        Ok(buf)
+    }
 }
 
 impl Default for ParseLimits {

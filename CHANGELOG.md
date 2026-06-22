@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Copy-based (`no-mmap`) full-parse entry points** for every mmap-backed
+  format (Phase 6.13 Step 1): `parse_bytes` / `parse_from_reader` (safetensors),
+  `parse_gguf_bytes` / `parse_gguf_from_reader`, and `parse_pth_bytes` /
+  `parse_pth_from_reader`, each with a `_with_limits` variant. They read the
+  artefact into an owned buffer (bounded by `ParseLimits::max_single_alloc_bytes`)
+  and parse with **zero `unsafe` and zero mmap**, so a truncated or
+  concurrently-written source yields a clean `Err` instead of an uncatchable
+  `SIGBUS` — the **recommended entry point for untrusted input** (e.g. a
+  user-uploaded file). The path-based `parse` / `parse_gguf` / `parse_pth` keep
+  memory-mapping as the trusted-local-file fast path; behaviour and output are
+  unchanged. Internally the three `Parsed*` types now hold their bytes behind a
+  shared `Backing` (mmap or owned), so both paths share one type and one
+  structure parser. Parity is pinned by `tests/parse_owned_path.rs`.
 - **User documentation scaffold**, mirroring the sibling `hf-fetch-model`
   `docs/` system: a [`docs/FAQ.md`](docs/FAQ.md) (install, feature flags,
   supported formats, `inspect` vs `parse`, dequantizing/converting, parsing

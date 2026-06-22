@@ -41,9 +41,10 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::utils::PREALLOC_SOFT_CAP;
@@ -994,12 +995,14 @@ impl fmt::Display for GgufInspectInfo {
 /// A parsed `GGUF` file — owns the memory-mapped data and provides
 /// zero-copy tensor views.
 ///
-/// Created by [`parse_gguf`]. Call [`tensors`](Self::tensors) to obtain
-/// [`GgufTensor`] views borrowed directly from the mapped file.
+/// Created by [`parse_gguf`] (memory-mapped) or by [`parse_gguf_bytes`] /
+/// [`parse_gguf_from_reader`] (owned copy). Call [`tensors`](Self::tensors) to
+/// obtain [`GgufTensor`] views borrowed directly from the backing bytes.
 #[derive(Debug)]
 pub struct ParsedGguf {
-    /// Memory-mapped file.
-    mmap: memmap2::Mmap,
+    /// File bytes — a memory map (path-based [`parse_gguf`]) or an owned
+    /// `Vec<u8>` (copy-based [`parse_gguf_bytes`] / [`parse_gguf_from_reader`]).
+    buffer: Backing,
     /// `GGUF` version read from the header.
     version: u32,
     /// Effective tensor-data alignment in bytes.
@@ -1083,7 +1086,7 @@ impl ParsedGguf {
             let start = usize::try_from(info.data_offset).ok()?;
             let byte_len = usize::try_from(byte_len_u64).ok()?;
             let end = start.checked_add(byte_len)?;
-            let slice = self.mmap.get(start..end)?;
+            let slice = self.buffer.get(start..end)?;
             Some(GgufTensor {
                 name: info.name.as_str(),
                 shape: info.shape.as_slice(),
@@ -1156,13 +1159,13 @@ impl ParsedGguf {
                 ),
             })?;
         let data = self
-            .mmap
+            .buffer
             .get(start..end)
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!(
-                    "tensor `{}`: byte range {start}..{end} exceeds mmap length {}",
+                    "tensor `{}`: byte range {start}..{end} exceeds backing length {}",
                     info.name,
-                    self.mmap.len()
+                    self.buffer.len()
                 ),
             })?;
         let n_elements: usize = info
@@ -1704,24 +1707,127 @@ pub fn parse_gguf_with_limits(
     // the mapped region if another process writes to the underlying file
     // concurrently. Tensor files are read-only artefacts in practice — the
     // same assumption every other anamnesis format parser (pth, safetensors
-    // via the `safetensors` crate) relies on.
+    // via the `safetensors` crate) relies on. Untrusted callers that cannot
+    // make that assumption use `parse_gguf_bytes` / `parse_gguf_from_reader`
+    // instead (no mmap, no `SIGBUS`).
     let raw =
         unsafe { memmap2::MmapOptions::new().populate().map(&file) }.map_err(AnamnesisError::Io)?;
+    parsed_gguf_from_backing(Backing::Mmap(raw), limits)
+}
 
-    // Wrap the mmap in a `std::io::Cursor` so the parser core can run over
-    // it via the same `Read + Seek` substrate the reader-generic
-    // `inspect_gguf_from_reader` uses. The mmap stays alive for the whole
-    // `ParsedGguf` lifetime so that `ParsedGguf::tensors` can hand out
-    // zero-copy `Cow::Borrowed` slices into it after parsing.
-    let parsed = parse_gguf_from_reader(std::io::Cursor::new(&raw[..]), limits)?;
-
+/// Builds a [`ParsedGguf`] from an already-acquired byte backing — the single
+/// construction site shared by the mmap path ([`parse_gguf_with_limits`]) and
+/// the copy-based paths ([`parse_gguf_bytes_with_limits`] /
+/// [`parse_gguf_from_reader_with_limits`]). The structure is read over a
+/// `Cursor` so the same `Read + Seek` core ([`read_gguf_structure`]) serves
+/// every path; the backing is retained so [`ParsedGguf::tensors`] can hand out
+/// zero-copy `Cow::Borrowed` slices into it.
+fn parsed_gguf_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Result<ParsedGguf> {
+    let front = read_gguf_structure(Cursor::new(&buffer[..]), limits)?;
     Ok(ParsedGguf {
-        mmap: raw,
-        version: parsed.version,
-        alignment: parsed.alignment,
-        metadata: parsed.metadata,
-        tensor_infos: parsed.tensor_infos,
+        buffer,
+        version: front.version,
+        alignment: front.alignment,
+        metadata: front.metadata,
+        tensor_infos: front.tensor_infos,
     })
+}
+
+/// Parses `GGUF` bytes already held in memory, returning a [`ParsedGguf`] that
+/// **owns** them — the copy-based, mmap-free path.
+///
+/// **Recommended for untrusted input**: no mmap, so a truncated or hostile
+/// source is a clean `Err`, never a `SIGBUS`. [`parse_gguf_bytes`] is the
+/// [`ParseLimits::default`] (unbounded) special case of
+/// [`parse_gguf_bytes_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
+/// [`parse_gguf_with_limits`], or [`AnamnesisError::Unsupported`] for an
+/// unsupported `GGUF` variant.
+///
+/// # Memory
+///
+/// Takes ownership of `bytes` (no copy); peak heap is the input size plus
+/// `O(n_tensors + n_metadata_kv)`.
+pub fn parse_gguf_bytes(bytes: Vec<u8>) -> crate::Result<ParsedGguf> {
+    parse_gguf_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Parses owned `GGUF` bytes under a caller-supplied [`ParseLimits`] budget —
+/// the bounded, mmap-free path for untrusted input.
+///
+/// Rejects an input larger than [`ParseLimits::max_single_alloc_bytes`] before
+/// parsing, then enforces every applicable `limits` ceiling exactly as
+/// [`parse_gguf_with_limits`] does.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `bytes` exceeds `limits` or on the
+/// malformed-input conditions of [`parse_gguf_with_limits`].
+/// Returns [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
+///
+/// # Memory
+///
+/// Takes ownership of `bytes` (no copy); peak heap is the input size plus
+/// `O(n_tensors + n_metadata_kv)`.
+pub fn parse_gguf_bytes_with_limits(
+    bytes: Vec<u8>,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedGguf> {
+    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
+        reason: "GGUF bytes: length overflows u64".into(),
+    })?;
+    limits.check_alloc(len, "GGUF bytes")?;
+    parsed_gguf_from_backing(Backing::Owned(bytes), limits)
+}
+
+/// Parses a `GGUF` artefact from any reader, returning a [`ParsedGguf`] that
+/// **owns** the bytes — the copy-based, mmap-free path.
+///
+/// **Recommended for untrusted streamed input.** [`parse_gguf_from_reader`] is
+/// the [`ParseLimits::default`] (unbounded) special case of
+/// [`parse_gguf_from_reader_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails, [`AnamnesisError::Parse`]
+/// on malformed input, or [`AnamnesisError::Unsupported`] for an unsupported
+/// `GGUF` variant.
+///
+/// # Memory
+///
+/// Reads the whole stream into an owned `Vec<u8>`; peak heap is the artefact
+/// size plus `O(n_tensors + n_metadata_kv)`.
+pub fn parse_gguf_from_reader<R: Read>(reader: R) -> crate::Result<ParsedGguf> {
+    parse_gguf_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses a `GGUF` artefact from any reader under a caller-supplied
+/// [`ParseLimits`] budget — the bounded, mmap-free path for untrusted input.
+///
+/// The read is bounded by [`ParseLimits::max_single_alloc_bytes`] so an
+/// unbounded or hostile stream cannot exhaust memory.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails.
+/// Returns [`AnamnesisError::Parse`] if the bytes read exceed `limits` or on the
+/// malformed-input conditions of [`parse_gguf_with_limits`].
+/// Returns [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
+///
+/// # Memory
+///
+/// Reads the stream into an owned `Vec<u8>` of at most
+/// `max_single_alloc_bytes + 1` bytes; peak heap is the artefact size plus
+/// `O(n_tensors + n_metadata_kv)`.
+pub fn parse_gguf_from_reader_with_limits<R: Read>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedGguf> {
+    let bytes = limits.read_to_vec_bounded(reader, "GGUF file")?;
+    parse_gguf_bytes_with_limits(bytes, limits)
 }
 
 /// Reader-generic core extracted from [`parse_gguf`].
@@ -1738,7 +1844,7 @@ pub fn parse_gguf_with_limits(
 /// product, plus per-tensor alignment and end-of-data bounds checks against
 /// the stream's total length (captured via `seek(SeekFrom::End(0))` once at
 /// reader construction).
-fn parse_gguf_from_reader<R: Read + Seek>(
+fn read_gguf_structure<R: Read + Seek>(
     reader: R,
     limits: &ParseLimits,
 ) -> crate::Result<GgufFrontMatter> {
@@ -2106,7 +2212,7 @@ pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<Gguf
     // checks against its policy (the inspect-before-parse gate), then the host
     // calls `parse_gguf_with_limits` for the real enforcement. So pass the
     // unbounded default — the permanent GGUF caps remain the only bound here.
-    let front = parse_gguf_from_reader(buffered, &ParseLimits::default())?;
+    let front = read_gguf_structure(buffered, &ParseLimits::default())?;
     Ok(build_inspect_info(
         front.version,
         front.alignment,

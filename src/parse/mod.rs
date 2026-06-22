@@ -40,8 +40,10 @@ pub(crate) mod utils;
 
 #[cfg(feature = "gguf")]
 pub use gguf::{
-    inspect_gguf_from_reader, parse_gguf, parse_gguf_with_limits, GgufInspectInfo,
-    GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType, ParsedGguf,
+    inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
+    parse_gguf_from_reader, parse_gguf_from_reader_with_limits, parse_gguf_with_limits,
+    GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType,
+    ParsedGguf,
 };
 #[cfg(feature = "gguf")]
 pub use gguf_write::{write_gguf, write_gguf_to_writer, GgufWriteTensor};
@@ -54,8 +56,9 @@ pub use npz::{
 pub use ollama::resolve_ollama_model;
 #[cfg(feature = "pth")]
 pub use pth::{
-    inspect_pth_from_reader, parse_pth, parse_pth_with_limits, ParsedPth, PthDtype, PthInspectInfo,
-    PthTensor, PthTensorInfo,
+    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
+    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_with_limits, ParsedPth,
+    PthDtype, PthInspectInfo, PthTensor, PthTensorInfo,
 };
 pub use safetensors::{
     parse_safetensors_header, parse_safetensors_header_from_reader,

@@ -318,6 +318,10 @@
 /// Command-line interface implementation shared by the `anamnesis` and
 /// `amn` binaries. Feature-gated behind `cli`; pulls in [`clap`] only
 /// when enabled.
+// Raw-byte backing store (memory map or owned copy) shared by every
+// parsed-model type. Crate-internal: the `Backing` enum distinguishes the
+// trusted mmap fast path from the owned-copy untrusted-input path.
+mod backing;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod error;
@@ -338,14 +342,18 @@ pub use lethe::{
     NF4_CODEBOOK,
 };
 pub use limits::ParseLimits;
-pub use model::{parse, parse_with_limits, ParsedModel, TargetDtype};
+pub use model::{
+    parse, parse_bytes, parse_bytes_with_limits, parse_from_reader, parse_from_reader_with_limits,
+    parse_with_limits, ParsedModel, TargetDtype,
+};
 #[cfg(feature = "ollama")]
 pub use parse::resolve_ollama_model;
 #[cfg(feature = "gguf")]
 pub use parse::{
-    inspect_gguf_from_reader, parse_gguf, parse_gguf_with_limits, write_gguf, write_gguf_to_writer,
-    GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType,
-    GgufWriteTensor, ParsedGguf,
+    inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
+    parse_gguf_from_reader, parse_gguf_from_reader_with_limits, parse_gguf_with_limits, write_gguf,
+    write_gguf_to_writer, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor,
+    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf,
 };
 #[cfg(feature = "npz")]
 pub use parse::{
@@ -354,8 +362,9 @@ pub use parse::{
 };
 #[cfg(feature = "pth")]
 pub use parse::{
-    inspect_pth_from_reader, parse_pth, parse_pth_with_limits, ParsedPth, PthDtype, PthInspectInfo,
-    PthTensor, PthTensorInfo,
+    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
+    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_with_limits, ParsedPth,
+    PthDtype, PthInspectInfo, PthTensor, PthTensorInfo,
 };
 pub use parse::{
     parse_safetensors_header, parse_safetensors_header_from_reader,

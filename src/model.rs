@@ -3,17 +3,29 @@
 //! High-level parse-first API.
 //!
 //! [`parse`] memory-maps a `.safetensors` file, returning a
-//! [`ParsedModel`] that holds the parsed header metadata and a
-//! [`memmap2::Mmap`] view of the file's bytes. All subsequent operations
-//! ([`ParsedModel::inspect`], [`ParsedModel::remember`]) work from this
-//! parsed representation — no second open, no eager copy. The kernel
-//! pages bytes in lazily on access, so `inspect()` on a multi-GB shard
-//! only faults the header (~1 MiB).
+//! [`ParsedModel`] that holds the parsed header metadata and the file's
+//! bytes. All subsequent operations ([`ParsedModel::inspect`],
+//! [`ParsedModel::remember`]) work from this parsed representation — no
+//! second open, no eager copy. On the memory-mapped path the kernel pages
+//! bytes in lazily on access, so `inspect()` on a multi-GB shard only faults
+//! the header (~1 MiB).
+//!
+//! # Trusted vs untrusted input
+//!
+//! [`parse`] / [`parse_with_limits`] memory-map the file — the
+//! **trusted-local-file fast path**. A memory map can fault with `SIGBUS` if
+//! the file is truncated or written concurrently, an OS signal the caller
+//! cannot catch. For **untrusted input** (a user upload, a network / FUSE
+//! path) prefer the copy-based [`parse_bytes`] / [`parse_from_reader`] entry
+//! points: they read the artefact into an owned buffer (bounded by
+//! [`ParseLimits`]), parse with no mmap and no `unsafe`, and fail with a clean
+//! `Err` rather than a `SIGBUS`.
 
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
@@ -71,24 +83,26 @@ impl FromStr for TargetDtype {
     }
 }
 
-/// A parsed `.safetensors` model, holding parsed header metadata and a
-/// memory-mapped view of the file's bytes.
+/// A parsed `.safetensors` model, holding parsed header metadata and the
+/// file's bytes.
 ///
-/// Created by [`parse`]. The file's bytes are accessed through a
-/// [`memmap2::Mmap`] rather than an owned `Vec<u8>` — the kernel pages
-/// bytes in lazily on access, so `inspect()` on a multi-GB shard only
-/// faults in the header (~1 MiB). All public methods
-/// ([`ParsedModel::inspect`], [`ParsedModel::remember`]) consume the
-/// buffer through `&[u8]` slices, so the mmap is invisible to callers.
+/// Created by [`parse`] (memory-mapped) or by [`parse_bytes`] /
+/// [`parse_from_reader`] (owned copy). The bytes are reached through a `&[u8]`
+/// regardless of backing, so both paths share every method
+/// ([`ParsedModel::inspect`], [`ParsedModel::remember`]) and the backing is
+/// invisible to callers. On the memory-mapped path the kernel pages bytes in
+/// lazily on access, so `inspect()` on a multi-GB shard only faults in the
+/// header (~1 MiB).
 pub struct ParsedModel {
     /// Parsed header metadata (tensor names, dtypes, shapes, roles, scheme).
     pub header: SafetensorsHeader,
-    /// Memory-mapped file bytes. Tensor data starts at offset
-    /// `header_size + 8`. Backed by [`memmap2::Mmap`] rather than an
-    /// owned `Vec<u8>`: the OS pages bytes in lazily on access, so
-    /// `parse()` + `inspect()` on a multi-GB shard touches only the
-    /// header (~1 MiB) instead of materialising the whole file.
-    buffer: memmap2::Mmap,
+    /// File bytes — either a memory map (path-based [`parse`]) or an owned
+    /// `Vec<u8>` (copy-based [`parse_bytes`] / [`parse_from_reader`]). Tensor
+    /// data starts at offset `header_size + 8`. On the mmap path the OS pages
+    /// bytes in lazily on access, so `parse()` + `inspect()` on a multi-GB
+    /// shard touches only the header (~1 MiB) instead of materialising the
+    /// whole file.
+    buffer: Backing,
 }
 
 /// Parses a `.safetensors` file, returning a [`ParsedModel`] holding both
@@ -149,10 +163,114 @@ pub fn parse_with_limits(
     // in practice — the same assumption every other tensor parser in this
     // crate (`parse_pth`, `parse_gguf`) and the upstream `safetensors`
     // crate's mmap path rely on. The mapping is released when the
-    // returned `ParsedModel` is dropped.
-    let buffer = unsafe { memmap2::Mmap::map(&file) }.map_err(AnamnesisError::Io)?;
+    // returned `ParsedModel` is dropped. Untrusted callers that cannot
+    // make the read-only-artefact assumption use `parse_bytes` /
+    // `parse_from_reader` instead (no mmap, no `SIGBUS`).
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(AnamnesisError::Io)?;
+    parsed_model_from_backing(Backing::Mmap(mmap), limits)
+}
+
+/// Builds a [`ParsedModel`] from an already-acquired byte backing — the single
+/// construction site shared by the mmap path ([`parse_with_limits`]) and the
+/// copy-based paths ([`parse_bytes_with_limits`] /
+/// [`parse_from_reader_with_limits`]), so the header parse cannot drift between
+/// them.
+fn parsed_model_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Result<ParsedModel> {
     let header = parse_safetensors_header_with_limits(&buffer, limits)?;
     Ok(ParsedModel { header, buffer })
+}
+
+/// Parses `.safetensors` bytes already held in memory, returning a
+/// [`ParsedModel`] that **owns** them — the copy-based, mmap-free path.
+///
+/// This is the **recommended entry point for untrusted input** (a user upload,
+/// bytes received over the network): unlike [`parse`], it never memory-maps, so
+/// a truncated or concurrently-written source cannot fault the process with a
+/// `SIGBUS`; a malformed input is a clean `Err`. [`parse_bytes`] is the
+/// [`ParseLimits::default`] (unbounded) special case of
+/// [`parse_bytes_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
+///
+/// # Memory
+///
+/// Takes ownership of `bytes` (no copy) and holds them for the
+/// [`ParsedModel`]'s lifetime — peak heap is the input size. Contrast [`parse`],
+/// which memory-maps and pages lazily.
+pub fn parse_bytes(bytes: Vec<u8>) -> crate::Result<ParsedModel> {
+    parse_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Parses owned `.safetensors` bytes under a caller-supplied [`ParseLimits`]
+/// budget — the bounded, mmap-free path for untrusted input.
+///
+/// Rejects an input larger than [`ParseLimits::max_single_alloc_bytes`] before
+/// parsing, then enforces every applicable [`ParseLimits`] ceiling on the header
+/// exactly as [`parse_with_limits`] does.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `bytes` exceeds `limits` or the
+/// safetensors header is malformed.
+///
+/// # Memory
+///
+/// Takes ownership of `bytes` (no copy); peak heap is the input size.
+pub fn parse_bytes_with_limits(bytes: Vec<u8>, limits: &ParseLimits) -> crate::Result<ParsedModel> {
+    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
+        reason: "safetensors bytes: length overflows u64".into(),
+    })?;
+    limits.check_alloc(len, "safetensors bytes")?;
+    parsed_model_from_backing(Backing::Owned(bytes), limits)
+}
+
+/// Parses a `.safetensors` artefact from any reader, returning a [`ParsedModel`]
+/// that **owns** the bytes — the copy-based, mmap-free path.
+///
+/// The **recommended entry point for untrusted streamed input**: the whole
+/// stream is read into an owned buffer (bounded by [`ParseLimits`]) and parsed
+/// with no mmap, so a truncated or hostile stream is a clean `Err`, never a
+/// `SIGBUS`. [`parse_from_reader`] is the [`ParseLimits::default`] (unbounded)
+/// special case of [`parse_from_reader_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails.
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
+///
+/// # Memory
+///
+/// Reads the entire stream into an owned `Vec<u8>`; peak heap is the artefact
+/// size.
+pub fn parse_from_reader<R: std::io::Read>(reader: R) -> crate::Result<ParsedModel> {
+    parse_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses a `.safetensors` artefact from any reader under a caller-supplied
+/// [`ParseLimits`] budget — the bounded, mmap-free path for untrusted input.
+///
+/// The read is bounded by [`ParseLimits::max_single_alloc_bytes`] so an
+/// unbounded or hostile stream cannot exhaust memory; the header is then parsed
+/// under the same `limits` as [`parse_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails.
+/// Returns [`AnamnesisError::Parse`] if the bytes read exceed `limits` or the
+/// safetensors header is malformed.
+///
+/// # Memory
+///
+/// Reads the stream into an owned `Vec<u8>` of at most
+/// `max_single_alloc_bytes + 1` bytes; peak heap is the artefact size.
+pub fn parse_from_reader_with_limits<R: std::io::Read>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<ParsedModel> {
+    let bytes = limits.read_to_vec_bounded(reader, "safetensors file")?;
+    parse_bytes_with_limits(bytes, limits)
 }
 
 /// Owned dequantised tensors produced by [`ParsedModel::dequantize_all`]:
