@@ -1603,8 +1603,9 @@ fn read_typed_array<R: Read + Seek>(
             // the recursion depth before reading anything so we fail fast
             // on adversarial nesting.
             if depth >= MAX_ARRAY_DEPTH {
-                return Err(AnamnesisError::Parse {
-                    reason: format!(
+                return Err(AnamnesisError::LimitExceeded {
+                    limit: "MAX_ARRAY_DEPTH",
+                    message: format!(
                         "GGUF metadata: array nesting exceeds depth cap {MAX_ARRAY_DEPTH}"
                     ),
                 });
@@ -2314,8 +2315,9 @@ fn read_tensor_info_relative<R: Read + Seek>(
         });
     }
     if n_dims > MAX_TENSOR_DIMS {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_TENSOR_DIMS",
+            message: format!(
                 "GGUF tensor `{name}`: n_dimensions {n_dims} exceeds cap {MAX_TENSOR_DIMS}"
             ),
         });
@@ -2342,8 +2344,9 @@ fn read_tensor_info_relative<R: Read + Seek>(
                 reason: format!("GGUF tensor `{name}`: element count overflow"),
             })?;
         if n_elements > MAX_TENSOR_ELEMENTS {
-            return Err(AnamnesisError::Parse {
-                reason: format!(
+            return Err(AnamnesisError::LimitExceeded {
+                limit: "MAX_TENSOR_ELEMENTS",
+                message: format!(
                     "GGUF tensor `{name}`: element count {n_elements} exceeds cap {MAX_TENSOR_ELEMENTS}"
                 ),
             });
@@ -2975,13 +2978,14 @@ mod tests {
         let tmp = write_temp_gguf(&b.finish());
         let err = parse_gguf(tmp.path()).unwrap_err();
         match err {
-            AnamnesisError::Parse { reason } => {
+            AnamnesisError::LimitExceeded { limit, message } => {
+                assert_eq!(limit, "MAX_ARRAY_DEPTH");
                 assert!(
-                    reason.contains("depth cap"),
-                    "expected depth-cap error, got: {reason}"
+                    message.contains("depth cap"),
+                    "expected depth-cap error, got: {message}"
                 );
             }
-            other => panic!("expected Parse, got {other:?}"),
+            other => panic!("expected LimitExceeded, got {other:?}"),
         }
     }
 

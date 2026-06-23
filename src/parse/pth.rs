@@ -2556,18 +2556,18 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 ///
 /// Returns [`AnamnesisError::LimitExceeded`] if the `data.pkl` declared size
 /// exceeds the 100 MiB cap (`MAX_PKL_SIZE`, defensive against adversarial
-/// central directories) or the declared entry count / central-directory size
-/// exceeds the `ZIP_MAX_ENTRIES` cap or the caller's limits.
+/// central directories), the `byteorder` entry declared size exceeds its
+/// `MAX_BYTEORDER_SIZE` cap, or the declared entry count / central-directory
+/// size exceeds the `ZIP_MAX_ENTRIES` cap or the caller's limits.
 ///
 /// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
 /// `GLOBAL` outside the `torch.*` allowlist.
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is shorter than 4 bytes,
 /// the local-file header magic is not `PK\x03\x04`, the central directory is
-/// malformed, the `data.pkl` entry is missing, the `byteorder` entry declared
-/// size exceeds its 64 B cap, the `byteorder` bytes are not UTF-8 or not
-/// `"little"`/`"big"`, the pickle VM rejects the opcode stream, or any
-/// `_rebuild_tensor_v2` call has malformed arguments.
+/// malformed, the `data.pkl` entry is missing, the `byteorder` bytes are not
+/// UTF-8 or not `"little"`/`"big"`, the pickle VM rejects the opcode stream, or
+/// any `_rebuild_tensor_v2` call has malformed arguments.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-`PyTorch` 1.6)
 /// `.pth` files that begin with a raw pickle byte (`0x80` followed by a
@@ -2679,8 +2679,9 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
     let big_endian = match byteorder_entry {
         Some(entry) => {
             if entry.uncompressed_size > MAX_BYTEORDER_SIZE {
-                return Err(AnamnesisError::Parse {
-                    reason: format!(
+                return Err(AnamnesisError::LimitExceeded {
+                    limit: "MAX_BYTEORDER_SIZE",
+                    message: format!(
                         "ZIP entry `{}`: declared size {} bytes exceeds the \
                          {MAX_BYTEORDER_SIZE}-byte byteorder cap",
                         entry.name, entry.uncompressed_size
