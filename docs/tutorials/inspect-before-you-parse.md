@@ -129,7 +129,7 @@ let limits = ParseLimits::default()
     .with_max_item_count(4096)                       // cap the declared tensor count
     .with_max_decompression_ratio(100);             // zip-bomb guard for .npz / .pth
 
-let model = parse_with_limits("upload.safetensors", &limits)?; // clean Err if over budget
+let model = parse_with_limits("upload.safetensors", &limits)?; // over budget → Err(LimitExceeded)
 ```
 
 `ParseLimits::default()` is permissive (the CLI's behaviour); you tighten the axes that matter for your environment. For a header-only gate over data you are streaming or fetching remotely — without a file on disk — use the reader-based `inspect_*_from_reader` calls to read the declared totals first, check them against your policy, and only then parse. That is the same *inspect → check → parse* pattern, made programmatic.

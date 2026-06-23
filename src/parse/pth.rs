@@ -104,16 +104,17 @@ const MAX_BYTEORDER_SIZE: u64 = 64;
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `declared` exceeds [`MAX_PKL_SIZE`] or
-/// the caller's `ParseLimits` single-allocation budget.
+/// Returns [`AnamnesisError::LimitExceeded`] if `declared` exceeds
+/// [`MAX_PKL_SIZE`] or the caller's `ParseLimits` single-allocation budget.
 fn enforce_pkl_size_cap(
     declared: u64,
     entry_name: &str,
     limits: &ParseLimits,
 ) -> crate::Result<()> {
     if declared > MAX_PKL_SIZE {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_PKL_SIZE",
+            message: format!(
                 "ZIP entry `{entry_name}`: declared size {declared} bytes exceeds \
                  the {MAX_PKL_SIZE}-byte cap"
             ),
@@ -721,11 +722,12 @@ const MAX_PICKLE_PAYLOAD: usize = 64 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`].
+/// Returns [`AnamnesisError::LimitExceeded`] if `len` exceeds [`MAX_PICKLE_PAYLOAD`].
 fn enforce_pickle_payload_cap(len: usize, opcode: &str) -> crate::Result<()> {
     if len > MAX_PICKLE_PAYLOAD {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_PICKLE_PAYLOAD",
+            message: format!(
                 "pickle {opcode} length {len} bytes exceeds the \
                  {MAX_PICKLE_PAYLOAD}-byte cap"
             ),
@@ -859,9 +861,10 @@ impl<'a> PickleVm<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`] if the running total would exceed the
-    /// permanent floor, or if [`Budget::charge_alloc`] rejects the caller's
-    /// aggregate.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the running total would
+    /// exceed the permanent working-set floor, or if [`Budget::charge_alloc`]
+    /// rejects the caller's aggregate; [`AnamnesisError::Parse`] if the running
+    /// total overflows `u64`.
     fn charge(&mut self, bytes: u64, context: &str) -> crate::Result<()> {
         self.working_set =
             self.working_set
@@ -870,8 +873,9 @@ impl<'a> PickleVm<'a> {
                     reason: "pickle working-set byte counter overflow".into(),
                 })?;
         if self.working_set > MAX_PICKLE_WORKING_SET {
-            return Err(AnamnesisError::Parse {
-                reason: format!(
+            return Err(AnamnesisError::LimitExceeded {
+                limit: "MAX_PICKLE_WORKING_SET",
+                message: format!(
                     "pickle VM working set exceeds the {MAX_PICKLE_WORKING_SET}-byte cap \
                      ({context})"
                 ),
@@ -887,12 +891,13 @@ impl<'a> PickleVm<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`] if `depth` exceeds
+    /// Returns [`AnamnesisError::LimitExceeded`] if `depth` exceeds
     /// [`MAX_PICKLE_VM_DEPTH`] or the working-set charge is rejected.
     fn push_value(&mut self, v: PickleValue, depth: u32) -> crate::Result<()> {
         if depth > MAX_PICKLE_VM_DEPTH {
-            return Err(AnamnesisError::Parse {
-                reason: format!(
+            return Err(AnamnesisError::LimitExceeded {
+                limit: "MAX_PICKLE_VM_DEPTH",
+                message: format!(
                     "pickle value nesting depth {depth} exceeds the \
                      {MAX_PICKLE_VM_DEPTH} cap"
                 ),
@@ -920,14 +925,15 @@ impl<'a> PickleVm<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`] if the updated depth exceeds
+    /// Returns [`AnamnesisError::LimitExceeded`] if the updated depth exceeds
     /// [`MAX_PICKLE_VM_DEPTH`].
     fn bump_top_depth(&mut self, child_depth: u32) -> crate::Result<()> {
         if let Some(meta) = self.meta_stack.last_mut() {
             meta.depth = meta.depth.max(child_depth);
             if meta.depth > MAX_PICKLE_VM_DEPTH {
-                return Err(AnamnesisError::Parse {
-                    reason: format!(
+                return Err(AnamnesisError::LimitExceeded {
+                    limit: "MAX_PICKLE_VM_DEPTH",
+                    message: format!(
                         "pickle value nesting depth {} exceeds the \
                          {MAX_PICKLE_VM_DEPTH} cap",
                         meta.depth
@@ -1409,12 +1415,7 @@ impl<'a> PickleVm<'a> {
                     // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
                     let name = self.read_line()?.to_owned();
                     if !is_allowed_global(&module, &name) {
-                        return Err(AnamnesisError::Parse {
-                            reason: format!(
-                                "disallowed pickle global `{module}.{name}` \
-                                 (potential code execution)"
-                            ),
-                        });
+                        return Err(AnamnesisError::DisallowedGlobal { module, name });
                     }
                     self.push_leaf(PickleValue::Global { module, name })?;
                 }
@@ -1433,11 +1434,9 @@ impl<'a> PickleVm<'a> {
                         }
                     };
                     if !is_allowed_global(module, name) {
-                        return Err(AnamnesisError::Parse {
-                            reason: format!(
-                                "disallowed pickle global `{module}.{name}` \
-                                 (potential code execution)"
-                            ),
+                        return Err(AnamnesisError::DisallowedGlobal {
+                            module: module.to_owned(),
+                            name: name.to_owned(),
                         });
                     }
                     self.push_leaf(PickleValue::Global {
@@ -2110,10 +2109,13 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch`
-/// ZIP archive, uses unsupported pickle opcodes, contains non-allowlisted
-/// globals, or a declared `ZIP` entry count / `data.pkl` / pickle payload
-/// exceeds `limits`.
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared `ZIP` entry count,
+/// `data.pkl` size, or pickle payload / working-set / nesting depth exceeds
+/// `limits` or a permanent cap.
+/// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
+/// `GLOBAL` outside the `torch.*` allowlist.
+/// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch` ZIP
+/// archive or uses unsupported pickle opcodes.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
 /// files that are raw pickle without ZIP wrapping.
@@ -2271,8 +2273,10 @@ pub fn parse_pth_bytes(bytes: Vec<u8>) -> crate::Result<ParsedPth> {
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `bytes` exceeds `limits` or on the
-/// malformed-input conditions of [`parse_pth_with_limits`].
+/// Returns [`AnamnesisError::LimitExceeded`] if `bytes` exceeds `limits`.
+/// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
+/// [`parse_pth_with_limits`]; [`AnamnesisError::DisallowedGlobal`] for a pickle
+/// `GLOBAL` outside the `torch.*` allowlist.
 /// Returns [`AnamnesisError::Unsupported`] for a legacy (pre-1.6) `.pth` file.
 ///
 /// # Memory
@@ -2320,8 +2324,10 @@ pub fn parse_pth_from_reader<R: Read>(reader: R) -> crate::Result<ParsedPth> {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if the reader fails.
-/// Returns [`AnamnesisError::Parse`] if the bytes read exceed `limits` or on the
-/// malformed-input conditions of [`parse_pth_with_limits`].
+/// Returns [`AnamnesisError::LimitExceeded`] if the bytes read exceed `limits`.
+/// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
+/// [`parse_pth_with_limits`]; [`AnamnesisError::DisallowedGlobal`] for a pickle
+/// `GLOBAL` outside the `torch.*` allowlist.
 /// Returns [`AnamnesisError::Unsupported`] for a legacy `.pth` file.
 ///
 /// # Memory
@@ -2548,15 +2554,20 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
 /// reader fails.
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if the `data.pkl` declared size
+/// exceeds the 100 MiB cap (`MAX_PKL_SIZE`, defensive against adversarial
+/// central directories) or the declared entry count / central-directory size
+/// exceeds the `ZIP_MAX_ENTRIES` cap or the caller's limits.
+///
+/// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
+/// `GLOBAL` outside the `torch.*` allowlist.
+///
 /// Returns [`AnamnesisError::Parse`] if the file is shorter than 4 bytes,
 /// the local-file header magic is not `PK\x03\x04`, the central directory is
-/// malformed, the `data.pkl` entry
-/// is missing, the `data.pkl` declared size exceeds the
-/// 100 MiB cap (defensive against adversarial central directories), the
-/// `byteorder` entry declared size exceeds its 64 B cap, the `byteorder`
-/// bytes are not UTF-8 or not `"little"`/`"big"`, the pickle VM rejects
-/// the opcode stream, or any `_rebuild_tensor_v2` call has malformed
-/// arguments.
+/// malformed, the `data.pkl` entry is missing, the `byteorder` entry declared
+/// size exceeds its 64 B cap, the `byteorder` bytes are not UTF-8 or not
+/// `"little"`/`"big"`, the pickle VM rejects the opcode stream, or any
+/// `_rebuild_tensor_v2` call has malformed arguments.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-`PyTorch` 1.6)
 /// `.pth` files that begin with a raw pickle byte (`0x80` followed by a
@@ -2763,10 +2774,11 @@ fn read_pth_entry_bytes<R: Read + Seek>(
 ///
 /// # Errors
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared entry count or
+/// central-directory size exceeds `limits` or the `ZIP_MAX_ENTRIES` cap.
 /// Returns [`AnamnesisError::Parse`] if the central directory is malformed, a
 /// local-header data offset cannot be resolved, `data_start` or `size`
-/// overflows `usize`, an entry's byte range exceeds the file size, or the
-/// declared entry count / central-directory size exceeds `limits`.
+/// overflows `usize`, or an entry's byte range exceeds the file size.
 fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryIndex> {
     let mut src = crate::parse::zip::SliceSource::new(raw);
     let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
@@ -3196,7 +3208,7 @@ mod tests {
         assert!(enforce_pkl_size_cap(16, "data.pkl", &tight).is_ok());
         let err = enforce_pkl_size_cap(17, "data.pkl", &tight).unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected pkl-size limit error, got: {err}"
         );
 
@@ -3210,7 +3222,7 @@ mod tests {
         let tight = ParseLimits::default().with_max_single_alloc(1);
         let err = PickleVm::new(pkl, &tight).execute().unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected pickle-payload limit error, got: {err}"
         );
     }
@@ -3235,7 +3247,7 @@ mod tests {
         let tight = ParseLimits::default().with_max_total_bytes(2 * value_cost - 1);
         let err = PickleVm::new(pkl, &tight).execute().unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected aggregate limit error, got: {err}"
         );
         // A budget covering both values exactly fits.
@@ -3466,7 +3478,7 @@ mod tests {
             .execute()
             .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("nesting depth")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "MAX_PICKLE_VM_DEPTH"),
             "expected depth-cap rejection, got: {err}"
         );
     }
@@ -3484,7 +3496,7 @@ mod tests {
         let tight = ParseLimits::default().with_max_total_bytes(200);
         let err = PickleVm::new(&pkl, &tight).execute().unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected working-set budget rejection, got: {err}"
         );
     }
@@ -3507,7 +3519,7 @@ mod tests {
         let tight = ParseLimits::default().with_max_total_bytes(1500);
         let err = PickleVm::new(&pkl, &tight).execute().unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected memo-replay budget rejection, got: {err}"
         );
     }
@@ -3521,7 +3533,7 @@ mod tests {
         assert!(vm.charge(MAX_PICKLE_WORKING_SET, "test").is_ok());
         let err = vm.charge(1, "test").unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("working set")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "MAX_PICKLE_WORKING_SET"),
             "expected permanent working-set floor rejection, got: {err}"
         );
     }

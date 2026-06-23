@@ -158,7 +158,7 @@ A tensor archive is attacker-controllable, so anamnesis treats every parser entr
 
 ### How do I bound memory when parsing untrusted files?
 
-The library API takes a caller-supplied `ParseLimits` budget (max single allocation, max aggregate declared bytes, max item count, max decompression ratio) threaded through every `parse_*_with_limits` entry point and enforced fail-fast *before* allocation. `ParseLimits::default()` is permissive (today's behaviour); tighten it to your environment — a memory-constrained edge board sets MB-scale ceilings, a multi-tenant worker sets per-slot ceilings — and a hostile declaration is rejected with a clean `Err` instead of an OOM.
+The library API takes a caller-supplied `ParseLimits` budget (max single allocation, max aggregate declared bytes, max item count, max decompression ratio) threaded through every `parse_*_with_limits` entry point and enforced fail-fast *before* allocation. `ParseLimits::default()` is permissive (today's behaviour); tighten it to your environment — a memory-constrained edge board sets MB-scale ceilings, a multi-tenant worker sets per-slot ceilings — and a hostile declaration is rejected with a clean `AnamnesisError::LimitExceeded` (carrying the breached limit's name) instead of an OOM. A malformed file is `Parse`, and a `.pth` referencing a non-`torch.*` pickle global is `DisallowedGlobal` — so a host can branch on the error *kind*, not the message.
 
 ## Python
 

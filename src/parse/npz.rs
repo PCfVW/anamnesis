@@ -246,8 +246,9 @@ fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Resul
     // Reject an adversarial declared header length before allocating. The
     // v2/v3 `u32` length can reach 4 GiB; legitimate headers are <1 KiB.
     if header_len > NPY_MAX_HEADER_BYTES {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "NPY_MAX_HEADER_BYTES",
+            message: format!(
                 "NPY header length {header_len} bytes exceeds the \
                  {NPY_MAX_HEADER_BYTES}-byte cap"
             ),
@@ -534,8 +535,9 @@ fn read_array_data(
         });
     }
     if data_bytes_u64 > NPZ_MAX_ARRAY_BYTES {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "NPZ_MAX_ARRAY_BYTES",
+            message: format!(
                 "NPY array size {data_bytes} bytes exceeds the \
                  {NPZ_MAX_ARRAY_BYTES}-byte cap"
             ),
@@ -877,9 +879,10 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
 ///
 /// Returns [`AnamnesisError::Io`] if the file cannot be opened or read.
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared count, allocation,
+/// or decompression ratio exceeds `limits` or a permanent `NPZ` cap.
 /// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed, an
-/// `NPY` header is invalid, array data is truncated, or a declared count /
-/// allocation exceeds `limits`.
+/// `NPY` header is invalid, or array data is truncated.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
 /// or an unsupported dtype.
@@ -1390,7 +1393,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("NPZ array data")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected array single-alloc limit error, got: {err}"
         );
         assert!(parse_npz_with_limits(
@@ -1407,8 +1410,7 @@ mod tests {
             parse_npz_with_limits(tmp.path(), &ParseLimits::default().with_max_single_alloc(1))
                 .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason }
-                if reason.contains("central directory") || reason.contains("NPY header")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected container/header single-alloc limit error, got: {err}"
         );
 
@@ -1416,7 +1418,7 @@ mod tests {
         let err = parse_npz_with_limits(tmp.path(), &ParseLimits::default().with_max_item_count(0))
             .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_item_count")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_item_count"),
             "expected item-count limit error, got: {err}"
         );
         assert!(
@@ -1461,7 +1463,7 @@ mod tests {
         let with_aggregate = per_item_only.with_max_total_bytes(8000);
         let err = parse_npz_with_limits(tmp.path(), &with_aggregate).unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected aggregate limit error, got: {err}"
         );
 
@@ -1505,7 +1507,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_decompression_ratio")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_decompression_ratio"),
             "expected ratio limit error, got: {err}"
         );
 

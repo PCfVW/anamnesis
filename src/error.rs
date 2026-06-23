@@ -1,17 +1,39 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /// Errors produced by anamnesis operations.
+///
+/// # Rust → Python exception mapping (frozen for the Phase 8 bindings)
+///
+/// The `PyO3` bindings expose each variant as a distinct, catchable Python
+/// exception under a common base, so a multi-tenant host can answer (for
+/// example) *413* for a budget breach, *400* for malformed input, and a flagged
+/// security event for a hostile pickle — never a dead worker:
+///
+/// | `AnamnesisError` | Python exception |
+/// |---|---|
+/// | `Parse` | `ParseError` |
+/// | `Unsupported` | `UnsupportedError` |
+/// | `LimitExceeded` | `LimitExceededError` |
+/// | `DisallowedGlobal` | `SecurityError` |
+/// | `Io` | builtin `OSError` |
+///
+/// `ParseError` / `UnsupportedError` / `LimitExceededError` / `SecurityError`
+/// all subclass a base `AnamnesisError(Exception)`. The wiring lands in Phase 8;
+/// this table is the contract it implements.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AnamnesisError {
-    /// A format decoding failure (malformed header, invalid tensor metadata).
+    /// A format decoding failure (malformed header, invalid tensor metadata,
+    /// truncated stream, out-of-bounds offset, or arithmetic overflow on a
+    /// header-derived value). Maps to Python `ParseError`.
     #[error("parse error: {reason}")]
     Parse {
         /// Human-readable description of what went wrong.
         reason: String,
     },
 
-    /// A recognized but unimplemented format or feature.
+    /// A recognized but unimplemented format or feature. Maps to Python
+    /// `UnsupportedError`.
     #[error("unsupported format `{format}`: {detail}")]
     Unsupported {
         /// The format name (e.g., `"GPTQ"`, `"safetensors"`).
@@ -20,7 +42,37 @@ pub enum AnamnesisError {
         detail: String,
     },
 
-    /// A file system error.
+    /// A declared or derived size, count, or ratio exceeded a resource budget —
+    /// either a caller-supplied [`ParseLimits`](crate::ParseLimits) axis or a
+    /// permanent per-format floor (`MAX_PKL_SIZE`, the `GGUF` `MAX_*` family, the
+    /// vendored-`ZIP` entry cap, …). Distinct from [`Self::Parse`] so an
+    /// untrusted-input host can treat "too big for my budget" (e.g. *413 Payload
+    /// Too Large*) differently from "malformed" (*400*). Maps to Python
+    /// `LimitExceededError`.
+    #[error("limit exceeded ({limit}): {message}")]
+    LimitExceeded {
+        /// Stable machine-readable tag naming the breached limit — the axis or
+        /// constant name (e.g. `"max_single_alloc_bytes"`, `"max_total_bytes"`,
+        /// `"max_item_count"`, `"max_decompression_ratio"`, `"MAX_PKL_SIZE"`).
+        limit: &'static str,
+        /// Human-readable detail, including the offending value and the cap.
+        message: String,
+    },
+
+    /// A `.pth` pickle stream referenced a `GLOBAL` outside the `torch.*`
+    /// security allowlist — a potential arbitrary-code-execution vector that the
+    /// VM refuses to interpret. A dedicated variant (not [`Self::Parse`]) so a
+    /// host can log / alert on a potentially hostile upload distinctly from a
+    /// merely malformed one. Maps to Python `SecurityError`.
+    #[error("disallowed pickle global `{module}.{name}` (potential code execution)")]
+    DisallowedGlobal {
+        /// The referenced module (e.g. `"posix"`).
+        module: String,
+        /// The referenced attribute / callable (e.g. `"system"`).
+        name: String,
+    },
+
+    /// A file system error. Maps to Python builtin `OSError`.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

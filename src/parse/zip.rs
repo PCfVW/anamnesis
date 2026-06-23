@@ -488,12 +488,13 @@ struct CentralDirInfo {
 ///
 /// # Errors
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared entry count exceeds
+/// [`ZIP_MAX_ENTRIES`] or the caller's `max_item_count`, the central-directory
+/// allocation exceeds the caller's `max_single_alloc_bytes`, or an entry name
+/// exceeds [`ZIP_MAX_NAME_LEN`].
 /// Returns [`AnamnesisError::Parse`] if the archive is too small, the EOCD or
 /// `ZIP64` records are missing/malformed, the central directory lies outside
-/// the file, the declared entry count exceeds [`ZIP_MAX_ENTRIES`] or the
-/// caller's `max_item_count`, the central-directory allocation exceeds the
-/// caller's `max_single_alloc_bytes`, an entry name exceeds
-/// [`ZIP_MAX_NAME_LEN`], or any record is truncated.
+/// the file, or any record is truncated.
 ///
 /// Returns [`AnamnesisError::Io`] if an underlying `read` on the source fails.
 ///
@@ -528,8 +529,9 @@ pub(crate) fn read_central_directory<S: ZipSource>(
         });
     }
     if info.entries > ZIP_MAX_ENTRIES {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "ZIP_MAX_ENTRIES",
+            message: format!(
                 "ZIP central directory declares {} entries, exceeding the {ZIP_MAX_ENTRIES} cap",
                 info.entries
             ),
@@ -783,8 +785,9 @@ fn parse_cd_entries(cd: &[u8], declared: u64, out: &mut Vec<ZipEntry>) -> crate:
         let offset32 = cur.u32()?;
 
         if name_len > ZIP_MAX_NAME_LEN {
-            return Err(AnamnesisError::Parse {
-                reason: format!(
+            return Err(AnamnesisError::LimitExceeded {
+                limit: "ZIP_MAX_NAME_LEN",
+                message: format!(
                     "ZIP entry name length {name_len} exceeds the {ZIP_MAX_NAME_LEN}-byte cap"
                 ),
             });
@@ -1202,7 +1205,7 @@ mod tests {
         let limits = ParseLimits::default().with_max_item_count(2);
         let err = read_central_directory(&mut src, &limits).unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("entry count")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_item_count"),
             "expected item-count rejection, got: {err}"
         );
         // Unbounded accepts all three.
@@ -1255,8 +1258,7 @@ mod tests {
         let limits = ParseLimits::default().with_max_single_alloc(8);
         let err = read_central_directory(&mut src, &limits).unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason }
-                if reason.contains("central directory") || reason.contains("max_single_alloc")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected central-directory single-alloc rejection, got: {err}"
         );
     }

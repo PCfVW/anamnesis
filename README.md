@@ -148,6 +148,25 @@ built-in cap and are pure caller-supplied bounds. The inspection totals
 pre-filter — they omit per-entry header overhead — so they are for the early
 reject; `parse_*_with_limits` is the authoritative enforcement.
 
+**Error taxonomy.** A rejection's *kind* is its `AnamnesisError` variant, so a
+host can branch without string-matching the message: a budget/cap breach (a
+`ParseLimits` axis or a permanent floor like `MAX_PKL_SIZE`) is
+**`LimitExceeded { limit, message }`** (answer *413*); a malformed/truncated file
+is **`Parse`** (*400*); a `.pth` pickle referencing a `GLOBAL` outside the
+`torch.*` allowlist is **`DisallowedGlobal { module, name }`** (a security signal
+to log/alert on); a recognised-but-unimplemented format/dtype is
+**`Unsupported`**; and I/O failures are **`Io`**. The Python bindings (v0.8.0,
+[Phase 8](ROADMAP.md#phase-8-python-bindings-pyo3)) map these one-to-one onto a
+catchable exception hierarchy (base `AnamnesisError(Exception)`):
+
+| `AnamnesisError` | Python exception |
+|---|---|
+| `Parse` | `ParseError` |
+| `Unsupported` | `UnsupportedError` |
+| `LimitExceeded` | `LimitExceededError` |
+| `DisallowedGlobal` | `SecurityError` |
+| `Io` | builtin `OSError` |
+
 See also [Parser robustness](#parser-robustness-untrusted-input-hardening) for the
 underlying per-format caps.
 

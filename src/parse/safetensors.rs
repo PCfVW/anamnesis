@@ -31,12 +31,13 @@ const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `header_len` exceeds the cap or the
-/// caller's `budget` (per-item single-allocation cap + cumulative aggregate).
+/// Returns [`AnamnesisError::LimitExceeded`] if `header_len` exceeds the cap or
+/// the caller's `budget` (per-item single-allocation cap + cumulative aggregate).
 fn enforce_safetensors_header_cap(header_len: u64, budget: &mut Budget) -> crate::Result<()> {
     if header_len > MAX_SAFETENSORS_HEADER_BYTES {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_SAFETENSORS_HEADER_BYTES",
+            message: format!(
                 "safetensors header length {header_len} exceeds \
                  {MAX_SAFETENSORS_HEADER_BYTES}-byte cap"
             ),
@@ -994,9 +995,10 @@ pub fn parse_safetensors_header(buffer: &[u8]) -> crate::Result<SafetensorsHeade
 ///
 /// # Errors
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header size exceeds
+/// the cap or `limits`.
 /// Returns [`AnamnesisError::Parse`] if the buffer is too small for the 8-byte
-/// length prefix, the safetensors header is malformed, or its declared size
-/// exceeds the cap or `limits`.
+/// length prefix or the safetensors header is malformed.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognized dtype.
 ///
@@ -1167,8 +1169,9 @@ pub fn parse_safetensors_header_from_reader<R: Read>(
 /// Returns [`AnamnesisError::Io`] if the reader fails to produce the
 /// requested bytes (8-byte length prefix or `length` bytes of `JSON`).
 ///
-/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed, the
-/// declared length exceeds the 100 MiB sanity cap, or it exceeds `limits`.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared length exceeds the
+/// 100 MiB sanity cap or `limits`.
+/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognised
 /// dtype.
@@ -1589,7 +1592,7 @@ mod tests {
             panic!("expected slice limit rejection");
         };
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected slice limit error, got: {err}"
         );
         let Err(err) =
@@ -1598,7 +1601,7 @@ mod tests {
             panic!("expected reader limit rejection");
         };
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected reader limit error, got: {err}"
         );
 
@@ -1621,7 +1624,7 @@ mod tests {
             panic!("expected aggregate rejection");
         };
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected aggregate error, got: {err}"
         );
     }
@@ -1779,14 +1782,15 @@ mod tests {
         let bogus_len = MAX_SAFETENSORS_HEADER_BYTES + 1;
         let prefix = bogus_len.to_le_bytes();
         match parse_safetensors_header_from_reader(std::io::Cursor::new(&prefix[..])) {
-            Err(AnamnesisError::Parse { reason }) => {
+            Err(AnamnesisError::LimitExceeded { limit, message }) => {
+                assert_eq!(limit, "MAX_SAFETENSORS_HEADER_BYTES");
                 assert!(
-                    reason.contains("exceeds") && reason.contains("cap"),
-                    "expected oversized-length error, got: {reason}"
+                    message.contains("exceeds") && message.contains("cap"),
+                    "expected oversized-length error, got: {message}"
                 );
             }
             Ok(_) => panic!("expected Err for oversized header, got Ok"),
-            Err(other) => panic!("expected AnamnesisError::Parse, got {other:?}"),
+            Err(other) => panic!("expected AnamnesisError::LimitExceeded, got {other:?}"),
         }
     }
 

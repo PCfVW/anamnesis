@@ -1388,8 +1388,9 @@ impl<R: Read + Seek> GgufReader<R> {
     fn read_string(&mut self, max_len: u64) -> crate::Result<String> {
         let len = self.read_u64_le()?;
         if len > max_len {
-            return Err(AnamnesisError::Parse {
-                reason: format!("GGUF: string length {len} exceeds cap {max_len}"),
+            return Err(AnamnesisError::LimitExceeded {
+                limit: "GGUF string length",
+                message: format!("GGUF: string length {len} exceeds cap {max_len}"),
             });
         }
         let len_usz = usize::try_from(len).map_err(|_| AnamnesisError::Parse {
@@ -1456,8 +1457,9 @@ fn read_metadata_value<R: Read + Seek>(
 fn read_array_len<R: Read + Seek>(cursor: &mut GgufReader<R>) -> crate::Result<usize> {
     let len = cursor.read_u64_le()?;
     if len > MAX_ARRAY_LEN {
-        return Err(AnamnesisError::Parse {
-            reason: format!("GGUF metadata: array length {len} exceeds cap {MAX_ARRAY_LEN}"),
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_ARRAY_LEN",
+            message: format!("GGUF metadata: array length {len} exceeds cap {MAX_ARRAY_LEN}"),
         });
     }
     usize::try_from(len).map_err(|_| AnamnesisError::Parse {
@@ -1682,11 +1684,12 @@ pub fn parse_gguf(path: impl AsRef<Path>) -> crate::Result<ParsedGguf> {
 ///
 /// Returns [`AnamnesisError::Io`] if the file cannot be opened or mapped.
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared count or allocation
+/// exceeds `limits` or a permanent `GGUF` cap.
 /// Returns [`AnamnesisError::Parse`] if the magic bytes are missing, the
 /// header fields are truncated or out of range, the metadata table contains
-/// an invalid value type, a tensor info entry is malformed, a tensor's
-/// resolved byte range falls outside the mapped file, or a declared count /
-/// allocation exceeds `limits`.
+/// an invalid value type, a tensor info entry is malformed, or a tensor's
+/// resolved byte range falls outside the mapped file.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for `GGUF` v1 files, big-endian
 /// `GGUF` files, legacy pre-`GGUF` formats, and unrecognised tensor dtypes.
@@ -1764,8 +1767,9 @@ pub fn parse_gguf_bytes(bytes: Vec<u8>) -> crate::Result<ParsedGguf> {
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `bytes` exceeds `limits` or on the
-/// malformed-input conditions of [`parse_gguf_with_limits`].
+/// Returns [`AnamnesisError::LimitExceeded`] if `bytes` exceeds `limits`.
+/// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
+/// [`parse_gguf_with_limits`].
 /// Returns [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
 ///
 /// # Memory
@@ -1813,8 +1817,9 @@ pub fn parse_gguf_from_reader<R: Read>(reader: R) -> crate::Result<ParsedGguf> {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if the reader fails.
-/// Returns [`AnamnesisError::Parse`] if the bytes read exceed `limits` or on the
-/// malformed-input conditions of [`parse_gguf_with_limits`].
+/// Returns [`AnamnesisError::LimitExceeded`] if the bytes read exceed `limits`.
+/// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
+/// [`parse_gguf_with_limits`].
 /// Returns [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
 ///
 /// # Memory
@@ -1906,13 +1911,15 @@ fn read_gguf_structure<R: Read + Seek>(
     let tensor_count = cursor.read_u64_le()?;
     let kv_count = cursor.read_u64_le()?;
     if tensor_count > MAX_TENSOR_COUNT {
-        return Err(AnamnesisError::Parse {
-            reason: format!("GGUF: tensor count {tensor_count} exceeds cap {MAX_TENSOR_COUNT}"),
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_TENSOR_COUNT",
+            message: format!("GGUF: tensor count {tensor_count} exceeds cap {MAX_TENSOR_COUNT}"),
         });
     }
     if kv_count > MAX_KV_COUNT {
-        return Err(AnamnesisError::Parse {
-            reason: format!("GGUF: metadata kv count {kv_count} exceeds cap {MAX_KV_COUNT}"),
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_KV_COUNT",
+            message: format!("GGUF: metadata kv count {kv_count} exceeds cap {MAX_KV_COUNT}"),
         });
     }
     // Caller-supplied ceilings, layered on top of the permanent caps above.
@@ -2562,7 +2569,7 @@ mod tests {
         let err = parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_item_count(1))
             .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_item_count")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_item_count"),
             "expected item-count limit error, got: {err}"
         );
         assert!(
@@ -2576,7 +2583,7 @@ mod tests {
             parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_single_alloc(1))
                 .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected single-alloc limit error, got: {err}"
         );
     }
@@ -2597,7 +2604,7 @@ mod tests {
             parse_gguf_with_limits(f.path(), &ParseLimits::default().with_max_total_bytes(50))
                 .unwrap_err();
         assert!(
-            matches!(err, AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected aggregate limit error, got: {err}"
         );
 

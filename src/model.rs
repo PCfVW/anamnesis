@@ -144,8 +144,9 @@ pub fn parse(path: impl AsRef<Path>) -> crate::Result<ParsedModel> {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if the file cannot be opened or mapped.
-/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed or
-/// its declared size exceeds `limits`.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header size exceeds
+/// `limits`.
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
 ///
 /// # Memory
 ///
@@ -212,8 +213,8 @@ pub fn parse_bytes(bytes: Vec<u8>) -> crate::Result<ParsedModel> {
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if `bytes` exceeds `limits` or the
-/// safetensors header is malformed.
+/// Returns [`AnamnesisError::LimitExceeded`] if `bytes` exceeds `limits`.
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
 ///
 /// # Memory
 ///
@@ -258,8 +259,8 @@ pub fn parse_from_reader<R: std::io::Read>(reader: R) -> crate::Result<ParsedMod
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Io`] if the reader fails.
-/// Returns [`AnamnesisError::Parse`] if the bytes read exceed `limits` or the
-/// safetensors header is malformed.
+/// Returns [`AnamnesisError::LimitExceeded`] if the bytes read exceed `limits`.
+/// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
 ///
 /// # Memory
 ///

@@ -81,8 +81,14 @@ fn safetensors_reader_respects_max_single_alloc() {
     use anamnesis::parse_from_reader_with_limits;
     // The fixture is 96 bytes; an 8-byte ceiling must reject the read.
     let limits = ParseLimits::default().with_max_single_alloc(8);
-    let r = parse_from_reader_with_limits(fs::File::open(ST_FP8).expect("open"), &limits);
-    assert!(r.is_err(), "oversized read should be rejected, not OOM");
+    let Err(err) = parse_from_reader_with_limits(fs::File::open(ST_FP8).expect("open"), &limits)
+    else {
+        panic!("oversized read should be rejected, not OOM");
+    };
+    assert!(
+        matches!(err, anamnesis::AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
+        "expected LimitExceeded(max_single_alloc_bytes), got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -145,8 +151,15 @@ mod pth {
     fn pth_reader_respects_max_single_alloc() {
         use anamnesis::parse_pth_from_reader_with_limits;
         let limits = ParseLimits::default().with_max_single_alloc(8);
-        let r = parse_pth_from_reader_with_limits(fs::File::open(PTH).expect("open"), &limits);
-        assert!(r.is_err());
+        let Err(err) =
+            parse_pth_from_reader_with_limits(fs::File::open(PTH).expect("open"), &limits)
+        else {
+            panic!("oversized read should be rejected");
+        };
+        assert!(
+            matches!(err, anamnesis::AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
+            "expected LimitExceeded(max_single_alloc_bytes), got: {err}"
+        );
     }
 }
 

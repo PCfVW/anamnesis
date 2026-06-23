@@ -9,7 +9,7 @@
 //! [`ParseLimits`] layers a *second*, caller-supplied ceiling on top of them:
 //! a memory-constrained edge board or a per-slot `MLaaS` worker passes a
 //! [`ParseLimits`] tightened to its own budget, and the parser rejects an
-//! over-budget declaration fail-fast with [`AnamnesisError::Parse`](crate::AnamnesisError::Parse)
+//! over-budget declaration fail-fast with [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
 //! **before** it allocates.
 //!
 //! The ceiling is **tighten-only**: where a built-in per-format constant exists
@@ -184,12 +184,13 @@ impl ParseLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if
-    /// `requested` exceeds the configured maximum single allocation.
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if `requested` exceeds the configured maximum single allocation.
     pub(crate) fn check_alloc(&self, requested: u64, context: &str) -> crate::Result<()> {
         if requested > self.max_single_alloc_bytes {
-            return Err(crate::AnamnesisError::Parse {
-                reason: format!(
+            return Err(crate::AnamnesisError::LimitExceeded {
+                limit: "max_single_alloc_bytes",
+                message: format!(
                     "requested allocation {requested} bytes exceeds caller \
                      ParseLimits max_single_alloc {} ({context})",
                     self.max_single_alloc_bytes
@@ -209,8 +210,8 @@ impl ParseLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if
-    /// `count` exceeds the configured maximum item count.
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if `count` exceeds the configured maximum item count.
     // Callers: the `gguf` parse path (tensor / KV counts) and the vendored ZIP
     // central-directory reader (`crate::parse::zip`, compiled under `npz`/`pth`,
     // for the entry count). With none of `npz`/`pth`/`gguf` enabled this helper
@@ -223,8 +224,9 @@ impl ParseLimits {
     )]
     pub(crate) fn check_item_count(&self, count: u64, context: &str) -> crate::Result<()> {
         if count > self.max_item_count {
-            return Err(crate::AnamnesisError::Parse {
-                reason: format!(
+            return Err(crate::AnamnesisError::LimitExceeded {
+                limit: "max_item_count",
+                message: format!(
                     "declared item count {count} exceeds caller ParseLimits \
                      max_item_count {} ({context})",
                     self.max_item_count
@@ -250,8 +252,8 @@ impl ParseLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if the
-    /// declared expansion ratio exceeds the configured maximum.
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if the declared expansion ratio exceeds the configured maximum.
     // Only the `npz` parse path reads `DEFLATE` (compressed) archive entries;
     // with that feature disabled this helper has no caller.
     #[cfg_attr(not(feature = "npz"), allow(dead_code))]
@@ -269,8 +271,9 @@ impl ParseLimits {
         // → within bound; `compressed == 0` yields `allowed == 0` → only a
         // non-empty entry is rejected.
         match self.max_decompression_ratio.checked_mul(compressed) {
-            Some(allowed) if uncompressed > allowed => Err(crate::AnamnesisError::Parse {
-                reason: format!(
+            Some(allowed) if uncompressed > allowed => Err(crate::AnamnesisError::LimitExceeded {
+                limit: "max_decompression_ratio",
+                message: format!(
                     "decompression ratio (uncompressed {uncompressed} / compressed \
                      {compressed}) exceeds caller ParseLimits max_decompression_ratio \
                      {} ({context})",
@@ -381,10 +384,11 @@ impl Budget {
     ///
     /// # Errors
     ///
-    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if
-    /// `bytes` exceeds [`ParseLimits::max_single_alloc_bytes`], if the running
-    /// total overflows `u64`, or if the new total exceeds
-    /// [`ParseLimits::max_total_bytes`].
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if `bytes` exceeds [`ParseLimits::max_single_alloc_bytes`] or the new total
+    /// exceeds [`ParseLimits::max_total_bytes`]; returns
+    /// [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if the running
+    /// total overflows `u64`.
     pub(crate) fn charge_alloc(&mut self, bytes: u64, context: &str) -> crate::Result<()> {
         // Per-item ceiling first (Step 1), so a single oversized item is
         // rejected on its own terms before it touches the running total.
@@ -396,8 +400,9 @@ impl Budget {
                     reason: format!("aggregate byte total overflow charging {bytes} ({context})"),
                 })?;
         if new_total > self.limits.max_total_bytes {
-            return Err(crate::AnamnesisError::Parse {
-                reason: format!(
+            return Err(crate::AnamnesisError::LimitExceeded {
+                limit: "max_total_bytes",
+                message: format!(
                     "cumulative declared bytes {new_total} exceeds caller ParseLimits \
                      max_total_bytes {} ({context})",
                     self.limits.max_total_bytes
@@ -434,7 +439,7 @@ mod tests {
             .check_decompression_ratio(1001, 10, "ctx")
             .unwrap_err();
         assert!(
-            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("max_decompression_ratio")),
+            matches!(err, crate::AnamnesisError::LimitExceeded { limit, .. } if limit == "max_decompression_ratio"),
             "expected ratio error, got: {err}"
         );
 
@@ -494,7 +499,7 @@ mod tests {
                                                         // though 100 passes the per-item cap.
         let err = budget.charge_alloc(100, "c").unwrap_err();
         assert!(
-            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("max_total_bytes")),
+            matches!(err, crate::AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected aggregate error, got: {err}"
         );
     }
@@ -507,7 +512,7 @@ mod tests {
         let mut budget = Budget::new(&limits);
         let err = budget.charge_alloc(51, "x").unwrap_err();
         assert!(
-            matches!(err, crate::AnamnesisError::Parse { ref reason } if reason.contains("max_single_alloc")),
+            matches!(err, crate::AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected single-alloc error, got: {err}"
         );
     }

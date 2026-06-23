@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finer-grained `AnamnesisError` taxonomy** (Phase 6.13 Step 2): two new
+  variants on the `#[non_exhaustive]` enum. **`LimitExceeded { limit, message }`**
+  is now returned for every budget/cap rejection — every `ParseLimits` axis
+  (`max_single_alloc_bytes` / `max_total_bytes` / `max_item_count` /
+  `max_decompression_ratio`) and every permanent per-format floor (`MAX_PKL_SIZE`,
+  `MAX_PICKLE_WORKING_SET`, `MAX_PICKLE_VM_DEPTH`, `MAX_PICKLE_PAYLOAD`,
+  `NPY_MAX_HEADER_BYTES`, `NPZ_MAX_ARRAY_BYTES`, the `GGUF` `MAX_*` family,
+  `ZIP_MAX_ENTRIES`, `ZIP_MAX_NAME_LEN`, `MAX_SAFETENSORS_HEADER_BYTES`) — where
+  these previously returned `Parse`. **`DisallowedGlobal { module, name }`** is
+  now returned when a `.pth` pickle references a `GLOBAL` outside the `torch.*`
+  allowlist (previously `Parse`). `Parse` keeps malformed/truncated/overflow
+  cases; `Unsupported` and `Io` are unchanged. This lets a host branch on the
+  error *kind* (e.g. *413* vs *400* vs a flagged security event) without
+  string-matching. The frozen Rust→Python exception map (`ParseError` /
+  `UnsupportedError` / `LimitExceededError` / `SecurityError` / `OSError`) is
+  documented on `AnamnesisError` and in the README. **Observable** for code that
+  matched the old variants on these conditions — acceptable pre-`1.0` and before
+  the bindings ship.
 - **Release builds now set `panic = "abort"`** (`[profile.release]` in
   `Cargo.toml`). The untrusted-input DoS analysis (parser docs, `CHANGELOG`
   Security notes) has long *assumed* abort-on-panic when arguing severity;

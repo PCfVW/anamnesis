@@ -233,7 +233,10 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
             // `align_up` only ever returns the Parse variant; passing the
             // other variants through unchanged keeps the closure total
             // without claiming a hidden invariant.
-            other @ (AnamnesisError::Unsupported { .. } | AnamnesisError::Io(_)) => other,
+            other @ (AnamnesisError::Unsupported { .. }
+            | AnamnesisError::LimitExceeded { .. }
+            | AnamnesisError::DisallowedGlobal { .. }
+            | AnamnesisError::Io(_)) => other,
         })?;
         write_string(&mut tensor_info_block, tensor.name)?;
         // CAST: usize → u32, n_dimensions is bounded by MAX_TENSOR_DIMS=8 on
