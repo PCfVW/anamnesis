@@ -81,6 +81,9 @@ const MAX_KV_COUNT: u64 = 1_000_000;
 /// (e.g., a tokenizer vocabulary serialised as a single string).
 const MAX_STRING_LEN: u64 = 16 * 1024 * 1024;
 
+/// `GGUF`-spec cap on a metadata-key length (`u16::MAX` = 65 535 bytes).
+const MAX_GGUF_KEY_LEN: u64 = 65_535;
+
 /// Upper bound on `ARRAY` element count (soft `DoS` guard).
 const MAX_ARRAY_LEN: u64 = 16_000_000;
 
@@ -1379,17 +1382,22 @@ impl<R: Read + Seek> GgufReader<R> {
     /// Reads a `gguf_string_t` (`u64` length prefix + raw bytes, interpreted
     /// as UTF-8).
     ///
+    /// `max_len` is the applicable cap (varies by call site: `MAX_STRING_LEN`
+    /// for metadata string values, `MAX_GGUF_KEY_LEN` for metadata keys,
+    /// `MAX_TENSOR_NAME_LEN` for tensor names) and `limit` is that cap's name,
+    /// used as the [`AnamnesisError::LimitExceeded`] tag on rejection.
+    ///
     /// The cap check runs against the declared length **before** allocating,
     /// so a rejected oversize header costs zero heap. UTF-8 validation
     /// consumes the temporary `Vec<u8>` via `String::from_utf8`, which
     /// either re-uses the buffer in place (success) or hands its bytes back
     /// to the caller via `FromUtf8Error::into_bytes` (error) — no double
     /// allocation in either branch.
-    fn read_string(&mut self, max_len: u64) -> crate::Result<String> {
+    fn read_string(&mut self, max_len: u64, limit: &'static str) -> crate::Result<String> {
         let len = self.read_u64_le()?;
         if len > max_len {
             return Err(AnamnesisError::LimitExceeded {
-                limit: "GGUF string length",
+                limit,
                 message: format!("GGUF: string length {len} exceeds cap {max_len}"),
             });
         }
@@ -1429,7 +1437,7 @@ fn read_metadata_value<R: Read + Seek>(
         6 => Ok(GgufMetadataValue::F32(cursor.read_f32_le()?)),
         7 => Ok(GgufMetadataValue::Bool(cursor.read_bool()?)),
         8 => Ok(GgufMetadataValue::String(
-            cursor.read_string(MAX_STRING_LEN)?,
+            cursor.read_string(MAX_STRING_LEN, "MAX_STRING_LEN")?,
         )),
         9 => {
             let inner_type = cursor.read_u32_le()?;
@@ -1586,7 +1594,7 @@ fn read_typed_array<R: Read + Seek>(
         8 => {
             let mut v: Vec<String> = Vec::with_capacity(cap);
             for _ in 0..len {
-                v.push(cursor.read_string(MAX_STRING_LEN)?);
+                v.push(cursor.read_string(MAX_STRING_LEN, "MAX_STRING_LEN")?);
             }
             Ok(GgufMetadataArray::String(v))
         }
@@ -1939,7 +1947,7 @@ fn read_gguf_structure<R: Read + Seek>(
     let mut metadata: HashMap<String, GgufMetadataValue> =
         HashMap::with_capacity(kv_count_usz.min(PREALLOC_SOFT_CAP));
     for _ in 0..kv_count_usz {
-        let key = cursor.read_string(u64::from(u16::MAX))?;
+        let key = cursor.read_string(MAX_GGUF_KEY_LEN, "MAX_GGUF_KEY_LEN")?;
         let value_type = cursor.read_u32_le()?;
         let value = read_metadata_value(&mut cursor, value_type)?;
         metadata.insert(key, value);
@@ -2298,7 +2306,7 @@ fn read_tensor_info_relative<R: Read + Seek>(
 ) -> crate::Result<GgufTensorInfo> {
     // GGUF tensor names: the spec caps them at 64 bytes, but some encoders
     // produce longer names in practice. Accept up to `MAX_TENSOR_NAME_LEN`.
-    let name = cursor.read_string(MAX_TENSOR_NAME_LEN)?;
+    let name = cursor.read_string(MAX_TENSOR_NAME_LEN, "MAX_TENSOR_NAME_LEN")?;
     let n_dims = cursor.read_u32_le()?;
     if n_dims == 0 {
         return Err(AnamnesisError::Parse {
