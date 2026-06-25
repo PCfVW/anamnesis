@@ -55,6 +55,7 @@ A living list of the questions we and our early users have actually run into. If
 - [Parsing untrusted input](#parsing-untrusted-input)
   - [Is it safe to parse a model file from a stranger?](#is-it-safe-to-parse-a-model-file-from-a-stranger)
   - [How do I bound memory when parsing untrusted files?](#how-do-i-bound-memory-when-parsing-untrusted-files)
+  - [Can a malformed file crash the process (panic or abort)?](#can-a-malformed-file-crash-the-process-panic-or-abort)
 - [Python](#python)
   - [Is there a `pip install anamnesis`?](#is-there-a-pip-install-anamnesis)
 
@@ -159,6 +160,10 @@ A tensor archive is attacker-controllable, so anamnesis treats every parser entr
 ### How do I bound memory when parsing untrusted files?
 
 The library API takes a caller-supplied `ParseLimits` budget (max single allocation, max aggregate declared bytes, max item count, max decompression ratio) threaded through every `parse_*_with_limits` entry point and enforced fail-fast *before* allocation. `ParseLimits::default()` is permissive (today's behaviour); tighten it to your environment — a memory-constrained edge board sets MB-scale ceilings, a multi-tenant worker sets per-slot ceilings — and a hostile declaration is rejected with a clean `AnamnesisError::LimitExceeded` (carrying the breached limit's name) instead of an OOM. A malformed file is `Parse`, and a `.pth` referencing a non-`torch.*` pickle global is `DisallowedGlobal` — so a host can branch on the error *kind*, not the message.
+
+### Can a malformed file crash the process (panic or abort)?
+
+No. No public parse/inspect entry point panics or aborts on any input — a malformed, truncated, or hostile file is always a clean `Result::Err`, never an unwinding panic and never a `SIGBUS` (the copy-based `parse_bytes` / `parse_*_from_reader` paths use no memory map). It's enforced in the source (the `unwrap`/`expect`/`panic`/indexing lints are denied crate-wide, and every header-derived size uses checked arithmetic) and pinned in CI by `tests/no_panic.rs` plus the `cargo fuzz` harness. Library/CLI release builds abort on panic (fail-closed); the future Python wheel is built to *unwind* so even an unexpected panic becomes a catchable `PanicException` rather than a dead worker.
 
 ## Python
 

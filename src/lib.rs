@@ -162,6 +162,23 @@
 //! Lossless `.pth` → `.safetensors` conversion. **11–31× faster** than
 //! `torch.load()` on torchvision models.
 //!
+//! # Panic safety
+//!
+//! No public parse/inspect entry point panics or aborts on **any** input — a
+//! malformed, truncated, or hostile artefact is always a clean `Result::Err`
+//! ([`AnamnesisError`]), never an unwinding panic and never a `SIGBUS` (use the
+//! copy-based [`parse_bytes`] / `parse_*_from_reader` paths for untrusted input,
+//! which take an owned buffer instead of a memory map). The lint floor
+//! (`unwrap_used` / `expect_used` / `panic` / `indexing_slicing` all denied) plus
+//! `checked_*` arithmetic on every header-derived value enforce this in the
+//! source; `tests/no_panic.rs` (a `catch_unwind` battery, run in debug so
+//! integer-overflow panics are in scope) and the `cargo fuzz` harness pin it.
+//!
+//! Library and CLI release builds use `panic = "abort"` (a *reachable* panic
+//! should fail the process closed, not unwind). The Phase 8 Python extension is
+//! built with a separate `panic = "unwind"` profile so `PyO3` can surface a panic
+//! as a catchable `PanicException`; see `docs/python-interop.md`.
+//!
 //! # Quick Start
 //!
 //! Path-based dequantisation (FP8 → BF16):

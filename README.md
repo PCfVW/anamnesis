@@ -167,6 +167,17 @@ catchable exception hierarchy (base `AnamnesisError(Exception)`):
 | `DisallowedGlobal` | `SecurityError` |
 | `Io` | builtin `OSError` |
 
+**No panic, no abort.** Beyond returning a *typed* error, no public parse/inspect
+entry point ever **panics or aborts** on any input — a hostile file is always a
+clean `Err`, never an unwinding panic and never a `SIGBUS` (the copy-based
+`parse_bytes` / `parse_*_from_reader` paths use no memory map). This is pinned in
+stable CI by `tests/no_panic.rs` (a `catch_unwind` battery over adversarial
+inputs, run in debug so integer-overflow panics count) and the `cargo fuzz`
+harness. Library/CLI release builds use `panic = "abort"` (fail-closed); the
+Python wheel is built `panic = "unwind"` so a panic surfaces as a catchable
+`PanicException` rather than killing the worker (see
+[`docs/python-interop.md`](docs/python-interop.md)).
+
 See also [Parser robustness](#parser-robustness-untrusted-input-hardening) for the
 underlying per-format caps.
 

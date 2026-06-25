@@ -98,3 +98,29 @@ path = "fuzz_targets/fuzz_pth_limits.rs"
 test = false
 doc = false
 bench = false
+
+# Phase 6.13 Step 1: the copy-based (`no-mmap`) full-parse entry points
+# (`parse_bytes` / `parse_gguf_bytes` / `parse_pth_bytes`) — the recommended
+# untrusted-input path, owned `Vec<u8>` instead of a mmap. They reach the full
+# data parse (deeper than the inspect-only targets); the panic-freedom invariant
+# (Phase 6.13 Step 3) must hold on this path too.
+[[bin]]
+name = "fuzz_safetensors_bytes"
+path = "fuzz_targets/fuzz_safetensors_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_gguf_bytes"
+path = "fuzz_targets/fuzz_gguf_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pth_bytes"
+path = "fuzz_targets/fuzz_pth_bytes.rs"
+test = false
+doc = false
+bench = false

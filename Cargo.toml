@@ -34,12 +34,22 @@ features = ["npz", "pth", "gguf", "awq", "gptq", "bnb", "ollama"]
 # `unwind` (libtest requires it), so `cargo test` / `cargo test --release` are
 # unaffected.
 #
-# Phase 6.13 exception (lands with the Phase 7 `python` feature, not here): the
-# PyO3 extension `cdylib` must build `panic = "unwind"` so PyO3 converts a Rust
-# panic into a catchable Python `PanicException` instead of aborting the host
-# worker. That override belongs to the maturin/`python` build configuration.
+# Phase 6.13 exception: the PyO3 extension `cdylib` must build `panic = "unwind"`
+# so PyO3 converts a Rust panic into a catchable Python `PanicException` instead
+# of aborting the host worker. That override lives in `[profile.python]` below;
+# Phase 8's maturin build selects it with `--profile python`.
 [profile.release]
 panic = "abort"
+
+# The profile the Phase 8 PyO3 `cdylib` is built with (maturin `--profile
+# python`). Identical to `release` except panics **unwind**: PyO3's panic
+# boundary turns an unwinding panic into a catchable Python `PanicException`,
+# whereas `panic = "abort"` would kill the worker uncatchably — voiding the
+# bindings' "malformed bytes -> exception, never a dead worker" pledge. Enforced
+# by `tests/panic_profile.rs`; see `docs/python-interop.md`.
+[profile.python]
+inherits = "release"
+panic = "unwind"
 
 [features]
 default = []

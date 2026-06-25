@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panic/abort-freedom as a tested invariant + the `unwind` build requirement**
+  (Phase 6.13 Step 3). No public parse/inspect entry point panics or aborts on
+  any input — promoted from an implicit property (a panic would crash the fuzzer)
+  to an explicit, stable-CI contract: `tests/no_panic.rs` runs a `catch_unwind`
+  battery (synthetic malformed shapes + truncations/bit-flips of the committed
+  fixtures) over every entry point in debug, so integer-overflow panics are in
+  scope, and three new owned-path `cargo fuzz` targets (`fuzz_safetensors_bytes`
+  / `fuzz_gguf_bytes` / `fuzz_pth_bytes`) cover the copy-based untrusted entry.
+  Adds a `[profile.python]` (`inherits = "release"`, `panic = "unwind"`) — the
+  profile the Phase 8 PyO3 `cdylib` is built with so a panic surfaces as a
+  catchable Python `PanicException` instead of an uncatchable abort — guarded by
+  `tests/panic_profile.rs` (asserts release = abort, python = unwind). New
+  `docs/python-interop.md` records the panic-safety + unwind contract.
 - **Copy-based (`no-mmap`) full-parse entry points** for every mmap-backed
   format (Phase 6.13 Step 1): `parse_bytes` / `parse_from_reader` (safetensors),
   `parse_gguf_bytes` / `parse_gguf_from_reader`, and `parse_pth_bytes` /
