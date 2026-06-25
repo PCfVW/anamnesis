@@ -270,10 +270,10 @@ impl fmt::Display for PthDtype {
 /// little-endian tensors) or owns a copy (non-contiguous / big-endian).
 ///
 /// **FFI / Python boundary:** `name` and `shape` are owned, but `data` borrows
-/// the owning [`ParsedPth`] (and its `Backing`) for `'a` in the zero-copy case.
-/// A binding that hands the bytes to another runtime (e.g. a `NumPy` array) must
-/// call `data.into_owned()` first, so the array never aliases a `Backing` the
-/// owner can drop. See `docs/python-interop.md` (ownership contract).
+/// the owning [`ParsedPth`] for `'a` in the zero-copy case. A binding that hands
+/// the bytes to another runtime (e.g. a `NumPy` array) must call
+/// `data.into_owned()` first, so the array never aliases bytes the owning
+/// [`ParsedPth`] can drop. See `docs/python-interop.md` (ownership contract).
 #[derive(Debug, Clone)]
 pub struct PthTensor<'a> {
     /// Tensor name (`state_dict` key, e.g. `"linear.weight"`).

@@ -12,19 +12,14 @@
 //!
 //! Each test below performs that exact extraction inside an inner scope, lets the
 //! `Parsed*` **drop at the end of the scope**, and then uses the collected data.
-//! That it *compiles and runs* is the structural guarantee: a value still
-//! borrowing the `Backing` (a `Cow::Borrowed` / `&'a` field kept in the result)
-//! could not outlive the `Parsed*`, so the inner scope would fail to compile.
-//! This is the PyO3-free foundation the binding's owned-copy contract rests on.
+//! Two guarantees combine: *compile-time*, the borrow checker would reject a
+//! result that kept a `Cow::Borrowed` / `&'a` field (it could not outlive the
+//! `Parsed*`), so the inner scope only compiles because the extraction takes
+//! ownership; *run-time*, using the data after the drop confirms the owned copy
+//! is genuinely independent of the owner. This is the `PyO3`-free foundation the
+//! binding's owned-copy contract rests on.
 
-#![allow(
-    clippy::panic,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::wildcard_enum_match_arm
-)]
+#![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::fs;
 

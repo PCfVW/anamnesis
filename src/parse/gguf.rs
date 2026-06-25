@@ -916,12 +916,12 @@ pub struct GgufTensorInfo {
 /// memory-mapped file for every supported dtype; `Cow::Owned` is reserved
 /// for future big-endian support.
 ///
-/// **FFI / Python boundary:** every field borrows the owning [`ParsedGguf`]
-/// (and its `Backing`) for `'a`. A binding that hands the bytes to another
-/// runtime (e.g. a `NumPy` array) must take ownership first — `data.into_owned()`
-/// plus `name.to_owned()` / `shape.to_vec()` — so the array never aliases a
-/// `Backing` the owner can drop. See `docs/python-interop.md` (ownership
-/// contract).
+/// **FFI / Python boundary:** `name`, `shape`, and `data` borrow the owning
+/// [`ParsedGguf`] for `'a` (`dtype` is owned). A binding that hands the bytes to
+/// another runtime (e.g. a `NumPy` array) must take ownership first —
+/// `data.into_owned()` plus `name.to_owned()` / `shape.to_vec()` — so the array
+/// never aliases bytes the owning [`ParsedGguf`] can drop. See
+/// `docs/python-interop.md` (ownership contract).
 #[derive(Debug, Clone)]
 pub struct GgufTensor<'a> {
     /// Tensor name (e.g., `"blk.0.attn_q.weight"`).
