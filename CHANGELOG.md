@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`NumPy` / `BF16` data-ownership contract** (Phase 6.13 Step 4), the design
+  the Phase 8 PyO3 bindings implement — recorded in `docs/python-interop.md`
+  *before* a `pip` API freezes it. **Ownership:** owned-copy by default — a
+  returned array always owns its bytes (GGUF / `.pth` via `Cow::into_owned`, npz
+  and `remember_to_bytes` already owned), so no array aliases a `Backing` the
+  owning `Parsed*` can drop (the pure-Python use-after-free is structurally
+  impossible); zero-copy via `PyCapsule` is a documented future opt-in.
+  **`BF16`:** return `ml_dtypes.bfloat16` when that optional dep is present, else
+  raw `bytes` + a `"bfloat16"` dtype string — never a silent upcast. Pinned by
+  `tests/python_ownership_contract.rs` (owned extraction outlives a dropped
+  `Parsed*`) and FFI-boundary doc-notes on `GgufTensor` / `PthTensor`. Docs +
+  test only — no library behaviour change.
 - **Panic/abort-freedom as a tested invariant + the `unwind` build requirement**
   (Phase 6.13 Step 3). No public parse/inspect entry point panics or aborts on
   any input — promoted from an implicit property (a panic would crash the fuzzer)

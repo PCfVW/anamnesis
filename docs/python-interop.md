@@ -54,4 +54,59 @@ even an *unexpected* panic (a bug, not an input) surfaces as a catchable
 `PanicException` instead of killing the worker. See the error → exception map on
 `AnamnesisError` (and the README "Parsing untrusted input" section).
 
-<!-- Phase 6.13 Step 4 will add: ## NumPy / BF16 data-ownership contract -->
+## NumPy / BF16 data-ownership contract (Phase 6.13 Step 4)
+
+Two coupled decisions the Phase 8 `numpy` interop hard-depends on, locked here so
+the binding implements rather than re-litigates them — and so a published `pip`
+API never freezes an unsafe shape.
+
+### Ownership — *owned copy by default*
+
+**Rule.** A NumPy array the binding hands back must either **own** its bytes or
+borrow Rust memory through a lifetime-safe capsule that keeps the owner alive —
+**never** a bare view into a `Backing` the owning `Parsed*` can drop. A bare view
+is a **use-after-free reachable from pure Python**: `arr = model.tensor("w"); del
+model` would free the mmap/`Vec` the array still points at.
+
+**Decision: the first wheel copies.** Every returned array owns its bytes. The
+core already supports this on every path — no new API, no lifetime gymnastics in
+the binding:
+
+| Format | Accessor | Today | Binding takes ownership via |
+|---|---|---|---|
+| safetensors | `ParsedModel::remember_to_bytes` | **owned** `Vec<u8>` (dequantised `BF16`) | already owned |
+| npz | `NpzTensor::data` | **owned** `Vec<u8>` | already owned |
+| GGUF | `ParsedGguf::tensors` → `GgufTensor::data` | `Cow::Borrowed` into the `Backing` | `Cow::into_owned()` |
+| `.pth` | `ParsedPth::tensors` → `PthTensor::data` | `Cow::Borrowed` into the `Backing` | `Cow::into_owned()` |
+
+Only GGUF and `.pth` `tensors()` borrow (zero-copy `Cow::Borrowed` slices into the
+`Backing`); the binding calls `.into_owned()` before constructing the array, so no
+array ever aliases a droppable `Backing`. Combined with Step 1's copy-based
+`parse_*_bytes` / `parse_*_from_reader` entry points (owned `Backing`, no mmap),
+the untrusted-input path is owned end to end. The Rust-side guarantee — *owned
+extraction outlives a dropped `Parsed*`* — is pinned by
+`tests/python_ownership_contract.rs`.
+
+**Deferred opt-in: zero-copy.** A later release may offer a zero-copy array whose
+NumPy `base` is a `PyCapsule` holding a reference to the owning `Parsed*` (so the
+GC cannot drop it while the array lives). It is a real copy-elision win but a
+use-after-free footgun if the lifetime wiring is ever wrong, so it is **out of
+scope for the first wheel** — opt-in, never the default.
+
+### BF16 — exact, never silently widened
+
+NumPy has no native `bfloat16`. anamnesis's whole purpose is *exact* precision
+recovery, so the binding must not quietly upcast.
+
+**Decision.** Return an [`ml_dtypes.bfloat16`](https://github.com/jax-ml/ml_dtypes)
+array when that (optional) Python dependency is importable; otherwise return raw
+`bytes` + an explicit `"bfloat16"` dtype string the caller can reinterpret. Never
+silently widen `BF16` → `float32` (it doubles memory and discards the
+exact-bytes property). This mirrors what the core already models: `NpzDtype::BF16`
+is a first-class variant, and the NPZ parser already reads the JAX void-`V2`
+`bfloat16` convention. All other dtypes (`F16`, `F32`, `I32`, …) map to their
+native NumPy types.
+
+See also the *Panic safety* section above and the README "Parsing untrusted
+input" error taxonomy — together they are the safety contract the bindings ship
+against.
