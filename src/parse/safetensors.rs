@@ -976,6 +976,8 @@ fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
 /// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
 ///
 /// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognized dtype.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header exceeds the
+/// permanent 100 MiB cap (`MAX_SAFETENSORS_HEADER_BYTES`, always-on).
 ///
 /// # Memory
 ///
@@ -1125,8 +1127,10 @@ fn build_header_from_metadata(
 /// Returns [`AnamnesisError::Io`] if the reader fails to produce the
 /// requested bytes (8-byte length prefix or `length` bytes of `JSON`).
 ///
-/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed or
-/// the declared length exceeds the 100 MiB sanity cap.
+/// Returns [`AnamnesisError::Parse`] if the header bytes are malformed.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared length exceeds the
+/// permanent 100 MiB cap (`MAX_SAFETENSORS_HEADER_BYTES`, always-on).
 ///
 /// Returns [`AnamnesisError::Unsupported`] if a tensor uses an unrecognised
 /// dtype.

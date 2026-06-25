@@ -119,6 +119,8 @@ pub struct ParsedModel {
 /// mapped.
 /// Returns [`AnamnesisError::Parse`] if the safetensors header is
 /// malformed.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header exceeds the
+/// permanent 100 MiB cap (`MAX_SAFETENSORS_HEADER_BYTES`, always-on).
 ///
 /// # Memory
 ///

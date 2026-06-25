@@ -102,15 +102,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`# Errors` doc accuracy for the parse entry points.** Several entry points
-  (the copy-based `parse_bytes` / `parse_*_from_reader` wrappers, the `read`
-  helper, and the `parse_pth` family) still described the pre-Phase-6.13-Step-2
-  taxonomy: they attributed non-allowlisted pickle globals to `Parse` (now
-  `DisallowedGlobal`) and omitted `LimitExceeded`, which the always-on permanent
-  per-format caps return even under `ParseLimits::default()`. The docs now name
-  the variant each condition actually produces, so a caller routing on the error
-  *kind* (e.g. a Python binding mapping to HTTP statuses) sees the true contract.
-  Docs only — no behaviour change.
+- **`# Errors` doc accuracy across every parse/inspect entry point.** Many entry
+  points — the copy-based `parse_*_bytes` / `parse_*_from_reader` wrappers, the
+  `read` helper, and the pre-existing path/inspect/header functions (`parse`,
+  `parse_safetensors_header[_from_reader]`, `parse_gguf`, `inspect_gguf_from_reader`,
+  `inspect_npz[_from_reader]`, `parse_npz`, the `parse_pth` family) — still
+  described the pre-Phase-6.13-Step-2 taxonomy: they attributed non-allowlisted
+  pickle globals and over-cap declarations to `Parse`, where Step 2 reclassified
+  them to `DisallowedGlobal` and `LimitExceeded`. Because the pickle allowlist and
+  the permanent per-format caps are **always-on**, both variants are reachable even
+  under `ParseLimits::default()`. The docs (and the FAQ) now name the variant each
+  condition actually produces, so a caller routing on the error *kind* (e.g. a
+  Python binding mapping to HTTP statuses) sees the true contract. Docs only — no
+  behaviour change.
 
 ## [0.6.7] - 2026-06-15
 

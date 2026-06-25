@@ -1657,9 +1657,13 @@ fn read_typed_array<R: Read + Seek>(
 /// Returns [`AnamnesisError::Io`] if the file cannot be opened or mapped.
 ///
 /// Returns [`AnamnesisError::Parse`] if the magic bytes are missing, the
-/// header fields are truncated or out of range, the metadata table contains
-/// an invalid value type, a tensor info entry is malformed, or a tensor's
-/// resolved byte range falls outside the mapped file.
+/// header fields are truncated, the metadata table contains an invalid value
+/// type, a tensor info entry is malformed, or a tensor's resolved byte range
+/// falls outside the mapped file.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared string/array length,
+/// metadata-KV or tensor count, dimension, or element count exceeds a permanent
+/// `GGUF` cap (always-on).
 ///
 /// Returns [`AnamnesisError::Unsupported`] for `GGUF` v1 files (which use
 /// `u32` string lengths instead of `u64`), big-endian `GGUF` files (v3+
@@ -2186,10 +2190,14 @@ struct GgufFrontMatter {
 /// reader fails.
 ///
 /// Returns [`AnamnesisError::Parse`] if the magic bytes are missing, the
-/// header fields are truncated or out of range, the metadata table contains
-/// an invalid value type, a tensor info entry is malformed, or a tensor's
-/// resolved byte range falls outside the stream's total length (captured
-/// via `seek(SeekFrom::End(0))` at construction).
+/// header fields are truncated, the metadata table contains an invalid value
+/// type, a tensor info entry is malformed, or a tensor's resolved byte range
+/// falls outside the stream's total length (captured via `seek(SeekFrom::End(0))`
+/// at construction).
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared string/array length,
+/// metadata-KV or tensor count, dimension, or element count exceeds a permanent
+/// `GGUF` cap (always-on).
 ///
 /// Returns [`AnamnesisError::Unsupported`] for `GGUF` v1 files (which use
 /// `u32` string lengths instead of `u64`), big-endian `GGUF` files (v3+

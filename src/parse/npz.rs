@@ -677,6 +677,9 @@ impl fmt::Display for NpzInspectInfo {
 /// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed or
 /// an `NPY` header is invalid.
 ///
+/// Returns [`AnamnesisError::LimitExceeded`] if a `ZIP` entry count / name
+/// length or an `NPY` header size exceeds a permanent cap (always-on).
+///
 /// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
 /// or an unsupported dtype.
 ///
@@ -748,6 +751,9 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 ///
 /// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed or
 /// an `NPY` header is invalid.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if a `ZIP` entry count / name
+/// length or an `NPY` header size exceeds a permanent cap (always-on).
 ///
 /// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
 /// or an unsupported dtype.
@@ -850,6 +856,10 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
 ///
 /// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed, an
 /// `NPY` header is invalid, or array data is truncated.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if a `ZIP` entry count / name
+/// length, an `NPY` header size, or a declared array size exceeds a permanent
+/// cap (all always-on, reachable even at default limits).
 ///
 /// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
 /// or an unsupported dtype.
