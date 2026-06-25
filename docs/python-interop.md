@@ -1,6 +1,6 @@
 # Python interop — design notes for the PyO3 bindings
 
-<!-- Last updated: 2026-06-25, anamnesis v0.6.7 (Phase 6.13) -->
+<!-- Last updated: 2026-06-25, anamnesis v0.6.8 (Phase 6.13) -->
 
 This is the contract the [Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3)
 PyO3 bindings (`pip install anamnesis`) implement. It is written **before** the

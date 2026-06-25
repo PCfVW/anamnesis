@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-06-21, anamnesis v0.6.7 -->
+<!-- Last updated: 2026-06-25, anamnesis v0.6.8 -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.

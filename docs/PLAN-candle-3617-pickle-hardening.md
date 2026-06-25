@@ -3,7 +3,7 @@
 **Status:** Proposed (issue posted, no PR yet)
 **Date:** 2026-06-17
 **Upstream issue:** [huggingface/candle#3617](https://github.com/huggingface/candle/issues/3617) — *"Unbounded pickle-VM working set in `candle-core/src/pickle.rs` (DoS via crafted `.pth`)"* (opened by PCfVW, 2026-06-13)
-**Reference implementation:** `anamnesis ≥ 0.6.6` (current 0.6.7), [`src/parse/pth.rs`](../src/parse/pth.rs)
+**Reference implementation:** `anamnesis ≥ 0.6.6` (current 0.6.8), [`src/parse/pth.rs`](../src/parse/pth.rs)
 **Relation to other docs:** continues the [`security-audit-brief.md`](security-audit-brief.md) / [`security-audit-findings.md`](security-audit-findings.md) theme; this one targets *upstream* (candle) rather than anamnesis itself.
 
 ---
