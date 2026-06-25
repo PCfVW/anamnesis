@@ -6,12 +6,27 @@
 //! `panic = "abort"` profile would be an uncatchable process kill, and which the
 //! Phase 8 bindings must be able to surface as a catchable `PanicException`).
 //!
-//! Each entry point is exercised over a battery of adversarial inputs (synthetic
-//! malformed shapes + truncations and bit-flips of the committed fixtures) inside
-//! [`std::panic::catch_unwind`], asserting it never unwinds. This runs under the
-//! default (debug) test profile, so debug-only integer-overflow panics are in
-//! scope. The `cargo fuzz` harness extends this to coverage-guided exploration;
-//! this test pins the contract in stable CI.
+//! Every re-exported parse/inspect entry point of all four formats is driven
+//! here — the owned-bytes, reader, **and path/mmap** variants, each under both
+//! `ParseLimits::default()` and a deliberately hostile tight budget (so the
+//! `check_alloc` / bounded-reader / `Budget::charge_alloc` / count / ratio
+//! rejection arithmetic is on the hook too) — over a battery of adversarial
+//! inputs (synthetic malformed shapes + truncations and bit-flips of the
+//! committed fixtures), each call wrapped in [`std::panic::catch_unwind`] and
+//! asserted never to unwind. The suite runs under the default (debug) test
+//! profile, so debug-only integer-overflow panics are in scope.
+//!
+//! Two boundaries are deliberate, not omissions:
+//! - **`SIGBUS` is out of scope by nature.** The `parse*` path/mmap variants map
+//!   the file; a *post-map* truncation faults with `SIGBUS` — an OS signal
+//!   `catch_unwind` cannot catch. That hazard is addressed by *recommending the
+//!   copy-based `parse_bytes` / `parse_*_from_reader` paths* for untrusted input
+//!   (Step 1), not by this test. Mapping a complete file exercises the identical
+//!   `parsed_*_from_backing` parse core the owned paths use.
+//! - **Exhaustive structural exploration is the fuzzer's job.** This test pins
+//!   the entry-point surface against a fixed corpus in stable CI; the coverage-
+//!   guided `cargo fuzz` harness (incl. the owned-bytes `fuzz_*_bytes` targets)
+//!   drives deep-nesting / rare-opcode discovery the fixed battery cannot.
 
 #![allow(
     clippy::panic,
@@ -24,12 +39,28 @@
 )]
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
+
+use anamnesis::ParseLimits;
 
 /// Runs `f` and asserts it returns normally (`Ok`/`Err`) rather than unwinding.
 /// The produced value is irrelevant — only "did it panic?" matters.
 fn assert_no_panic<T>(label: &str, f: impl FnOnce() -> T) {
     let outcome = catch_unwind(AssertUnwindSafe(f));
     assert!(outcome.is_ok(), "PANICKED on input `{label}`");
+}
+
+/// A deliberately hostile budget (16-byte single-allocation ceiling): forces
+/// every parser onto its `ParseLimits` rejection branches, so the checked
+/// arithmetic that backs them must reject without panicking.
+fn tight() -> ParseLimits {
+    ParseLimits::default().with_max_single_alloc(16)
+}
+
+/// Writes `bytes` to `path` for the path/mmap entry points. A failure here is a
+/// fault in the *test harness*, not the code under test, so it may panic.
+fn stage(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("test harness: write temp input");
 }
 
 /// Committed (always-present) fixtures, truncated and bit-flipped below to build
@@ -75,11 +106,16 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
             b.extend_from_slice(&[0xCDu8; 64]);
             b
         }),
-        // Raw pickle protocol bytes (legacy `.pth` detection path).
+        // Raw pickle protocol bytes (legacy `.pth` detection path), then a MARK
+        // flood — pushes the pickle VM toward its nesting/stack guards.
         ("pickle-proto".to_owned(), vec![0x80, 0x02, b'}', b'.']),
+        ("pickle-proto+mark-flood".to_owned(), {
+            let mut b = vec![0x80u8, 0x02];
+            b.extend_from_slice(&[0x28u8; 8192]); // `(` = MARK
+            b
+        }),
         // Deeply repetitive bytes — stress recursion / nesting guards.
         ("open-brackets-8k".to_owned(), vec![b'['; 8192]),
-        ("pickle-mark-flood".to_owned(), vec![0x28u8; 8192]), // `(` = MARK
         ("repeating-2byte-100k".to_owned(), {
             b"\x80\x02".iter().copied().cycle().take(100_000).collect()
         }),
@@ -101,7 +137,7 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
             continue;
         };
         let len = bytes.len();
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = fixture_basename(path);
         for cut in [1usize, 4, 8, 16, len / 4, len / 2, len.saturating_sub(1)] {
             let cut = cut.min(len);
             inputs.push((format!("{name}@trunc{cut}"), bytes[..cut].to_vec()));
@@ -118,6 +154,27 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
     inputs
 }
 
+/// The label prefix used for inputs derived from a fixture path.
+fn fixture_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Guards against a silently-stale `FIXTURES` path: if a fixture moves, its
+/// truncation/flip inputs vanish and the battery weakens *invisibly* — so assert
+/// every fixture actually contributed inputs, loudly.
+#[test]
+fn battery_includes_every_fixture() {
+    let inputs = adversarial_inputs();
+    for fixture in FIXTURES {
+        let base = fixture_basename(fixture);
+        assert!(
+            inputs.iter().any(|(label, _)| label.starts_with(base)),
+            "no inputs derived from `{fixture}` — a FIXTURES path is stale, \
+             silently weakening coverage"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // safetensors (always-on)
 // ---------------------------------------------------------------------------
@@ -125,25 +182,56 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
 #[test]
 fn safetensors_entry_points_never_panic() {
     use anamnesis::{
-        parse_bytes, parse_from_reader, parse_safetensors_header_from_reader, ParseLimits,
+        parse, parse_bytes, parse_bytes_with_limits, parse_from_reader,
+        parse_from_reader_with_limits, parse_safetensors_header,
+        parse_safetensors_header_from_reader, parse_safetensors_header_from_reader_with_limits,
+        parse_safetensors_header_with_limits, parse_with_limits,
     };
     use std::io::Cursor;
 
+    let tmp = tempfile::NamedTempFile::new().expect("temp file");
+    let path = tmp.path();
+    let tight = tight();
+
     for (label, bytes) in adversarial_inputs() {
-        assert_no_panic(&format!("safetensors parse_bytes / {label}"), || {
+        // owned bytes
+        assert_no_panic(&format!("st parse_bytes / {label}"), || {
             parse_bytes(bytes.clone())
         });
-        assert_no_panic(&format!("safetensors parse_from_reader / {label}"), || {
+        assert_no_panic(
+            &format!("st parse_bytes_with_limits[tight] / {label}"),
+            || parse_bytes_with_limits(bytes.clone(), &tight),
+        );
+        // reader
+        assert_no_panic(&format!("st parse_from_reader / {label}"), || {
             parse_from_reader(Cursor::new(bytes.clone()))
         });
-        // A tightened budget exercises the limit-checking arithmetic too.
-        let tight = ParseLimits::default().with_max_single_alloc(16);
-        assert_no_panic(&format!("safetensors parse_bytes(tight) / {label}"), || {
-            anamnesis::parse_bytes_with_limits(bytes.clone(), &tight)
+        assert_no_panic(
+            &format!("st parse_from_reader_with_limits[tight] / {label}"),
+            || parse_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
+        // header — bytes + reader
+        assert_no_panic(&format!("st parse_safetensors_header / {label}"), || {
+            parse_safetensors_header(&bytes)
         });
-        assert_no_panic(&format!("safetensors header_from_reader / {label}"), || {
+        assert_no_panic(
+            &format!("st parse_safetensors_header_with_limits[tight] / {label}"),
+            || parse_safetensors_header_with_limits(&bytes, &tight),
+        );
+        assert_no_panic(&format!("st header_from_reader / {label}"), || {
             parse_safetensors_header_from_reader(Cursor::new(bytes.clone()))
         });
+        assert_no_panic(
+            &format!("st header_from_reader_with_limits[tight] / {label}"),
+            || parse_safetensors_header_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
+        // path / mmap
+        stage(path, &bytes);
+        assert_no_panic(&format!("st parse(path) / {label}"), || parse(path));
+        assert_no_panic(
+            &format!("st parse_with_limits(path)[tight] / {label}"),
+            || parse_with_limits(path, &tight),
+        );
     }
 }
 
@@ -154,19 +242,42 @@ fn safetensors_entry_points_never_panic() {
 #[cfg(feature = "gguf")]
 #[test]
 fn gguf_entry_points_never_panic() {
-    use anamnesis::{inspect_gguf_from_reader, parse_gguf_bytes, parse_gguf_from_reader};
+    use anamnesis::{
+        inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
+        parse_gguf_from_reader, parse_gguf_from_reader_with_limits, parse_gguf_with_limits,
+    };
     use std::io::Cursor;
+
+    let tmp = tempfile::NamedTempFile::new().expect("temp file");
+    let path = tmp.path();
+    let tight = tight();
 
     for (label, bytes) in adversarial_inputs() {
         assert_no_panic(&format!("gguf parse_gguf_bytes / {label}"), || {
             parse_gguf_bytes(bytes.clone())
         });
+        assert_no_panic(
+            &format!("gguf parse_gguf_bytes_with_limits[tight] / {label}"),
+            || parse_gguf_bytes_with_limits(bytes.clone(), &tight),
+        );
         assert_no_panic(&format!("gguf parse_gguf_from_reader / {label}"), || {
             parse_gguf_from_reader(Cursor::new(bytes.clone()))
         });
+        assert_no_panic(
+            &format!("gguf parse_gguf_from_reader_with_limits[tight] / {label}"),
+            || parse_gguf_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
         assert_no_panic(&format!("gguf inspect_from_reader / {label}"), || {
             inspect_gguf_from_reader(Cursor::new(bytes.clone()))
         });
+        stage(path, &bytes);
+        assert_no_panic(&format!("gguf parse_gguf(path) / {label}"), || {
+            parse_gguf(path)
+        });
+        assert_no_panic(
+            &format!("gguf parse_gguf_with_limits(path)[tight] / {label}"),
+            || parse_gguf_with_limits(path, &tight),
+        );
     }
 }
 
@@ -177,44 +288,78 @@ fn gguf_entry_points_never_panic() {
 #[cfg(feature = "pth")]
 #[test]
 fn pth_entry_points_never_panic() {
-    use anamnesis::{inspect_pth_from_reader, parse_pth_bytes, parse_pth_from_reader};
+    use anamnesis::{
+        inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
+        parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_with_limits,
+    };
     use std::io::Cursor;
+
+    let tmp = tempfile::NamedTempFile::new().expect("temp file");
+    let path = tmp.path();
+    let tight = tight();
 
     for (label, bytes) in adversarial_inputs() {
         assert_no_panic(&format!("pth parse_pth_bytes / {label}"), || {
             parse_pth_bytes(bytes.clone())
         });
+        assert_no_panic(
+            &format!("pth parse_pth_bytes_with_limits[tight] / {label}"),
+            || parse_pth_bytes_with_limits(bytes.clone(), &tight),
+        );
         assert_no_panic(&format!("pth parse_pth_from_reader / {label}"), || {
             parse_pth_from_reader(Cursor::new(bytes.clone()))
         });
+        assert_no_panic(
+            &format!("pth parse_pth_from_reader_with_limits[tight] / {label}"),
+            || parse_pth_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
         assert_no_panic(&format!("pth inspect_from_reader / {label}"), || {
             inspect_pth_from_reader(Cursor::new(bytes.clone()))
         });
+        stage(path, &bytes);
+        assert_no_panic(&format!("pth parse_pth(path) / {label}"), || {
+            parse_pth(path)
+        });
+        assert_no_panic(
+            &format!("pth parse_pth_with_limits(path)[tight] / {label}"),
+            || parse_pth_with_limits(path, &tight),
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
-// NPZ
+// NPZ (path-based parse + reader/path inspect)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "npz")]
 #[test]
 fn npz_entry_points_never_panic() {
-    use anamnesis::{inspect_npz_from_reader, parse_npz_with_limits, ParseLimits};
+    use anamnesis::{inspect_npz, inspect_npz_from_reader, parse_npz, parse_npz_with_limits};
     use std::io::Cursor;
 
-    // `parse_npz*` is path-based; reuse one temp file, overwritten per input.
     let tmp = tempfile::NamedTempFile::new().expect("temp file");
-    let path = tmp.path().to_path_buf();
+    let path = tmp.path();
+    let default = ParseLimits::default();
+    let tight = tight();
 
     for (label, bytes) in adversarial_inputs() {
         assert_no_panic(&format!("npz inspect_from_reader / {label}"), || {
             inspect_npz_from_reader(Cursor::new(bytes.clone()))
         });
-
-        std::fs::write(&path, &bytes).expect("write temp npz");
-        assert_no_panic(&format!("npz parse_npz_with_limits / {label}"), || {
-            parse_npz_with_limits(&path, &ParseLimits::default())
+        stage(path, &bytes);
+        assert_no_panic(&format!("npz inspect_npz(path) / {label}"), || {
+            inspect_npz(path)
         });
+        assert_no_panic(&format!("npz parse_npz(path) / {label}"), || {
+            parse_npz(path)
+        });
+        assert_no_panic(
+            &format!("npz parse_npz_with_limits(path)[default] / {label}"),
+            || parse_npz_with_limits(path, &default),
+        );
+        assert_no_panic(
+            &format!("npz parse_npz_with_limits(path)[tight] / {label}"),
+            || parse_npz_with_limits(path, &tight),
+        );
     }
 }
