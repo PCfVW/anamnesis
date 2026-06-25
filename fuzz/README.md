@@ -12,11 +12,14 @@ tests *pin* them, and fuzzing *searches* for inputs we didn't think of.
 
 ## Targets
 
-Three flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
+Four flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
 inspection surface), **path/parse** targets (the full data-extraction path,
-materialising the input to a temp file), and **limit-enforcement** targets
+materialising the input to a temp file), **limit-enforcement** targets
 (Phase 6.8 Step 5) that parse under a `ParseLimits` **derived from the input**,
-so the fuzzer co-explores `(malformed file × tightened limits)`.
+so the fuzzer co-explores `(malformed file × tightened limits)`, and
+**owned-bytes** targets (Phase 6.13 Step 1) that drive the copy-based,
+mmap-free full-parse entry points — the path the Python bindings route untrusted
+uploads through.
 
 | Target | Entry point | What it exercises |
 |---|---|---|
@@ -30,6 +33,9 @@ so the fuzzer co-explores `(malformed file × tightened limits)`.
 | `fuzz_npz_limits` | `parse_npz_with_limits` (via temp file) | **all four `ParseLimits` axes**: single-alloc, cumulative `Budget` (`checked_add`), item-count, decompression-ratio (`checked_mul`) |
 | `fuzz_gguf_limits` | `parse_gguf_with_limits` (via temp file) | GGUF limit branches: single-alloc + `Budget` on variable-length reads + scalar-array charge + tensor/KV count gate |
 | `fuzz_pth_limits` | `parse_pth_with_limits` + `tensors()` (via temp file) | `.pth` limit branches: the `data.pkl` cap + the pickle-VM `Budget` charged on each owned payload |
+| `fuzz_safetensors_bytes` | `parse_bytes` | the **copy-based** (no-mmap) safetensors full parse over owned bytes (Phase 6.13 Step 1) — the recommended untrusted-input path |
+| `fuzz_gguf_bytes` | `parse_gguf_bytes` | the **copy-based** GGUF full parse (header + metadata KV + tensor-info) over owned bytes |
+| `fuzz_pth_bytes` | `parse_pth_bytes` | the **copy-based** `.pth` full parse (ZIP walk + pickle VM + tensor extraction) over owned bytes |
 
 ## Prerequisites — Linux / macOS / WSL (not Windows-MSVC)
 
@@ -117,3 +123,13 @@ cleanly and the full re-sweep above is **zero-crash** post-fix. Not yet wired
 into CI; a scheduled Linux fuzz job is a candidate follow-up (it needs nightly +
 `cargo-fuzz` install in the runner, so it is intentionally kept out of the
 stable-only push/PR matrix).
+
+**Phase 6.13 (v0.6.8, owned-bytes full-parse targets)** — re-run under WSL2
+Ubuntu (nightly + `cargo-fuzz` 0.13.1): all 13 targets compile (the three new
+`fuzz_*_bytes` included). Unseeded 181 s campaigns on the new copy-based
+entry points: `fuzz_safetensors_bytes` 9.09 M runs (cov 1374, RSS 524 MB),
+`fuzz_gguf_bytes` 8.47 M, `fuzz_pth_bytes` 58.35 M (cov 160, RSS 430 MB —
+the pickle-VM working-set floor holding well under the 2 GB limit) —
+**≈75.9 M executions, zero crashes**, pinning the panic-freedom invariant
+(Phase 6.13 Step 3) on the recommended untrusted-input path. The always-run
+counterpart is `tests/no_panic.rs` (a `catch_unwind` battery in stable CI).
