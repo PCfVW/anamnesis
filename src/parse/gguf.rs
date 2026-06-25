@@ -1756,8 +1756,10 @@ fn parsed_gguf_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Res
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
-/// [`parse_gguf_with_limits`], or [`AnamnesisError::Unsupported`] for an
-/// unsupported `GGUF` variant.
+/// [`parse_gguf_with_limits`]; [`AnamnesisError::LimitExceeded`] if a declared
+/// length, count, or dimension exceeds a permanent cap (always-on — reachable
+/// even at the default limits this wrapper passes); or
+/// [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
 ///
 /// # Memory
 ///
@@ -1805,9 +1807,11 @@ pub fn parse_gguf_bytes_with_limits(
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Io`] if the reader fails, [`AnamnesisError::Parse`]
-/// on malformed input, or [`AnamnesisError::Unsupported`] for an unsupported
-/// `GGUF` variant.
+/// Returns [`AnamnesisError::Io`] if the reader fails;
+/// [`AnamnesisError::Parse`] on malformed input;
+/// [`AnamnesisError::LimitExceeded`] if a declared length, count, or dimension
+/// exceeds a permanent cap (always-on — reachable even at default limits); or
+/// [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
 ///
 /// # Memory
 ///

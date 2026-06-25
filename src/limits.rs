@@ -299,9 +299,12 @@ impl ParseLimits {
     ///
     /// Returns [`AnamnesisError::Io`](crate::AnamnesisError::Io) if the
     /// underlying read fails.
-    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) if the
-    /// bytes read exceed the caller's
-    /// [`ParseLimits::max_single_alloc_bytes`] budget.
+    /// Returns
+    /// [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// (`max_single_alloc_bytes`) if the bytes read exceed the caller's budget —
+    /// this is `check_alloc`'s variant.
+    /// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) only in the
+    /// degenerate case that the read length overflows `u64`.
     ///
     /// # Memory
     ///

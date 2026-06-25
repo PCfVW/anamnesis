@@ -100,6 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the three tests that wrote through a temp **file** now write into a temp
   **dir** + fresh path.
 
+### Fixed
+
+- **`# Errors` doc accuracy for the parse entry points.** Several entry points
+  (the copy-based `parse_bytes` / `parse_*_from_reader` wrappers, the `read`
+  helper, and the `parse_pth` family) still described the pre-Phase-6.13-Step-2
+  taxonomy: they attributed non-allowlisted pickle globals to `Parse` (now
+  `DisallowedGlobal`) and omitted `LimitExceeded`, which the always-on permanent
+  per-format caps return even under `ParseLimits::default()`. The docs now name
+  the variant each condition actually produces, so a caller routing on the error
+  *kind* (e.g. a Python binding mapping to HTTP statuses) sees the true contract.
+  Docs only — no behaviour change.
+
 ## [0.6.7] - 2026-06-15
 
 Phase 6.12 — vendored ZIP container reader. Replaces `zip::ZipArchive` (the

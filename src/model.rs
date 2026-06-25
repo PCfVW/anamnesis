@@ -194,6 +194,9 @@ fn parsed_model_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Re
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header exceeds the
+/// permanent 100 MiB cap (`MAX_SAFETENSORS_HEADER_BYTES`, always-on — reachable
+/// even at the default limits this wrapper passes).
 ///
 /// # Memory
 ///
@@ -240,6 +243,9 @@ pub fn parse_bytes_with_limits(bytes: Vec<u8>, limits: &ParseLimits) -> crate::R
 ///
 /// Returns [`AnamnesisError::Io`] if the reader fails.
 /// Returns [`AnamnesisError::Parse`] if the safetensors header is malformed.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header exceeds the
+/// permanent 100 MiB cap (`MAX_SAFETENSORS_HEADER_BYTES`, always-on — reachable
+/// even at the default limits this wrapper passes).
 ///
 /// # Memory
 ///

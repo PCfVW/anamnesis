@@ -164,17 +164,25 @@ mod pth {
 }
 
 // ---------------------------------------------------------------------------
-// GGUF (fixture is local-only / not committed → guarded by `exists()`)
+// GGUF
 // ---------------------------------------------------------------------------
+//
+// No GGUF fixture is committed (real models are large / local-only), so the
+// parity test synthesises a minimal valid GGUF in memory via the crate's own
+// writer (`write_gguf_to_writer`). It is therefore self-contained and **always
+// runs in CI** — unlike an `exists()`-guarded fixture, which would silently
+// no-op the parity check on a fresh checkout.
 
 #[cfg(feature = "gguf")]
 mod gguf {
     use super::fs;
-    use std::path::Path;
+    use std::collections::HashMap;
+    use std::io::Cursor;
 
-    use anamnesis::{parse_gguf, parse_gguf_bytes, parse_gguf_from_reader, ParsedGguf};
-
-    const GGUF: &str = "tests/fixtures/gguf_reference/models/SmolLM2-135M-Instruct-Q4_K_M.gguf";
+    use anamnesis::{
+        parse_gguf, parse_gguf_bytes, parse_gguf_from_reader, write_gguf_to_writer, GgufType,
+        GgufWriteTensor, ParsedGguf,
+    };
 
     /// `(name, data)` for every tensor, sorted — the parity fingerprint.
     fn fingerprint(p: &ParsedGguf) -> Vec<(String, Vec<u8>)> {
@@ -186,25 +194,51 @@ mod gguf {
         v
     }
 
+    /// A minimal valid GGUF (two tensors of distinct dtypes), produced by the
+    /// crate's own encoder so the parity test needs no on-disk fixture. The byte
+    /// values are arbitrary — parity only compares byte-for-byte across paths.
+    fn synthesize_gguf() -> Vec<u8> {
+        let f32_bytes: Vec<u8> = (0u32..6).flat_map(u32::to_le_bytes).collect();
+        let i32_bytes: Vec<u8> = (0i32..4).flat_map(i32::to_le_bytes).collect();
+        let f32_shape = [2usize, 3];
+        let i32_shape = [4usize];
+        let tensors = [
+            GgufWriteTensor {
+                name: "w.f32",
+                shape: &f32_shape,
+                dtype: GgufType::F32,
+                data: &f32_bytes,
+            },
+            GgufWriteTensor {
+                name: "w.i32",
+                shape: &i32_shape,
+                dtype: GgufType::I32,
+                data: &i32_bytes,
+            },
+        ];
+        let mut cursor = Cursor::new(Vec::new());
+        write_gguf_to_writer(&mut cursor, &tensors, &HashMap::new()).expect("write gguf");
+        cursor.into_inner()
+    }
+
     #[test]
     fn gguf_owned_paths_match_mmap() {
-        if !Path::new(GGUF).exists() {
-            eprintln!("skipping gguf parity: fixture not present ({GGUF})");
-            return;
-        }
-        let bytes = fs::read(GGUF).expect("read gguf fixture");
+        let bytes = synthesize_gguf();
 
-        let p_path = parse_gguf(GGUF).expect("path parse");
-        let p_bytes = parse_gguf_bytes(bytes).expect("bytes parse");
-        let p_reader =
-            parse_gguf_from_reader(fs::File::open(GGUF).expect("open")).expect("reader parse");
+        // The path/mmap entry point needs a file on disk.
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        fs::write(tmp.path(), &bytes).expect("stage gguf");
+
+        let p_path = parse_gguf(tmp.path()).expect("path parse");
+        let p_bytes = parse_gguf_bytes(bytes.clone()).expect("bytes parse");
+        let p_reader = parse_gguf_from_reader(Cursor::new(bytes)).expect("reader parse");
 
         let header = format!("{:?}", p_path.inspect());
         assert_eq!(header, format!("{:?}", p_bytes.inspect()));
         assert_eq!(header, format!("{:?}", p_reader.inspect()));
 
         let fp = fingerprint(&p_path);
-        assert!(!fp.is_empty(), "fixture should have tensors");
+        assert!(!fp.is_empty(), "synthesised gguf should have tensors");
         assert_eq!(
             fp,
             fingerprint(&p_bytes),

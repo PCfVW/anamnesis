@@ -2062,8 +2062,13 @@ fn copy_to_contiguous(
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch`
-/// ZIP archive, uses unsupported pickle opcodes, or contains
-/// non-allowlisted globals.
+/// ZIP archive or uses unsupported pickle opcodes.
+///
+/// Returns [`AnamnesisError::DisallowedGlobal`] for a pickle `GLOBAL` outside
+/// the `torch.*` allowlist, and [`AnamnesisError::LimitExceeded`] for a
+/// permanent-cap rejection (`data.pkl` size, pickle payload / working-set /
+/// nesting depth). Both are always-on, so reachable even at the default
+/// (unbounded) limits this wrapper passes.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
 /// files that are raw pickle without ZIP wrapping.
@@ -2251,10 +2256,13 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::Unsupported`] on the
-/// same conditions as [`parse_pth_with_limits`] (invalid ZIP, unsupported pickle
-/// opcodes, non-allowlisted globals, legacy format, or a declared size exceeding
-/// `limits`).
+/// Returns the same errors as [`parse_pth_with_limits`]:
+/// [`AnamnesisError::Parse`] (invalid ZIP / unsupported pickle opcodes),
+/// [`AnamnesisError::DisallowedGlobal`] (a `GLOBAL` outside the `torch.*`
+/// allowlist), [`AnamnesisError::LimitExceeded`] (a `data.pkl` size or pickle
+/// payload / working-set / nesting depth exceeding a permanent cap — always-on,
+/// so reachable even at the default limits this wrapper passes), and
+/// [`AnamnesisError::Unsupported`] (legacy raw-pickle format).
 ///
 /// # Memory
 ///
@@ -2303,9 +2311,12 @@ pub fn parse_pth_bytes_with_limits(
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Io`] if the reader fails, [`AnamnesisError::Parse`]
-/// on malformed input, or [`AnamnesisError::Unsupported`] for a legacy `.pth`
-/// file.
+/// Returns [`AnamnesisError::Io`] if the reader fails;
+/// [`AnamnesisError::Parse`] on malformed input;
+/// [`AnamnesisError::DisallowedGlobal`] for a pickle `GLOBAL` outside the
+/// `torch.*` allowlist; [`AnamnesisError::LimitExceeded`] for a permanent-cap
+/// rejection (both always-on, so reachable even at default limits); or
+/// [`AnamnesisError::Unsupported`] for a legacy `.pth` file.
 ///
 /// # Memory
 ///
