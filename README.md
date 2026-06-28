@@ -68,29 +68,25 @@ the [CLI Reference](docs/cli-reference.md).
 ## Try it
 
 ```
-$ amn inspect ollama:llama3.2:1b          # header-only — no weights loaded
+$ amn inspect model-fp8.safetensors       # what precision is in here?
+Format:      Fine-grained FP8 (E4M3), 128x128 blocks
+Quantized:   1 tensors (weights) + 1 scale tensors (F32)
+Passthrough: 1 tensors (norms, embeddings)
+Size:        96 B (FP8) -> 144 B (BF16)
+Lethe took:  ~48 B of precision
+
+$ amn remember model-fp8.safetensors      # recover it: FP8 → bit-exact BF16
+Parsing...  3 tensors, Fine-grained FP8 (E4M3), 128x128 blocks
+Recalling... 1 tensors
+Output: model-bf16.safetensors (144 B)
+
+$ amn inspect ollama:llama3.2:1b          # header-only on a real GGUF — no weights loaded
 Format:      GGUF v3
 Arch:        llama
 Tensors:     147
 Total size:  1.22 GB
 Dtypes:      F32, Q8_0
 Alignment:   32 bytes
-
-$ amn parse model.pth
-Parsed model.pth (PyTorch state_dict)
-  Tensors:    3
-  Total size: 1.7 KB
-  Dtypes:     F32
-  Byte order: little-endian
-
-  rnn.weight_ih_l0               F32 [16, 1]         64 B
-  rnn.weight_hh_l0               F32 [16, 16]        1.0 KB
-  linear.weight                  F32 [10, 16]        640 B
-
-$ amn remember model.pth                  # .pth → .safetensors (lossless)
-Converting model.pth → model.safetensors
-  3 tensors, 1.7 KB
-  Done.
 
 $ amn convert model.npz --to safetensors  # any input → any target, one dispatch
 Converting model.npz -> model-bf16.safetensors (NPZ -> safetensors)
