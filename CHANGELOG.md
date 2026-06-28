@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`docs/validation.md`** and **`docs/cli-reference.md`** — the validation
+  evidence (cross-validation tables, per-kernel speeds, conversion benchmarks,
+  peak-heap assertions, robustness hardening timeline) and the complete CLI
+  reference (subcommands, flags, the convert matrix, output-path rules, the
+  `ollama:` URL scheme), relocated out of the README.
+
+### Changed
+
+- **README restructured** around an audience-oriented "first window" — a *New to
+  anamnesis?* routing block, *Try it*, *Library quick start*, a compact *Formats
+  & quantization support* matrix, and a *What's next* roadmap teaser — with the
+  long validation and CLI detail moved to the new docs above. The pre-1.0 status
+  is now an understated line rather than a warning banner. Docs only — no code or
+  API change.
+
 ## [0.6.8] - 2026-06-25
 
 ### Added
