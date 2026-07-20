@@ -166,6 +166,13 @@ pub(crate) struct Hub {
     pub(crate) st_metadata: Option<HashMap<String, String>>,
     /// Tensors dequantised while reading.
     pub(crate) dequantized: usize,
+    /// `GGUF` key/value metadata carried from a `GGUF` source so a
+    /// dequantise-in-place `gguf → gguf` keeps the architecture / tokenizer KV
+    /// that makes the output loadable — a re-emitted file with no KV is a bare
+    /// tensor container. Empty for every non-`GGUF` source; caller-supplied KV
+    /// is merged over it by the writer.
+    #[cfg(feature = "gguf")]
+    pub(crate) gguf_metadata: HashMap<String, crate::GgufMetadataValue>,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +483,8 @@ fn read_safetensors(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
         tensors,
         st_metadata: model.header.metadata.clone(),
         dequantized,
+        #[cfg(feature = "gguf")]
+        gguf_metadata: HashMap::new(),
     })
 }
 
@@ -504,6 +513,8 @@ fn read_npz(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
         tensors,
         st_metadata: None,
         dequantized: 0,
+        #[cfg(feature = "gguf")]
+        gguf_metadata: HashMap::new(),
     })
 }
 
@@ -529,6 +540,8 @@ fn read_pth(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
         tensors,
         st_metadata: None,
         dequantized: 0,
+        #[cfg(feature = "gguf")]
+        gguf_metadata: HashMap::new(),
     })
 }
 
@@ -579,6 +592,9 @@ fn read_gguf(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
         tensors,
         st_metadata: None,
         dequantized,
+        // Preserve the source KV so a dequantise-in-place `gguf -> gguf` stays
+        // loadable; caller-supplied KV is merged over it by the writer.
+        gguf_metadata: parsed.metadata().clone(),
     })
 }
 
@@ -643,7 +659,7 @@ fn write_gguf_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
         })
         .collect();
 
-    write_gguf(output, &tensors, &HashMap::new())?;
+    write_gguf(output, &tensors, &hub.gguf_metadata)?;
 
     Ok(ConvertStats {
         tensors: tensors.len(),

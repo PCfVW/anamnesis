@@ -411,6 +411,108 @@ fn convert_gguf_to_bnb_nf4_smokes() {
     assert!(names.contains(&"linear.weight.absmax"));
 }
 
+/// `gguf` → `gguf` dequantise-in-place (Phase 6.14 Step 3) must **preserve the
+/// source KV**. Re-emitting a GGUF with an empty metadata table would produce a
+/// bare tensor container that no inference runtime can load, so the hub carries
+/// the source's architecture / hyper-parameter keys into the output.
+#[test]
+#[cfg(feature = "gguf")]
+fn convert_gguf_to_gguf_preserves_metadata() {
+    use anamnesis::GgufMetadataValue;
+    use std::collections::HashMap;
+
+    let f32_bytes: Vec<u8> = (0..8).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let shape = [8usize];
+    let tensors = [anamnesis::GgufWriteTensor {
+        name: "w",
+        shape: &shape,
+        dtype: anamnesis::GgufType::F32,
+        data: &f32_bytes,
+    }];
+    let mut meta: HashMap<String, GgufMetadataValue> = HashMap::new();
+    meta.insert(
+        "general.architecture".to_owned(),
+        GgufMetadataValue::String("llama".to_owned()),
+    );
+    meta.insert("llama.block_count".to_owned(), GgufMetadataValue::U32(32));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let in_path = dir.path().join("in.gguf");
+    anamnesis::write_gguf(&in_path, &tensors, &meta).expect("write gguf fixture");
+    let out_path = dir.path().join("out.gguf");
+
+    let output = Command::new(binary_path())
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "gguf",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run amn convert");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "amn convert gguf -> gguf failed\nstderr: {stderr}"
+    );
+
+    let reparsed = anamnesis::parse_gguf(&out_path).expect("re-parse converted gguf");
+    let out_meta = reparsed.metadata();
+    assert_eq!(
+        out_meta.get("general.architecture"),
+        Some(&GgufMetadataValue::String("llama".to_owned())),
+        "source architecture KV must survive the round trip: {out_meta:?}"
+    );
+    assert_eq!(
+        out_meta.get("llama.block_count"),
+        Some(&GgufMetadataValue::U32(32)),
+        "typed numeric KV must survive with its type intact: {out_meta:?}"
+    );
+}
+
+/// A **quantised** safetensors → `gguf` used to fail with a "dequantise first"
+/// error that forced the user to stage a temp file by hand. The hub now chains
+/// the two hops internally (Phase 6.14 Step 3).
+#[test]
+#[cfg(feature = "gguf")]
+fn convert_quantized_safetensors_to_gguf_auto_chains() {
+    let in_path = std::path::Path::new("tests/fixtures/safetensors_reference/fp8.safetensors");
+    assert!(in_path.exists(), "committed FP8 fixture missing");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_path = dir.path().join("out.gguf");
+
+    let output = Command::new(binary_path())
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "gguf",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run amn convert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "quantised safetensors -> gguf should auto-chain\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("dequantized to BF16"),
+        "expected the chain to report a dequant step, got: {stdout}"
+    );
+
+    // The FP8 weight came out as BF16; nothing quantised remains.
+    let reparsed = anamnesis::parse_gguf(&out_path).expect("re-parse converted gguf");
+    assert!(
+        reparsed.tensors().all(|t| !t.dtype.is_quantized()),
+        "output GGUF must be scalar (dequantised)"
+    );
+}
+
 #[test]
 fn convert_unknown_target_errors_cleanly() {
     let bf16: Vec<u8> = vec![0u8; 2];
