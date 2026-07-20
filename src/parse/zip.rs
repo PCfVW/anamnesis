@@ -144,11 +144,18 @@ pub(crate) trait ZipSource {
 
 /// A [`ZipSource`] backed by an in-memory byte slice (the `.pth` memory-mapped
 /// file). `read_at` is a bounds-checked `copy_from_slice` from the mapping.
+///
+/// Only the `.pth` reader constructs one — `.npz` drives the container through
+/// `ReaderSource` — so it is gated on `pth` to keep an `npz`-only build free of
+/// dead code. `test` keeps it available to this module's own unit tests in every
+/// feature combination.
+#[cfg(any(feature = "pth", test))]
 pub(crate) struct SliceSource<'a> {
     /// The whole archive bytes (the mmap).
     data: &'a [u8],
 }
 
+#[cfg(any(feature = "pth", test))]
 impl<'a> SliceSource<'a> {
     /// Wraps `data` as a [`ZipSource`].
     #[must_use]
@@ -157,6 +164,7 @@ impl<'a> SliceSource<'a> {
     }
 }
 
+#[cfg(any(feature = "pth", test))]
 impl ZipSource for SliceSource<'_> {
     fn total_len(&self) -> u64 {
         // CAST: usize → u64, lossless widening on all supported targets
@@ -428,6 +436,11 @@ impl Compression {
     }
 
     /// Returns `true` for a `STORED` (uncompressed) entry.
+    ///
+    /// Only the `.pth` reader branches on this (`.npz` always routes through the
+    /// inflate path), so it is gated on `pth` to keep an `npz`-only build free of
+    /// dead code; `test` keeps it available to this module's unit tests.
+    #[cfg(any(feature = "pth", test))]
     #[must_use]
     pub(crate) const fn is_stored(self) -> bool {
         matches!(self, Self::Stored)
@@ -935,6 +948,11 @@ pub(crate) fn data_start<S: ZipSource>(src: &mut S, entry: &ZipEntry) -> crate::
 ///
 /// `find('/')` matches every realistic `PyTorch` / `NumPy` archive; a name with
 /// no `/` is returned verbatim. Returns a borrow into `name` (no allocation).
+///
+/// Only the `.pth` reader strips the prefix today (`.npz` keys on the full entry
+/// name), so it is gated on `pth` to keep an `npz`-only build free of dead code;
+/// `test` keeps it available to this module's unit tests.
+#[cfg(any(feature = "pth", test))]
 #[must_use]
 pub(crate) fn strip_archive_prefix(name: &str) -> Cow<'_, str> {
     match name.find('/') {
