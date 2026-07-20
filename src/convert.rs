@@ -110,13 +110,15 @@ pub struct ConvertOptions {
 impl ConvertOptions {
     /// Returns options with the default (unbounded) [`ParseLimits`].
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            limits: ParseLimits::unbounded(),
+        }
     }
 
     /// Sets the resource budget applied to the input parse.
     #[must_use]
-    pub fn with_limits(mut self, limits: ParseLimits) -> Self {
+    pub const fn with_limits(mut self, limits: ParseLimits) -> Self {
         self.limits = limits;
         self
     }

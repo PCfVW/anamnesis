@@ -293,6 +293,124 @@ fn convert_npz_to_bnb_nf4_smokes() {
     assert!(names.contains(&"linear.weight.absmax"));
 }
 
+/// `.pth` → `bnb-nf4` (Phase 6.14 Step 2) — previously `Unsupported`; the BF16
+/// hub now routes it.
+///
+/// This fixture pins the **passthrough** half of the encoder contract: its three
+/// F32 tensors are `[2, 1]`, `[2, 2]`, `[2, 2]` (2–4 elements), all far below the
+/// 64-element NF4 block, so none is eligible and every tensor is written through
+/// as `BF16` with no NF4 companions. The hub still performs the `F32` → `BF16`
+/// conversion the encoder's input contract requires. The *quantising* half of the
+/// contract is covered by the NPZ and GGUF cases above, which use 64-element
+/// tensors.
+#[test]
+#[cfg(all(feature = "pth", feature = "bnb"))]
+fn convert_pth_to_bnb_nf4_passes_ineligible_tensors_through() {
+    let in_path = std::path::Path::new("tests/fixtures/pth_reference/algzoo_rnn_small.pth");
+    assert!(in_path.exists(), "committed .pth fixture missing");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_path = dir.path().join("out-pth-bnb-nf4.safetensors");
+
+    let output = Command::new(binary_path())
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "bnb-nf4",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run amn convert");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "amn convert pth -> bnb-nf4 failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let model = anamnesis::parse(&out_path).unwrap();
+    let names: Vec<&str> = model
+        .header
+        .tensors
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert_eq!(names.len(), 3, "all three tensors survive: {names:?}");
+    assert!(names.contains(&"rnn.weight_ih_l0"));
+    assert!(names.contains(&"rnn.weight_hh_l0"));
+    assert!(names.contains(&"linear.weight"));
+    // Nothing was eligible, so no NF4 companion tensors were emitted.
+    assert!(
+        !names.iter().any(|n| n.ends_with(".absmax")),
+        "no tensor is NF4-eligible, so none should gain companions: {names:?}"
+    );
+    // The hub converted F32 -> BF16 on the way to the encoder.
+    assert!(
+        model
+            .header
+            .tensors
+            .iter()
+            .all(|t| t.dtype == anamnesis::Dtype::BF16),
+        "passthrough tensors should be BF16"
+    );
+}
+
+/// `gguf` → `bnb-nf4` (Phase 6.14 Step 2): the hub dequantises/normalises the
+/// GGUF source to BF16, then the NF4 encoder runs. GGUF stores dimensions
+/// most-significant-first, so `[1, 64]` on disk is `[64, 1]` row-major — exactly
+/// one NF4 block.
+#[test]
+#[cfg(all(feature = "gguf", feature = "bnb"))]
+fn convert_gguf_to_bnb_nf4_smokes() {
+    use std::collections::HashMap;
+
+    let f32_bytes: Vec<u8> = (0..64)
+        .flat_map(|i| ((i as f32 - 31.5) / 32.0).to_le_bytes())
+        .collect();
+    let shape = [1usize, 64];
+    let tensors = [anamnesis::GgufWriteTensor {
+        name: "linear",
+        shape: &shape,
+        dtype: anamnesis::GgufType::F32,
+        data: &f32_bytes,
+    }];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let in_path = dir.path().join("in.gguf");
+    anamnesis::write_gguf(&in_path, &tensors, &HashMap::new()).expect("write gguf fixture");
+    let out_path = dir.path().join("out-gguf-bnb-nf4.safetensors");
+
+    let output = Command::new(binary_path())
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "bnb-nf4",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run amn convert");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "amn convert gguf -> bnb-nf4 failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let model = anamnesis::parse(&out_path).unwrap();
+    assert_eq!(model.header.scheme, anamnesis::QuantScheme::Bnb4);
+    let names: Vec<&str> = model
+        .header
+        .tensors
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(names.contains(&"linear.weight"));
+    assert!(names.contains(&"linear.weight.absmax"));
+}
+
 #[test]
 fn convert_unknown_target_errors_cleanly() {
     let bf16: Vec<u8> = vec![0u8; 2];
