@@ -341,6 +341,7 @@
 mod backing;
 #[cfg(feature = "cli")]
 pub mod cli;
+pub mod convert;
 pub mod error;
 pub mod inspect;
 pub mod lethe;
@@ -349,6 +350,7 @@ pub mod model;
 pub mod parse;
 pub mod remember;
 
+pub use convert::{convert, ConvertOptions, ConvertStats, ConvertTarget};
 pub use error::{AnamnesisError, Result};
 pub use inspect::{format_bytes, InspectInfo};
 #[cfg(feature = "bnb")]

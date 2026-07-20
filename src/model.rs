@@ -547,6 +547,59 @@ impl ParsedModel {
         }
     }
 
+    /// Normalises this model into [`crate::convert`]'s hub form: quantised
+    /// entries dequantised to `BF16`, passthrough entries copied in their
+    /// **original** dtype. Returns the tensors plus how many were dequantised.
+    ///
+    /// Shares [`Self::dequantize_all`] with the `remember` paths, so the convert
+    /// hub and `remember` cannot drift apart.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the dequantisation errors of [`Self::dequantize_all`], and
+    /// returns [`AnamnesisError::Parse`] if a passthrough tensor is missing from
+    /// the header (which would mean the header and the walk disagree).
+    ///
+    /// # Memory
+    ///
+    /// Allocates owned copies of **every** tensor — peak heap is the full
+    /// dequantised model. This is the hub's documented `O(2 × model)` profile.
+    pub(crate) fn hub_tensors(&self) -> crate::Result<(Vec<crate::convert::HubTensor>, usize)> {
+        let (dequantized_data, passthrough_refs) = self.dequantize_all(|| {})?;
+
+        let dequantized = dequantized_data.len();
+        let mut tensors = Vec::with_capacity(dequantized.saturating_add(passthrough_refs.len()));
+
+        for (name, data, shape) in dequantized_data {
+            tensors.push(crate::convert::HubTensor {
+                name,
+                shape,
+                dtype: crate::Dtype::BF16,
+                data,
+            });
+        }
+
+        for (name, data, shape) in passthrough_refs {
+            let entry = self
+                .header
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("passthrough tensor `{name}` not found in header"),
+                })?;
+            tensors.push(crate::convert::HubTensor {
+                name: name.to_owned(),
+                shape: shape.to_vec(),
+                dtype: entry.dtype,
+                // BORROW: copy the buffer-borrowed bytes so the hub outlives `self`.
+                data: data.to_vec(),
+            });
+        }
+
+        Ok((tensors, dequantized))
+    }
+
     /// Internal: dequantize to `BF16` and write (no progress callback).
     fn remember_bf16(&self, output_path: &Path) -> crate::Result<()> {
         self.remember_bf16_inner(output_path, || {})

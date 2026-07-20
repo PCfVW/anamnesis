@@ -251,27 +251,46 @@ fn convert_safetensors_bf16_to_bnb_nf4_smokes() {
 }
 
 #[test]
-#[cfg(feature = "npz")]
-fn convert_npz_to_bnb_nf4_errors_cleanly() {
-    let f32_data: Vec<u8> = (0..4u32)
-        .flat_map(|i| f32::from(i as u16).to_le_bytes())
+#[cfg(all(feature = "npz", feature = "bnb"))]
+fn convert_npz_to_bnb_nf4_smokes() {
+    // 64 F32 elements as [64, 1] — exactly one NF4 block. Before Phase 6.14 this
+    // pair returned `Unsupported` (the NF4 target accepted only a plain-BF16
+    // safetensors source); the BF16 hub now routes NPZ -> BF16 -> NF4 encoder.
+    let f32_data: Vec<u8> = (0..64)
+        .flat_map(|i| ((i as f32 - 31.5) / 32.0).to_le_bytes())
         .collect();
-    let npz_bytes = build_npz_f32(&[("w", &[2, 2], &f32_data)]);
+    let npz_bytes = build_npz_f32(&[("linear", &[64, 1], &f32_data)]);
     let (_dir, in_path) = write_temp(&npz_bytes, "npz");
+    let out_path = in_path.with_file_name("out-npz-bnb-nf4.safetensors");
 
     let output = Command::new(binary_path())
-        .args(["convert", in_path.to_str().unwrap(), "--to", "bnb-nf4"])
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "bnb-nf4",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
         .output()
         .expect("run amn convert");
-    assert!(
-        !output.status.success(),
-        "should fail for unsupported combo"
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("npz->bnb-nf4") || stderr.contains("Phase 6"),
-        "expected helpful error message, got stderr: {stderr}"
+        output.status.success(),
+        "amn convert npz -> bnb-nf4 failed\nstdout: {stdout}\nstderr: {stderr}"
     );
+
+    let model = anamnesis::parse(&out_path).unwrap();
+    assert_eq!(model.header.scheme, anamnesis::QuantScheme::Bnb4);
+    let names: Vec<&str> = model
+        .header
+        .tensors
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(names.contains(&"linear.weight"));
+    assert!(names.contains(&"linear.weight.absmax"));
 }
 
 #[test]
