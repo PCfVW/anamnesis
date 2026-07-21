@@ -72,6 +72,19 @@ enum Commands {
         /// Output file path (derived from input if omitted).
         #[arg(long, short)]
         output: Option<PathBuf>,
+        /// JSON file of `GGUF` metadata key/values to stamp on a `gguf` target.
+        ///
+        /// Values are typed: plain JSON is inferred (string, bool, integer →
+        /// `u32`, float → `f32`, array from its first element), and an explicit
+        /// `{"type": "i32", "value": 3}` — or `{"type": "array", "item_type":
+        /// "i32", "value": [..]}` — pins an exact width. Merged over any KV
+        /// inherited from a `GGUF` source; `--gguf-kv` wins over this file.
+        #[arg(long, value_name = "FILE")]
+        gguf_metadata: Option<PathBuf>,
+        /// Repeatable `key=value` `GGUF` metadata. The value is always written as
+        /// a string — use `--gguf-metadata` for typed or array values.
+        #[arg(long, value_name = "KEY=VALUE")]
+        gguf_kv: Vec<String>,
     },
 }
 
@@ -106,9 +119,21 @@ pub fn run() -> crate::Result<()> {
             let resolved = resolve_input_path(path)?;
             run_remember(&resolved, &to, output.as_deref())
         }
-        Commands::Convert { path, to, output } => {
+        Commands::Convert {
+            path,
+            to,
+            output,
+            gguf_metadata,
+            gguf_kv,
+        } => {
             let resolved = resolve_input_path(path)?;
-            run_convert(&resolved, &to, output.as_deref())
+            run_convert(
+                &resolved,
+                &to,
+                output.as_deref(),
+                gguf_metadata.as_deref(),
+                &gguf_kv,
+            )
         }
     }
 }
@@ -638,15 +663,66 @@ fn gguf_type_to_safetensors_dtype(dtype: crate::GgufType) -> crate::Result<safet
 // `convert` subcommand — a thin wrapper over `crate::convert`
 // ---------------------------------------------------------------------------
 
+/// Builds [`ConvertOptions`] from the `GGUF` metadata flags: the JSON file first,
+/// then each `--gguf-kv` merged over it (so a one-off flag beats the file).
+///
+/// # Errors
+///
+/// Returns [`crate::AnamnesisError::Io`] if the metadata file cannot be read, and
+/// [`crate::AnamnesisError::Parse`] if the JSON or a `key=value` is malformed.
+#[cfg(feature = "gguf")]
+fn build_convert_options(
+    gguf_metadata: Option<&std::path::Path>,
+    gguf_kv: &[String],
+) -> crate::Result<ConvertOptions> {
+    let mut metadata = match gguf_metadata {
+        Some(file) => {
+            let json = std::fs::read_to_string(file).map_err(crate::AnamnesisError::Io)?;
+            crate::convert::parse_gguf_metadata_json(&json)?
+        }
+        None => std::collections::HashMap::new(),
+    };
+    for arg in gguf_kv {
+        let (key, value) = crate::convert::parse_gguf_kv_arg(arg)?;
+        metadata.insert(key, value);
+    }
+    Ok(ConvertOptions::new().with_gguf_metadata(metadata))
+}
+
+/// The `gguf`-less counterpart: the metadata flags have nowhere to go, so using
+/// them is a clear error rather than a silent no-op.
+///
+/// # Errors
+///
+/// Returns [`crate::AnamnesisError::Unsupported`] if either flag was supplied.
+#[cfg(not(feature = "gguf"))]
+fn build_convert_options(
+    gguf_metadata: Option<&std::path::Path>,
+    gguf_kv: &[String],
+) -> crate::Result<ConvertOptions> {
+    if gguf_metadata.is_some() || !gguf_kv.is_empty() {
+        return Err(crate::AnamnesisError::Unsupported {
+            format: "--gguf-metadata/--gguf-kv".into(),
+            detail: "GGUF metadata pass-through requires the `gguf` Cargo feature; \
+                     rebuild with `cargo install anamnesis --features cli,gguf`"
+                .into(),
+        });
+    }
+    Ok(ConvertOptions::new())
+}
+
 /// Runs the `convert` subcommand: parses the `--to` target, derives an output
-/// path when `-o` is omitted, and delegates the whole `(input × target)`
-/// dispatch to [`crate::convert::convert`].
+/// path when `-o` is omitted, collects any caller-supplied `GGUF` metadata, and
+/// delegates the whole `(input × target)` dispatch to [`crate::convert::convert`].
 fn run_convert(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
+    gguf_metadata: Option<&std::path::Path>,
+    gguf_kv: &[String],
 ) -> crate::Result<()> {
     let target = ConvertTarget::parse(to)?;
+    let options = build_convert_options(gguf_metadata, gguf_kv)?;
     let output_path = output.map_or_else(
         || crate::convert::derive_output_path(path, target),
         Path::to_owned,
@@ -663,7 +739,7 @@ fn run_convert(
             .unwrap_or("(output)")
     );
 
-    let stats = crate::convert::convert(path, target, &output_path, &ConvertOptions::new())?;
+    let stats = crate::convert::convert(path, target, &output_path, &options)?;
 
     if stats.dequantized > 0 {
         println!("  {} dequantized to BF16", stats.dequantized);

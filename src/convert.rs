@@ -105,21 +105,45 @@ pub struct ConvertOptions {
     /// Resource budget applied to the *input* parse. Defaults to
     /// [`ParseLimits::default`] (unbounded beyond the permanent per-format caps).
     pub limits: ParseLimits,
+    /// Caller-supplied `GGUF` key/value metadata, written verbatim and merged
+    /// **over** any KV carried from a `GGUF` source (the caller wins on a key
+    /// collision). Empty by default.
+    ///
+    /// anamnesis attaches no meaning to individual keys — it stamps what it is
+    /// handed. Deriving *model* knowledge (architecture hyper-parameters,
+    /// tokenizer arrays) from a source model's `config.json` / `tokenizer.json`
+    /// is a packaging concern for a downstream crate.
+    #[cfg(feature = "gguf")]
+    pub gguf_metadata: HashMap<String, crate::GgufMetadataValue>,
 }
 
 impl ConvertOptions {
-    /// Returns options with the default (unbounded) [`ParseLimits`].
+    /// Returns options with the default (unbounded) [`ParseLimits`] and no
+    /// caller-supplied `GGUF` metadata.
+    ///
+    /// Not `const`: the `gguf` build carries a `HashMap`, whose `new` is not a
+    /// `const fn`.
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            limits: ParseLimits::unbounded(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Sets the resource budget applied to the input parse.
     #[must_use]
-    pub const fn with_limits(mut self, limits: ParseLimits) -> Self {
+    pub fn with_limits(mut self, limits: ParseLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Sets the `GGUF` key/value metadata written to a `gguf` target, merged over
+    /// any KV inherited from a `GGUF` source.
+    #[cfg(feature = "gguf")]
+    #[must_use]
+    pub fn with_gguf_metadata(
+        mut self,
+        metadata: HashMap<String, crate::GgufMetadataValue>,
+    ) -> Self {
+        self.gguf_metadata = metadata;
         self
     }
 }
@@ -428,7 +452,7 @@ pub fn convert(
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
     let hub = read_hub(input, options)?;
-    write_hub(&hub, target, output)
+    write_hub(&hub, target, output, options)
 }
 
 /// Parses `input` into the hub, dispatching on the detected format.
@@ -445,11 +469,22 @@ fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
 }
 
 /// Writes the hub to `target`.
-fn write_hub(hub: &Hub, target: ConvertTarget, output: &Path) -> crate::Result<ConvertStats> {
+///
+/// `options` is read only by the `GGUF` writer (the caller-supplied KV merged
+/// over any inherited source KV); with the `gguf` feature off no arm consumes
+/// it, so the unused-variable warning is suppressed for that build rather than
+/// renaming the parameter and losing the signature's intent.
+#[cfg_attr(not(feature = "gguf"), allow(unused_variables))]
+fn write_hub(
+    hub: &Hub,
+    target: ConvertTarget,
+    output: &Path,
+    options: &ConvertOptions,
+) -> crate::Result<ConvertStats> {
     match target {
         ConvertTarget::Safetensors => write_safetensors(hub, output),
         #[cfg(feature = "gguf")]
-        ConvertTarget::Gguf => write_gguf_target(hub, output),
+        ConvertTarget::Gguf => write_gguf_target(hub, output, options),
         #[cfg(not(feature = "gguf"))]
         ConvertTarget::Gguf => Err(AnamnesisError::Unsupported {
             format: "gguf".into(),
@@ -637,7 +672,11 @@ fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
 /// Writes the hub as an unquantised `GGUF` file, reversing shapes back to
 /// most-significant-first.
 #[cfg(feature = "gguf")]
-fn write_gguf_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
+fn write_gguf_target(
+    hub: &Hub,
+    output: &Path,
+    options: &ConvertOptions,
+) -> crate::Result<ConvertStats> {
     use crate::{write_gguf, GgufWriteTensor};
 
     let mut owned: Vec<(String, crate::GgufType, Vec<usize>, &[u8])> =
@@ -659,7 +698,16 @@ fn write_gguf_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
         })
         .collect();
 
-    write_gguf(output, &tensors, &hub.gguf_metadata)?;
+    // Source KV first, caller KV merged over it: an explicit `--gguf-kv` /
+    // `--gguf-metadata` entry overrides the inherited value for the same key.
+    let mut metadata = hub.gguf_metadata.clone();
+    metadata.extend(
+        options
+            .gguf_metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    write_gguf(output, &tensors, &metadata)?;
 
     Ok(ConvertStats {
         tensors: tensors.len(),
@@ -700,6 +748,370 @@ fn write_bnb_nf4_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats>
         quantized: stats.quantized,
         passthrough: stats.passthrough,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Caller-supplied GGUF metadata (`--gguf-metadata` / `--gguf-kv`)
+// ---------------------------------------------------------------------------
+
+/// Parses one `--gguf-kv key=value` argument into a `String`-valued entry.
+///
+/// The value is **always** a [`GgufMetadataValue::String`](crate::GgufMetadataValue::String) —
+/// unambiguous for the one-off case (`general.architecture=llama`). Keys that
+/// need a specific width or an array go through
+/// [`parse_gguf_metadata_json`] instead.
+///
+/// Splits on the **first** `=`, so a value may itself contain `=`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the argument has no `=` or an empty key.
+#[cfg(feature = "gguf")]
+pub fn parse_gguf_kv_arg(arg: &str) -> crate::Result<(String, crate::GgufMetadataValue)> {
+    let (key, value) = arg.split_once('=').ok_or_else(|| AnamnesisError::Parse {
+        reason: format!("--gguf-kv `{arg}`: expected `key=value`"),
+    })?;
+    if key.is_empty() {
+        return Err(AnamnesisError::Parse {
+            reason: format!("--gguf-kv `{arg}`: empty key"),
+        });
+    }
+    Ok((
+        key.to_owned(),
+        crate::GgufMetadataValue::String(value.to_owned()),
+    ))
+}
+
+/// Parses a `--gguf-metadata` JSON document into a `GGUF` key/value table.
+///
+/// The document is a JSON object. Each value is either a **plain** JSON value,
+/// whose `GGUF` type is inferred, or an **explicit** `{"type": …, "value": …}`
+/// object when the exact width matters:
+///
+/// | JSON | Inferred `GGUF` type |
+/// |---|---|
+/// | `"llama"` | `String` |
+/// | `true` | `Bool` |
+/// | `32` (fits `u32`, non-negative) | `U32` |
+/// | `-5` / a larger integer | `I64` / `U64` |
+/// | `1e-5` | `F32` |
+/// | `["a", "b"]` | `Array<String>` (typed from the first element) |
+///
+/// Explicit forms — `{"type": "i32", "value": 3}` for a scalar (`u8` `i8` `u16`
+/// `i16` `u32` `i32` `u64` `i64` `f32` `f64` `bool` `string`), and
+/// `{"type": "array", "item_type": "i32", "value": [1, 2]}` for an array.
+///
+/// The escape hatch exists because inference cannot be right for every key:
+/// `tokenizer.ggml.token_type` is an `Array<I32>` in the `llama.cpp` convention,
+/// but a JSON array of non-negative integers infers `Array<U32>`. anamnesis
+/// attaches **no meaning to key names** — special-casing that key would import
+/// exactly the model knowledge this layer refuses — so the caller states the
+/// type instead.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the document is not valid JSON, is not a
+/// top-level object, contains a `null`, contains an empty array (no element to
+/// infer from), names an unknown type tag, or holds a number outside the range
+/// of its declared type.
+///
+/// # Memory
+///
+/// Allocates the parsed table; tokenizer arrays can run to tens of thousands of
+/// entries, so peak heap is proportional to the document.
+#[cfg(feature = "gguf")]
+pub fn parse_gguf_metadata_json(
+    json: &str,
+) -> crate::Result<HashMap<String, crate::GgufMetadataValue>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| AnamnesisError::Parse {
+            reason: format!("--gguf-metadata: invalid JSON: {e}"),
+        })?;
+    let obj = parsed.as_object().ok_or_else(|| AnamnesisError::Parse {
+        reason: format!(
+            "--gguf-metadata: expected a top-level JSON object, found {}",
+            json_type_name(&parsed)
+        ),
+    })?;
+
+    let mut out = HashMap::with_capacity(obj.len());
+    for (key, value) in obj {
+        out.insert(key.clone(), json_to_metadata_value(key, value)?);
+    }
+    Ok(out)
+}
+
+/// Names a JSON value's kind for error messages.
+#[cfg(feature = "gguf")]
+const fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match *value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Reads a JSON integer as `i128` so every `GGUF` width can be range-checked
+/// against one representation.
+#[cfg(feature = "gguf")]
+fn json_as_int(key: &str, value: &serde_json::Value) -> crate::Result<i128> {
+    let number = value.as_number().ok_or_else(|| AnamnesisError::Parse {
+        reason: format!(
+            "--gguf-metadata `{key}`: expected an integer, found {}",
+            json_type_name(value)
+        ),
+    })?;
+    if let Some(u) = number.as_u64() {
+        return Ok(i128::from(u));
+    }
+    if let Some(i) = number.as_i64() {
+        return Ok(i128::from(i));
+    }
+    Err(AnamnesisError::Parse {
+        reason: format!("--gguf-metadata `{key}`: expected an integer, found a float"),
+    })
+}
+
+/// Reads a JSON number as `f64`.
+#[cfg(feature = "gguf")]
+fn json_as_float(key: &str, value: &serde_json::Value) -> crate::Result<f64> {
+    value.as_f64().ok_or_else(|| AnamnesisError::Parse {
+        reason: format!(
+            "--gguf-metadata `{key}`: expected a number, found {}",
+            json_type_name(value)
+        ),
+    })
+}
+
+/// Reads a JSON bool.
+#[cfg(feature = "gguf")]
+fn json_as_bool(key: &str, value: &serde_json::Value) -> crate::Result<bool> {
+    value.as_bool().ok_or_else(|| AnamnesisError::Parse {
+        reason: format!(
+            "--gguf-metadata `{key}`: expected a boolean, found {}",
+            json_type_name(value)
+        ),
+    })
+}
+
+/// Reads a JSON string.
+#[cfg(feature = "gguf")]
+fn json_as_string(key: &str, value: &serde_json::Value) -> crate::Result<String> {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "--gguf-metadata `{key}`: expected a string, found {}",
+                json_type_name(value)
+            ),
+        })
+}
+
+/// Narrows an `i128` to a `GGUF` integer width, reporting the key on overflow.
+#[cfg(feature = "gguf")]
+fn narrow_int<T: TryFrom<i128>>(key: &str, raw: i128, type_name: &str) -> crate::Result<T> {
+    T::try_from(raw).map_err(|_| AnamnesisError::Parse {
+        reason: format!("--gguf-metadata `{key}`: value {raw} is out of range for {type_name}"),
+    })
+}
+
+/// Builds a scalar [`GgufMetadataValue`](crate::GgufMetadataValue) of the named
+/// type from a JSON value.
+#[cfg(feature = "gguf")]
+fn scalar_of_type(
+    key: &str,
+    type_tag: &str,
+    value: &serde_json::Value,
+) -> crate::Result<crate::GgufMetadataValue> {
+    use crate::GgufMetadataValue as V;
+    Ok(match type_tag {
+        "u8" => V::U8(narrow_int(key, json_as_int(key, value)?, "u8")?),
+        "i8" => V::I8(narrow_int(key, json_as_int(key, value)?, "i8")?),
+        "u16" => V::U16(narrow_int(key, json_as_int(key, value)?, "u16")?),
+        "i16" => V::I16(narrow_int(key, json_as_int(key, value)?, "i16")?),
+        "u32" => V::U32(narrow_int(key, json_as_int(key, value)?, "u32")?),
+        "i32" => V::I32(narrow_int(key, json_as_int(key, value)?, "i32")?),
+        "u64" => V::U64(narrow_int(key, json_as_int(key, value)?, "u64")?),
+        "i64" => V::I64(narrow_int(key, json_as_int(key, value)?, "i64")?),
+        "f32" => {
+            // CAST: f64 → f32 is the documented narrowing for the `f32` tag; the
+            // caller asked for a 32-bit float.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            let narrowed = json_as_float(key, value)? as f32;
+            V::F32(narrowed)
+        }
+        "f64" => V::F64(json_as_float(key, value)?),
+        "bool" => V::Bool(json_as_bool(key, value)?),
+        "string" => V::String(json_as_string(key, value)?),
+        other => {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "--gguf-metadata `{key}`: unknown type `{other}` \
+                     (expected u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/bool/string/array)"
+                ),
+            })
+        }
+    })
+}
+
+/// Builds a typed [`GgufMetadataArray`](crate::GgufMetadataArray) from JSON
+/// elements, all narrowed to `item_type`.
+#[cfg(feature = "gguf")]
+fn array_of_type(
+    key: &str,
+    item_type: &str,
+    items: &[serde_json::Value],
+) -> crate::Result<crate::GgufMetadataArray> {
+    use crate::GgufMetadataArray as A;
+    /// Maps each element through `f`, propagating the first error.
+    fn collect<T, F: Fn(&serde_json::Value) -> crate::Result<T>>(
+        items: &[serde_json::Value],
+        f: F,
+    ) -> crate::Result<Vec<T>> {
+        items.iter().map(f).collect()
+    }
+
+    Ok(match item_type {
+        "u8" => A::U8(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "u8")
+        })?),
+        "i8" => A::I8(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "i8")
+        })?),
+        "u16" => A::U16(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "u16")
+        })?),
+        "i16" => A::I16(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "i16")
+        })?),
+        "u32" => A::U32(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "u32")
+        })?),
+        "i32" => A::I32(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "i32")
+        })?),
+        "u64" => A::U64(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "u64")
+        })?),
+        "i64" => A::I64(collect(items, |v| {
+            narrow_int(key, json_as_int(key, v)?, "i64")
+        })?),
+        "f32" => A::F32(collect(items, |v| {
+            // CAST: f64 → f32, the documented narrowing for the `f32` tag.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            let narrowed = json_as_float(key, v)? as f32;
+            Ok(narrowed)
+        })?),
+        "f64" => A::F64(collect(items, |v| json_as_float(key, v))?),
+        "bool" => A::Bool(collect(items, |v| json_as_bool(key, v))?),
+        "string" => A::String(collect(items, |v| json_as_string(key, v))?),
+        other => {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "--gguf-metadata `{key}`: unknown array item type `{other}` \
+                     (expected u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/bool/string)"
+                ),
+            })
+        }
+    })
+}
+
+/// Infers the type tag a plain JSON value maps to.
+#[cfg(feature = "gguf")]
+fn infer_type_tag(key: &str, value: &serde_json::Value) -> crate::Result<&'static str> {
+    match *value {
+        serde_json::Value::Bool(_) => Ok("bool"),
+        serde_json::Value::String(_) => Ok("string"),
+        serde_json::Value::Number(ref n) => {
+            if n.is_f64() && !n.is_u64() && !n.is_i64() {
+                return Ok("f32");
+            }
+            let raw = json_as_int(key, value)?;
+            if (0..=i128::from(u32::MAX)).contains(&raw) {
+                Ok("u32")
+            } else if i64::try_from(raw).is_ok() {
+                Ok("i64")
+            } else {
+                Ok("u64")
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err(AnamnesisError::Parse {
+                reason: format!(
+                    "--gguf-metadata `{key}`: cannot infer a scalar type from {}",
+                    json_type_name(value)
+                ),
+            })
+        }
+    }
+}
+
+/// Converts one JSON value into a [`GgufMetadataValue`](crate::GgufMetadataValue),
+/// honouring the explicit `{"type", "value"}` form when present.
+#[cfg(feature = "gguf")]
+fn json_to_metadata_value(
+    key: &str,
+    value: &serde_json::Value,
+) -> crate::Result<crate::GgufMetadataValue> {
+    // Explicit form: an object carrying a `type` tag.
+    if let Some(obj) = value.as_object() {
+        let type_tag = obj
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!(
+                    "--gguf-metadata `{key}`: an object value must carry a string `type` field \
+                     (explicit form: {{\"type\": \"u32\", \"value\": 32}})"
+                ),
+            })?;
+        let inner = obj.get("value").ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("--gguf-metadata `{key}`: explicit form is missing `value`"),
+        })?;
+
+        if type_tag == "array" {
+            let item_type = obj
+                .get("item_type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!(
+                        "--gguf-metadata `{key}`: an `array` needs a string `item_type`"
+                    ),
+                })?;
+            let items = inner.as_array().ok_or_else(|| AnamnesisError::Parse {
+                reason: format!(
+                    "--gguf-metadata `{key}`: `array` expects a JSON array `value`, found {}",
+                    json_type_name(inner)
+                ),
+            })?;
+            return Ok(crate::GgufMetadataValue::Array(Box::new(array_of_type(
+                key, item_type, items,
+            )?)));
+        }
+        return scalar_of_type(key, type_tag, inner);
+    }
+
+    // Plain array: homogeneous, typed from the first element.
+    if let Some(items) = value.as_array() {
+        let first = items.first().ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "--gguf-metadata `{key}`: cannot infer an item type from an empty array \
+                 (use the explicit form: {{\"type\": \"array\", \"item_type\": \"i32\", \
+                 \"value\": []}})"
+            ),
+        })?;
+        let item_type = infer_type_tag(key, first)?;
+        return Ok(crate::GgufMetadataValue::Array(Box::new(array_of_type(
+            key, item_type, items,
+        )?)));
+    }
+
+    // Plain scalar.
+    let type_tag = infer_type_tag(key, value)?;
+    scalar_of_type(key, type_tag, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -891,5 +1303,115 @@ fn to_bf16_bytes(data: &[u8], dtype: Dtype, name: &str) -> crate::Result<Vec<u8>
                  supported for BnB-NF4 conversion"
             ),
         }),
+    }
+}
+
+#[cfg(all(test, feature = "gguf"))]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod gguf_metadata_tests {
+    use super::{parse_gguf_kv_arg, parse_gguf_metadata_json};
+    use crate::{GgufMetadataArray as A, GgufMetadataValue as V};
+
+    #[test]
+    fn plain_scalars_are_inferred() {
+        let meta = parse_gguf_metadata_json(
+            r#"{"s": "llama", "b": true, "small": 32, "neg": -5, "f": 1.5}"#,
+        )
+        .expect("parse");
+        assert_eq!(meta.get("s"), Some(&V::String("llama".to_owned())));
+        assert_eq!(meta.get("b"), Some(&V::Bool(true)));
+        // Non-negative integers that fit take `u32` — the llama.cpp width for counts.
+        assert_eq!(meta.get("small"), Some(&V::U32(32)));
+        assert_eq!(meta.get("neg"), Some(&V::I64(-5)));
+        assert_eq!(meta.get("f"), Some(&V::F32(1.5)));
+    }
+
+    #[test]
+    fn plain_arrays_take_their_first_element_type() {
+        let meta =
+            parse_gguf_metadata_json(r#"{"toks": ["a", "b"], "ids": [1, 2]}"#).expect("parse");
+        assert_eq!(
+            meta.get("toks"),
+            Some(&V::Array(Box::new(A::String(vec![
+                "a".to_owned(),
+                "b".to_owned()
+            ]))))
+        );
+        assert_eq!(
+            meta.get("ids"),
+            Some(&V::Array(Box::new(A::U32(vec![1, 2]))))
+        );
+    }
+
+    #[test]
+    fn explicit_form_pins_an_exact_width() {
+        let meta = parse_gguf_metadata_json(
+            r#"{"blocks": {"type": "u32", "value": 32}, "eps": {"type": "f32", "value": 1e-5}}"#,
+        )
+        .expect("parse");
+        assert_eq!(meta.get("blocks"), Some(&V::U32(32)));
+        assert_eq!(meta.get("eps"), Some(&V::F32(1e-5)));
+    }
+
+    /// The motivating case: `tokenizer.ggml.token_type` is `Array<I32>` in the
+    /// llama.cpp convention, but a JSON array of non-negative integers infers
+    /// `Array<U32>`. Only the explicit form gets it right, and anamnesis will not
+    /// special-case the key name.
+    #[test]
+    fn explicit_array_fixes_the_token_type_case() {
+        let inferred = parse_gguf_metadata_json(r#"{"tt": [1, 1, 2]}"#).expect("parse");
+        assert_eq!(
+            inferred.get("tt"),
+            Some(&V::Array(Box::new(A::U32(vec![1, 1, 2])))),
+            "inference alone yields U32 — the reason the escape hatch exists"
+        );
+
+        let explicit = parse_gguf_metadata_json(
+            r#"{"tt": {"type": "array", "item_type": "i32", "value": [1, 1, 2]}}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            explicit.get("tt"),
+            Some(&V::Array(Box::new(A::I32(vec![1, 1, 2]))))
+        );
+    }
+
+    #[test]
+    fn malformed_documents_are_rejected_with_the_key_named() {
+        // Not JSON at all.
+        assert!(parse_gguf_metadata_json("{not json").is_err());
+        // Not a top-level object.
+        assert!(parse_gguf_metadata_json("[1, 2]").is_err());
+        // Empty array: nothing to infer an item type from.
+        let err = parse_gguf_metadata_json(r#"{"empty": []}"#).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+        // Unknown type tag.
+        assert!(parse_gguf_metadata_json(r#"{"k": {"type": "u128", "value": 1}}"#).is_err());
+        // Out of range for the declared width.
+        let err = parse_gguf_metadata_json(r#"{"k": {"type": "u8", "value": 300}}"#).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "got: {err}");
+        // Null has no GGUF counterpart.
+        assert!(parse_gguf_metadata_json(r#"{"k": null}"#).is_err());
+    }
+
+    #[test]
+    fn kv_args_are_string_valued_and_split_on_the_first_equals() {
+        let (key, value) = parse_gguf_kv_arg("general.architecture=llama").expect("parse");
+        assert_eq!(key, "general.architecture");
+        assert_eq!(value, V::String("llama".to_owned()));
+
+        // A value may itself contain `=`.
+        let (key, value) = parse_gguf_kv_arg("k=a=b").expect("parse");
+        assert_eq!(key, "k");
+        assert_eq!(value, V::String("a=b".to_owned()));
+
+        // Even a numeric-looking value stays a string — typing goes through JSON.
+        assert_eq!(
+            parse_gguf_kv_arg("n=32").expect("parse").1,
+            V::String("32".to_owned())
+        );
+
+        assert!(parse_gguf_kv_arg("no-equals").is_err());
+        assert!(parse_gguf_kv_arg("=empty-key").is_err());
     }
 }

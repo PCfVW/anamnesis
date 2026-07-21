@@ -513,6 +513,130 @@ fn convert_quantized_safetensors_to_gguf_auto_chains() {
     );
 }
 
+/// `--gguf-metadata` / `--gguf-kv` (Phase 6.14 Step 4) and the precedence chain
+/// they form with Step 3's inherited KV: **source KV → JSON file → `--gguf-kv`**,
+/// each layer overriding the one before, with untouched source keys surviving.
+#[test]
+#[cfg(feature = "gguf")]
+fn convert_gguf_metadata_flags_merge_over_source_kv() {
+    use anamnesis::GgufMetadataValue;
+    use std::collections::HashMap;
+
+    let f32_bytes: Vec<u8> = (0..4).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let shape = [4usize];
+    let tensors = [anamnesis::GgufWriteTensor {
+        name: "w",
+        shape: &shape,
+        dtype: anamnesis::GgufType::F32,
+        data: &f32_bytes,
+    }];
+    let mut source_meta: HashMap<String, GgufMetadataValue> = HashMap::new();
+    source_meta.insert(
+        "general.architecture".to_owned(),
+        GgufMetadataValue::String("source-arch".to_owned()),
+    );
+    source_meta.insert(
+        "general.name".to_owned(),
+        GgufMetadataValue::String("keepme".to_owned()),
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let in_path = dir.path().join("in.gguf");
+    anamnesis::write_gguf(&in_path, &tensors, &source_meta).expect("write gguf fixture");
+
+    let meta_path = dir.path().join("meta.json");
+    std::fs::write(
+        &meta_path,
+        r#"{
+             "general.architecture": "from-file",
+             "llama.block_count": {"type": "u32", "value": 32},
+             "tokenizer.ggml.token_type": {"type": "array", "item_type": "i32", "value": [1, 2]}
+           }"#,
+    )
+    .expect("write metadata json");
+
+    let out_path = dir.path().join("out.gguf");
+    let output = Command::new(binary_path())
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "gguf",
+            "-o",
+            out_path.to_str().unwrap(),
+            "--gguf-metadata",
+            meta_path.to_str().unwrap(),
+            "--gguf-kv",
+            "general.architecture=from-flag",
+        ])
+        .output()
+        .expect("run amn convert");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "amn convert with metadata flags failed\nstderr: {stderr}"
+    );
+
+    let reparsed = anamnesis::parse_gguf(&out_path).expect("re-parse converted gguf");
+    let meta = reparsed.metadata();
+
+    // --gguf-kv beats the JSON file, which beats the inherited source value.
+    assert_eq!(
+        meta.get("general.architecture"),
+        Some(&GgufMetadataValue::String("from-flag".to_owned())),
+        "flag should win the three-way merge: {meta:?}"
+    );
+    // A source key nobody overrode survives (Step 3's inheritance).
+    assert_eq!(
+        meta.get("general.name"),
+        Some(&GgufMetadataValue::String("keepme".to_owned())),
+        "untouched source KV must survive: {meta:?}"
+    );
+    // Typed values from the file keep their declared width.
+    assert_eq!(
+        meta.get("llama.block_count"),
+        Some(&GgufMetadataValue::U32(32))
+    );
+    assert_eq!(
+        meta.get("tokenizer.ggml.token_type"),
+        Some(&GgufMetadataValue::Array(Box::new(
+            anamnesis::GgufMetadataArray::I32(vec![1, 2])
+        ))),
+        "the explicit item_type must survive as I32, not the inferred U32"
+    );
+}
+
+/// A malformed `--gguf-kv` is rejected with a message naming the expected shape,
+/// rather than being silently dropped.
+#[test]
+#[cfg(feature = "gguf")]
+fn convert_rejects_malformed_gguf_kv() {
+    let bf16: Vec<u8> = vec![0u8; 2];
+    let st_bytes = build_safetensors_bf16(&[("w", &[1], &bf16)]);
+    let (_dir, in_path) = write_temp(&st_bytes, "safetensors");
+
+    let output = Command::new(binary_path())
+        .args([
+            "convert",
+            in_path.to_str().unwrap(),
+            "--to",
+            "gguf",
+            "--gguf-kv",
+            "no-equals-sign",
+        ])
+        .output()
+        .expect("run amn convert");
+    assert!(
+        !output.status.success(),
+        "should reject malformed --gguf-kv"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("key=value"),
+        "expected a `key=value` hint, got stderr: {stderr}"
+    );
+}
+
 #[test]
 fn convert_unknown_target_errors_cleanly() {
     let bf16: Vec<u8> = vec![0u8; 2];
