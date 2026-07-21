@@ -665,7 +665,9 @@ fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
         tensors: hub.tensors.len(),
         dequantized: hub.dequantized,
         quantized: 0,
-        passthrough: hub.tensors.len(),
+        // A dequantised tensor did *not* go out in its incoming dtype, so the
+        // two counts partition the written set rather than overlapping.
+        passthrough: hub.tensors.len().saturating_sub(hub.dequantized),
     })
 }
 
@@ -713,7 +715,8 @@ fn write_gguf_target(
         tensors: tensors.len(),
         dequantized: hub.dequantized,
         quantized: 0,
-        passthrough: tensors.len(),
+        // As above: dequantised tensors are not passthrough.
+        passthrough: tensors.len().saturating_sub(hub.dequantized),
     })
 }
 
@@ -1148,6 +1151,9 @@ const fn npz_dtype_to_hub(dtype: crate::NpzDtype) -> Dtype {
 /// Currently infallible; returns `Result` so a future `PthDtype` without a
 /// counterpart can be rejected without a breaking change.
 #[cfg(feature = "pth")]
+// `clippy::unnecessary_wraps`: every arm is `Ok(_)` today; the `Result` is kept so
+// a future `PthDtype` without a safetensors counterpart can be rejected without a
+// breaking signature change.
 #[allow(clippy::unnecessary_wraps)]
 const fn pth_dtype_to_hub(dtype: crate::PthDtype) -> crate::Result<Dtype> {
     use crate::PthDtype;
@@ -1413,5 +1419,43 @@ mod gguf_metadata_tests {
 
         assert!(parse_gguf_kv_arg("no-equals").is_err());
         assert!(parse_gguf_kv_arg("=empty-key").is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod stats_tests {
+    use super::{convert, ConvertOptions, ConvertTarget};
+    use std::path::Path;
+
+    /// `ConvertStats` must **partition** the written tensors: a tensor is either
+    /// dequantised on the way in, quantised on the way out, or passed through in
+    /// its incoming dtype — never counted twice. The FP8 fixture exercises the
+    /// mixed case (one quantised weight plus companions).
+    #[test]
+    fn stats_partition_the_written_tensors() {
+        let input = Path::new("tests/fixtures/safetensors_reference/fp8.safetensors");
+        assert!(input.exists(), "committed FP8 fixture missing");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out.safetensors");
+
+        let stats = convert(
+            input,
+            ConvertTarget::Safetensors,
+            &out,
+            &ConvertOptions::new(),
+        )
+        .expect("convert fp8 -> safetensors");
+
+        assert!(
+            stats.dequantized > 0,
+            "the FP8 fixture has a quantised weight: {stats:?}"
+        );
+        assert_eq!(stats.quantized, 0, "safetensors target quantises nothing");
+        assert_eq!(
+            stats.dequantized + stats.passthrough,
+            stats.tensors,
+            "dequantised + passthrough must equal the tensors written: {stats:?}"
+        );
     }
 }
