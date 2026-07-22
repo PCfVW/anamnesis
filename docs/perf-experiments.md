@@ -805,7 +805,7 @@ complexity improvement only, per the "measure before claiming a speed win" rule.
 `#[ignore]`; re-run it against the parent commit to reproduce before/after.
 
 **Re-attempting this requires:** N/A — success case. Related deeper wins left for
-later: the hub itself is still `O(2 × model)` (streaming is Phase 10), and the
-reader-side GGUF KV clone in `read_gguf` (necessary because the hub outlives the
-mmap-backed parse) could be moved rather than cloned if `ParsedGguf` gained an
-`into_metadata()`.
+later: the hub is still materialised in full (`O(model)`; streaming it down to
+`O(largest tensor)` is Phase 10), and the reader-side GGUF KV clone in
+`read_gguf` (necessary because the hub outlives the mmap-backed parse) could be
+moved rather than cloned if `ParsedGguf` gained an `into_metadata()`.

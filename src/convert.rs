@@ -28,10 +28,16 @@
 //!
 //! # Memory
 //!
-//! The hub is eager and owned: peak heap is `O(2 × model)` — the same profile as
-//! [`ParsedModel::remember_to_bytes`](crate::ParsedModel::remember_to_bytes),
-//! since every tensor is materialised before the writer runs. Streaming output
-//! is `ROADMAP.md` Phase 10.
+//! The hub is eager and owned: peak heap is `O(model)` — every tensor is
+//! materialised as an owned hub tensor before the writer runs — plus the target
+//! writer's own buffer. The safetensors and `GGUF` writers borrow the hub's
+//! bytes and stream to the output (adding ~0); only the `BnB-NF4` encoder
+//! allocates a target buffer (its packed NF4 output). The readers and writers
+//! take **no second full copy**: an `NPZ` parse map is drained into the hub
+//! rather than cloned, and an already-`BF16` hub is borrowed to the `BnB`
+//! encoder via `Cow` instead of re-copied — see
+//! `docs/perf-experiments.md`, Experiment 9. Dropping even the single
+//! materialised hub (streaming output) is `ROADMAP.md` Phase 10.
 
 // `Cow` is used by the `bnb` (`to_bf16_bytes`) and `gguf` (`write_gguf_target`)
 // writers to borrow rather than copy; unused when neither feature is on.
@@ -447,8 +453,10 @@ pub fn derive_output_path(input: &Path, target: ConvertTarget) -> PathBuf {
 ///
 /// # Memory
 ///
-/// Peak heap is `O(2 × model)`: the whole hub is materialised before the writer
-/// runs. See the module docs.
+/// Peak heap is `O(model)`: the whole hub is materialised before the writer
+/// runs, plus the target writer's buffer (near-zero for the streaming
+/// safetensors / `GGUF` writers; the packed NF4 output for the `bnb-nf4`
+/// target). See the module docs.
 pub fn convert(
     input: &Path,
     target: ConvertTarget,

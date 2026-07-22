@@ -562,8 +562,9 @@ impl ParsedModel {
     ///
     /// # Memory
     ///
-    /// Allocates owned copies of **every** tensor — peak heap is the full
-    /// dequantised model. This is the hub's documented `O(2 × model)` profile.
+    /// Allocates owned copies of **every** tensor — peak heap is one full
+    /// dequantised model (`O(model)`, the hub itself). The end-to-end `convert`
+    /// peak adds only the target writer's buffer; see the `convert` module docs.
     pub(crate) fn hub_tensors(&self) -> crate::Result<(Vec<crate::convert::HubTensor>, usize)> {
         let (dequantized_data, passthrough_refs) = self.dequantize_all(|| {})?;
 
