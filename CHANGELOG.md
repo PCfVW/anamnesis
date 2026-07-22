@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParsedGguf::metadata()` is used to inherit source KV. No new kernels; quantized
   GGUF target columns still need Phase 8.5.
 
+- **`docs/tutorials/convert-between-formats.md`** — a walkthrough of `amn convert`
+  with real captured output (FP8 → `bnb-nf4` / `gguf` auto-chain, GGUF-KV stamping,
+  `gguf → gguf` KV inheritance), linked from the FAQ convert answer.
 
 - **`docs/validation.md`** and **`docs/cli-reference.md`** — the validation
   evidence (cross-validation tables, per-kernel speeds, conversion benchmarks,

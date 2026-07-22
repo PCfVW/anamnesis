@@ -149,7 +149,7 @@ It is the estimated number of bytes of precision that quantization (Lethe) disca
 amn convert model.gguf --to bnb-nf4     # dequantize + re-encode, one command
 ```
 
-Scalar dtypes are preserved (so `.pth → safetensors` and `NPZ`-`F32` → `GGUF` stay lossless); only quantized tensors become `BF16`. Stamp your own GGUF metadata with `--gguf-metadata <file.json>` / `--gguf-kv key=value` (anamnesis writes it verbatim). The full matrix, the metadata grammar, and what stays out of scope until the encode kernels land are in the [CLI reference](cli-reference.md#amn-convert-file---to-target).
+Scalar dtypes are preserved (so `.pth → safetensors` and `NPZ`-`F32` → `GGUF` stay lossless); only quantized tensors become `BF16`. Stamp your own GGUF metadata with `--gguf-metadata <file.json>` / `--gguf-kv key=value` (anamnesis writes it verbatim). The full walkthrough with real output is in [Convert a model between formats](tutorials/convert-between-formats.md); the full matrix, the metadata grammar, and what stays out of scope until the encode kernels land are in the [CLI reference](cli-reference.md#amn-convert-file---to-target).
 
 ## Parsing untrusted input
 

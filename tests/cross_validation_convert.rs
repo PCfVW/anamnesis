@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Phase 6 Step 3 — cross-format round-trip validation suite.
+//! Cross-format round-trip validation suite.
 //!
-//! This file exercises **every v0.6.0-available conversion pair** that
-//! `amn convert` can route, both directions where the pipeline is
-//! reversible. Each test follows the same shape:
+//! Phase 6 Step 3 (`t1`–`t14`) exercises **every v0.6.0-available conversion
+//! pair** through the low-level writers, both directions where the pipeline is
+//! reversible. Phase 6.14 Step 5 (`t15`–`t20`) adds the **newly-wired cells**
+//! (quantised-safetensors → gguf auto-chain, gguf → gguf, gguf/npz/`.pth` →
+//! bnb-nf4) driven through the public [`convert`](anamnesis::convert) entry
+//! point, pinning the BF16-hub dispatch, `ConvertStats` accounting, and
+//! GGUF-KV inheritance a library consumer actually depends on. Each test
+//! follows the same shape:
 //!
 //! 1. Build (or load) a deterministic fixture.
 //! 2. Run the forward conversion.
@@ -47,9 +52,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anamnesis::{
-    classify_inputs, npz_to_safetensors_bytes, parse, parse_gguf, parse_pth,
+    classify_inputs, convert, npz_to_safetensors_bytes, parse, parse_gguf, parse_pth,
     pth_to_safetensors_bytes, write_bnb_nf4_safetensors, write_bnb_nf4_safetensors_bytes,
-    write_gguf, BnbWriteInput, GgufType, GgufWriteTensor, NpzDtype, NpzTensor, QuantScheme,
+    write_gguf, BnbWriteInput, ConvertOptions, ConvertTarget, GgufMetadataValue, GgufType,
+    GgufWriteTensor, NpzDtype, NpzTensor, QuantScheme,
 };
 
 // ===========================================================================
@@ -846,6 +852,347 @@ fn t13_classify_inputs_agrees_with_writer_emission() {
         .find(|t| t.name == "b")
         .expect("passthrough `b` missing");
     assert_eq!(b_entry.dtype.to_string(), "BF16");
+}
+
+// ===========================================================================
+// Phase 6.14 Step 5 — the newly-wired cells, driven through the public
+// `convert()` API (not the low-level writers the tests above exercise).
+//
+// t1–t13 pin the *primitives*; these pin the *dispatch*: format detection,
+// the BF16-hub reader/writer routing, `ConvertStats` accounting, GGUF-KV
+// inheritance, and the auto-chain — all through the single entry point a
+// library consumer (and the Phase 8 Python binding) actually calls. Cells
+// covered: quantised-safetensors → gguf (auto-chain), gguf → gguf (KV +
+// byte-exact scalar), gguf → bnb-nf4, npz → bnb-nf4, `.pth` → bnb-nf4.
+// ===========================================================================
+
+/// Writes a scalar `GGUF` fixture to a temp file, returning its dir + path.
+/// The dir is returned so the caller keeps it alive for the file's lifetime.
+fn write_scalar_gguf(
+    tensors: &[GgufWriteTensor<'_>],
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let path = dir.path().join("source.gguf");
+    write_gguf(&path, tensors, metadata).unwrap();
+    (dir, path)
+}
+
+// -- #15 quantised safetensors -> GGUF: the auto-chain (dequant-in, scalar-out).
+// Not reversible (FP8 is lossy), so we assert the *routing*: the quantised
+// weight is dequantised to BF16 on the way in, and the result is a loadable
+// scalar GGUF.
+
+#[test]
+fn t15_convert_fp8_st_to_gguf_auto_chains_through_bf16() {
+    eprintln!("--- t15_convert_fp8_st_to_gguf_auto_chains_through_bf16 ---");
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("safetensors_reference")
+        .join("fp8.safetensors");
+    if !input.exists() {
+        eprintln!("  committed FP8 fixture missing; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("fp8-gguf.gguf");
+
+    let stats = convert(&input, ConvertTarget::Gguf, &out, &ConvertOptions::new())
+        .expect("fp8 safetensors -> gguf");
+    // The FP8 weight is recovered to BF16 on the way in; the scalar norm
+    // passes through. No temp file was staged by the caller.
+    assert!(
+        stats.dequantized >= 1,
+        "the FP8 weight must dequantise through the hub: {stats:?}"
+    );
+    assert_eq!(stats.quantized, 0, "the gguf target quantises nothing");
+    assert_eq!(
+        stats.dequantized + stats.passthrough,
+        stats.tensors,
+        "ConvertStats must partition the written tensors: {stats:?}"
+    );
+
+    // The output is a real GGUF whose recovered weight is BF16.
+    let parsed = parse_gguf(&out).unwrap();
+    let weight = parsed
+        .tensors()
+        .find(|t| t.name == "model.layers.0.weight")
+        .expect("recovered weight tensor missing from output GGUF");
+    assert_eq!(
+        weight.dtype,
+        GgufType::BF16,
+        "the auto-chain must land the quantised weight as BF16"
+    );
+}
+
+// -- #16 GGUF -> GGUF: dequantise-in-place on a scalar source is a byte-exact
+// passthrough, and the source metadata KV survives with types intact (the
+// Step 3 regression: a KV-less re-emit is a bare tensor container no runtime
+// can load).
+
+#[test]
+fn t16_convert_gguf_to_gguf_preserves_kv_and_bytes() {
+    eprintln!("--- t16_convert_gguf_to_gguf_preserves_kv_and_bytes ---");
+    let f32_data: Vec<u8> = (0..6u32)
+        .flat_map(|i| (i as f32 * 1.5 - 2.0).to_le_bytes())
+        .collect();
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "general.architecture".to_owned(),
+        GgufMetadataValue::String("anamnesis-test".to_owned()),
+    );
+    // A typed U32 key: its width must survive the round trip, not collapse to
+    // a string.
+    metadata.insert("test.block_count".to_owned(), GgufMetadataValue::U32(7));
+    let tensors = vec![GgufWriteTensor {
+        name: "w",
+        shape: &[3, 2], // GGUF MSB-first
+        dtype: GgufType::F32,
+        data: &f32_data,
+    }];
+    let (_dir, src) = write_scalar_gguf(&tensors, &metadata);
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("gguf-gguf.gguf");
+
+    let stats =
+        convert(&src, ConvertTarget::Gguf, &out, &ConvertOptions::new()).expect("gguf -> gguf");
+    assert_eq!(stats.dequantized, 0, "a scalar source dequantises nothing");
+    assert_eq!(stats.passthrough, 1);
+    assert_eq!(stats.tensors, 1);
+
+    let parsed = parse_gguf(&out).unwrap();
+    // Byte-exact: a scalar GGUF -> GGUF is losslessly reversible.
+    let collected: Vec<_> = parsed.tensors().collect();
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].name, "w");
+    assert_eq!(collected[0].dtype, GgufType::F32);
+    assert_bytes_equal_with_diagnostic(collected[0].data.as_ref(), &f32_data, "t16.w");
+
+    // KV survives with types intact.
+    assert_eq!(
+        parsed
+            .metadata()
+            .get("general.architecture")
+            .and_then(GgufMetadataValue::as_string),
+        Some("anamnesis-test"),
+        "source String KV must be inherited"
+    );
+    assert_eq!(
+        parsed.metadata().get("test.block_count"),
+        Some(&GgufMetadataValue::U32(7)),
+        "source typed U32 KV must survive as U32, not collapse to String"
+    );
+}
+
+// -- #17 GGUF -> GGUF with caller KV: `--gguf-metadata` merges OVER the
+// inherited source KV (caller wins on a key collision).
+
+#[test]
+fn t17_convert_gguf_to_gguf_caller_kv_overrides_source() {
+    eprintln!("--- t17_convert_gguf_to_gguf_caller_kv_overrides_source ---");
+    let f32_data: Vec<u8> = (0..4u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let mut src_kv = HashMap::new();
+    src_kv.insert(
+        "general.name".to_owned(),
+        GgufMetadataValue::String("from-source".to_owned()),
+    );
+    src_kv.insert(
+        "general.architecture".to_owned(),
+        GgufMetadataValue::String("llama".to_owned()),
+    );
+    let tensors = vec![GgufWriteTensor {
+        name: "w",
+        shape: &[4],
+        dtype: GgufType::F32,
+        data: &f32_data,
+    }];
+    let (_dir, src) = write_scalar_gguf(&tensors, &src_kv);
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("merged.gguf");
+
+    // The caller overrides `general.name` and adds a new key; the untouched
+    // `general.architecture` is inherited from the source.
+    let mut caller_kv = HashMap::new();
+    caller_kv.insert(
+        "general.name".to_owned(),
+        GgufMetadataValue::String("from-caller".to_owned()),
+    );
+    caller_kv.insert(
+        "general.quantization_version".to_owned(),
+        GgufMetadataValue::U32(2),
+    );
+    let opts = ConvertOptions::new().with_gguf_metadata(caller_kv);
+
+    convert(&src, ConvertTarget::Gguf, &out, &opts).expect("gguf -> gguf with caller KV");
+
+    let parsed = parse_gguf(&out).unwrap();
+    assert_eq!(
+        parsed
+            .metadata()
+            .get("general.name")
+            .and_then(GgufMetadataValue::as_string),
+        Some("from-caller"),
+        "caller KV must win on a key collision"
+    );
+    assert_eq!(
+        parsed
+            .metadata()
+            .get("general.architecture")
+            .and_then(GgufMetadataValue::as_string),
+        Some("llama"),
+        "untouched source KV must still be inherited"
+    );
+    assert_eq!(
+        parsed.metadata().get("general.quantization_version"),
+        Some(&GgufMetadataValue::U32(2)),
+        "caller-only key must be written"
+    );
+}
+
+// -- #18 GGUF -> BnB-NF4: a 2-D one-block weight is encoded to NF4 (companions
+// present), a 1-D bias passes through as BF16. Pins the encoder contract via
+// the GGUF reader rather than the low-level writer (t5/t6).
+
+#[test]
+fn t18_convert_gguf_to_bnb_nf4_encodes_weight_passes_bias() {
+    eprintln!("--- t18_convert_gguf_to_bnb_nf4_encodes_weight_passes_bias ---");
+    // 64 BF16 weight values as [64, 1] row-major -> GGUF stores [1, 64].
+    let w_bf16 = bf16_bytes_from_f32_iter((0..64).map(|i| (i as f32 - 31.5) / 32.0));
+    let b_bf16 = bf16_bytes_from_f32_iter([0.5, -0.25, 1.0]);
+    let tensors = vec![
+        GgufWriteTensor {
+            name: "w",
+            shape: &[1, 64], // GGUF MSB-first for a row-major [64, 1]
+            dtype: GgufType::BF16,
+            data: &w_bf16,
+        },
+        GgufWriteTensor {
+            name: "b",
+            shape: &[3],
+            dtype: GgufType::BF16,
+            data: &b_bf16,
+        },
+    ];
+    let (_dir, src) = write_scalar_gguf(&tensors, &HashMap::new());
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("gguf-bnb.safetensors");
+
+    let stats = convert(&src, ConvertTarget::BnbNf4, &out, &ConvertOptions::new())
+        .expect("gguf -> bnb-nf4");
+    assert_eq!(
+        stats.quantized, 1,
+        "the 2-D one-block weight is NF4-encoded"
+    );
+    assert_eq!(stats.passthrough, 1, "the 1-D bias passes through as BF16");
+
+    // The output must carry the NF4 companions for `w` and a bare BF16 `b`.
+    let model = parse(&out).unwrap();
+    assert_eq!(model.header.scheme, QuantScheme::Bnb4);
+    let out_bytes = std::fs::read(&out).unwrap();
+    let parsed = safetensors::SafeTensors::deserialize(&out_bytes).unwrap();
+    assert!(
+        parsed.tensor("w.weight").is_ok(),
+        "NF4-packed weight missing"
+    );
+    assert!(
+        parsed.tensor("w.weight.absmax").is_ok(),
+        "NF4 absmax companion missing"
+    );
+    assert!(
+        parsed.tensor("w.weight.quant_map").is_ok(),
+        "NF4 quant_map companion missing"
+    );
+    let b = parsed.tensor("b").expect("passthrough bias missing");
+    assert_eq!(b.dtype(), safetensors::Dtype::BF16);
+}
+
+// -- #19 NPZ -> BnB-NF4: end-to-end through the real gemma-scope fixture. Its
+// tensors are 1-D 8-element spot slices, so every one passes through as BF16 —
+// what we pin here is that the npz->bnb-nf4 cell routes at all (it returned
+// `Unsupported` before Step 1) and yields a valid BnB safetensors.
+
+#[test]
+fn t19_convert_npz_to_bnb_nf4_routes_and_passes_through() {
+    eprintln!("--- t19_convert_npz_to_bnb_nf4_routes_and_passes_through ---");
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("npz_reference")
+        .join("gemma_scope_small.npz");
+    if !input.exists() {
+        eprintln!("  gemma-scope NPZ fixture missing; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("npz-bnb.safetensors");
+
+    let stats = convert(&input, ConvertTarget::BnbNf4, &out, &ConvertOptions::new())
+        .expect("npz -> bnb-nf4");
+    assert!(stats.tensors > 0, "the fixture has tensors");
+    assert_eq!(
+        stats.quantized, 0,
+        "1-D spot slices are all below the 2-D/one-block bar"
+    );
+    assert_eq!(
+        stats.passthrough, stats.tensors,
+        "every tensor passes through: {stats:?}"
+    );
+
+    // Every written tensor is plain BF16 (the passthrough contract).
+    let out_bytes = std::fs::read(&out).unwrap();
+    let parsed = safetensors::SafeTensors::deserialize(&out_bytes).unwrap();
+    for name in parsed.names() {
+        let t = parsed.tensor(name).unwrap();
+        assert_eq!(
+            t.dtype(),
+            safetensors::Dtype::BF16,
+            "passthrough tensor `{name}` must be BF16"
+        );
+    }
+}
+
+// -- #20 .pth -> BnB-NF4: the AlgZoo fixture's tensors are all below the
+// one-block bar, so this is the passthrough half of the encoder contract
+// reached through the `.pth` reader.
+
+#[test]
+fn t20_convert_pth_to_bnb_nf4_routes_and_passes_through() {
+    eprintln!("--- t20_convert_pth_to_bnb_nf4_routes_and_passes_through ---");
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pth_reference")
+        .join("algzoo_rnn_small.pth");
+    if !input.exists() {
+        eprintln!("  AlgZoo .pth fixture missing; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("pth-bnb.safetensors");
+
+    let stats = convert(&input, ConvertTarget::BnbNf4, &out, &ConvertOptions::new())
+        .expect("pth -> bnb-nf4");
+    assert!(stats.tensors > 0, "the fixture has tensors");
+    assert_eq!(
+        stats.quantized, 0,
+        "AlgZoo tensors are below the one-block bar"
+    );
+    assert_eq!(
+        stats.passthrough, stats.tensors,
+        "every tensor passes through: {stats:?}"
+    );
+
+    let out_bytes = std::fs::read(&out).unwrap();
+    let parsed = safetensors::SafeTensors::deserialize(&out_bytes).unwrap();
+    for name in parsed.names() {
+        let t = parsed.tensor(name).unwrap();
+        assert_eq!(
+            t.dtype(),
+            safetensors::Dtype::BF16,
+            "passthrough tensor `{name}` must be BF16"
+        );
+    }
 }
 
 // ===========================================================================

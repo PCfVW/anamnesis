@@ -481,7 +481,7 @@ The same `# Source context` block (with format name swapped) should appear on `i
 
 ### Phase 6: Format Conversion Matrix
 
-**Goal:** Wire the conversion pipeline — `parse → remember → forget → write` end-to-end via a single CLI primitive. With Phase 5 complete (BnB encode), v0.6.0 ships every decode-side conversion (any input format → safetensors BF16) plus the BnB encode path (any input → BnB safetensors); the remaining encode-side rows of the matrix (GGUF / FP8 / IQ / TQ / MXFP4) light up at v0.8.5 once Phase 8.5 lands the missing encode kernels, accessible through the same `convert()` API and the same `amn convert` subcommand.
+**Goal:** Wire the conversion pipeline — `parse → remember → forget → write` end-to-end via a single CLI primitive. With Phase 5 complete (BnB encode), v0.6.0 ships every decode-side conversion (any input format → safetensors BF16) plus the BnB encode path (BF16-safetensors → BnB safetensors; full input coverage for the `bnb-nf4` target lands in [Phase 6.14](#phase-614-convert-matrix-completion-bf16-hub)); the remaining encode-side rows of the matrix (GGUF / FP8 / IQ / TQ / MXFP4) light up at v0.8.5 once Phase 8.5 lands the missing encode kernels, accessible through the same `convert()` API and the same `amn convert` subcommand.
 
 **Key conversions unlocked (cumulative across Phase 6 and Phase 8.5):**
 
