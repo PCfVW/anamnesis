@@ -36,6 +36,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 6 | `inspect_pth_from_reader` vs `parse_pth(path).inspect()` vs `torch.load` | **Reader 1.36× mmap median across 6 960 AlgZoo files; mmap 4.07× / reader 2.99× faster than `torch.load`** | Shipped |
 | 7 | Sign-of-zero preservation rule (`BnB FP4` decode tweak) — *correctness experiment* | **"Impossible" was conditional, not absolute** — narrow tweak recovers byte-exact round-trip on 0.2 % of FP4 elements with no NF4/INT8 side-effect | Shipped commits `a5c452d` / `24cba42` / `ab4e735` (v0.5.0) |
 | 8 | Vendored `ZIP` reader: container-metadata footprint vs `zip::ZipArchive::new` | **337 → 41 B/entry resident, 8.07×** (3.12× peak) on a 50 001-entry archive — projected ~12×, ceiling was ~8.4× | Shipped (v0.6.7, Phase 6.12) |
+| 9 | `convert` copy-elimination pass (avoid hub-sized copies + one `O(P·N)` scan) | **Confirmed: peak −39 % (bnb), −25 % (gguf KV), −49.6 % (npz)** — each drop equals exactly the one eliminated copy | Shipped (v0.6.9, Phase 6.14) |
 
 ---
 
@@ -748,3 +749,63 @@ peak metric simply doesn't capture.
 **Re-attempting this requires:** N/A — success case. The `#[ignore]` test is a
 committed regression guard (it asserts a resident reduction); re-run it against
 the parent commit to reproduce the before/after.
+
+---
+
+## Experiment 9 — `convert` copy-elimination pass (Phase 6.14)
+
+**Audit finding (self-review before the Python bindings expose `convert()`):**
+the BF16-hub `convert` path carried four avoidable costs — (1) `hub_tensors`
+recovered each passthrough tensor's dtype with a linear `find` over all tensors
+(`O(passthrough × N)`); (2) `to_bf16_bytes` did a full `data.to_vec()` even when
+the tensor was already `BF16`, allocating a second full-model buffer alongside
+the hub on the `bnb-nf4` path; (3) `write_gguf_target` deep-cloned the inherited
+source KV — including a multi-thousand-entry tokenizer array — even with no
+caller KV to merge; (4) `read_npz` cloned every tensor's bytes instead of moving
+out of the owned map. None changes output bytes; all are pure copy/scan
+elimination.
+
+**Method:** [`tests/bench_convert_adhoc.rs`](../tests/bench_convert_adhoc.rs), a
+`dhat`-instrumented `#[ignore]` harness (synthetic fixtures, one `dhat::Profiler`
+scope per route, fixtures built *before* the profiler so only `convert()`'s own
+allocations are counted). Release build. Compared parent vs patched on the same
+binary:
+`cargo test --release --features npz,gguf,bnb,pth --test bench_convert_adhoc -- --ignored --nocapture`.
+
+**Result (peak = `dhat` `max_bytes`; total = cumulative allocated):**
+
+| Route (fixture) | Metric | Before | After | Δ |
+|---|---|---:|---:|---:|
+| #2 `BF16` st → `bnb-nf4` (8192×8192, 128 MiB hub) | peak | 328.0 MiB | 200.0 MiB | **−128.0 MiB (−39.0 %)** |
+| | total | 332.0 MiB | 204.0 MiB | −128.0 MiB |
+| #3 `gguf → gguf` (256 K-token tokenizer KV) | peak | 25.3 MiB | 19.0 MiB | **−6.3 MiB (−25.0 %)** |
+| | total | 47.1 MiB | 37.6 MiB | −9.5 MiB (−20.2 %) |
+| | blocks | 786 504 | 524 353 | −262 151 (= one 256 K-entry KV copy) |
+| #4 `NPZ` → safetensors (2×4096×4096 F32, 128 MiB) | peak | 256.0 MiB | 129.0 MiB | **−127.0 MiB (−49.6 %)** |
+| | total | 257.1 MiB | 129.1 MiB | −128.0 MiB |
+
+**Why the numbers land exactly on the eliminated copy:** each drop equals one
+model-sized (or one KV-sized) buffer, confirming the hypothesis precisely rather
+than approximately. #2 removes the 128 MiB `to_bf16_bytes` copy of the
+already-`BF16` hub; #4 removes the 128 MiB per-tensor NPZ clone (peak halves
+because the owned parse map and the hub no longer coexist at full size); #3's
+`blocks` count falls by exactly 262 144 = 256 K — the tokenizer array is now
+copied twice (parse + the still-necessary reader-side owning clone) instead of
+three times (the write-side merge clone is gone).
+
+**#1 (the `O(P·N)` → `O(N)` dtype lookup)** is **not** in the table: it changes
+no allocation these routes exercise (a `find` and a one-pass index both touch the
+same bytes), and at current model sizes the scan-count reduction is far below
+wall-clock noise (the dequant dominates). It is an asymptotic guard for
+many-tensor models (a 70 B checkpoint has 1 000+ tensors), verified by inspection
+and the existing `convert` round-trip tests, not by measurement — claimed as a
+complexity improvement only, per the "measure before claiming a speed win" rule.
+
+**Disposition:** shipped in Phase 6.14 (v0.6.9). The harness is committed
+`#[ignore]`; re-run it against the parent commit to reproduce before/after.
+
+**Re-attempting this requires:** N/A — success case. Related deeper wins left for
+later: the hub itself is still `O(2 × model)` (streaming is Phase 10), and the
+reader-side GGUF KV clone in `read_gguf` (necessary because the hub outlives the
+mmap-backed parse) could be moved rather than cloned if `ParsedGguf` gained an
+`into_metadata()`.

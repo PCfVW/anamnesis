@@ -579,19 +579,25 @@ impl ParsedModel {
             });
         }
 
+        // One-pass name → dtype index so the passthrough loop stays O(N)
+        // rather than O(passthrough × N) via a linear `find` per tensor.
+        let dtype_by_name: std::collections::HashMap<&str, crate::Dtype> = self
+            .header
+            .tensors
+            .iter()
+            .map(|t| (t.name.as_str(), t.dtype))
+            .collect();
+
         for (name, data, shape) in passthrough_refs {
-            let entry = self
-                .header
-                .tensors
-                .iter()
-                .find(|t| t.name == name)
+            let dtype = *dtype_by_name
+                .get(name)
                 .ok_or_else(|| AnamnesisError::Parse {
                     reason: format!("passthrough tensor `{name}` not found in header"),
                 })?;
             tensors.push(crate::convert::HubTensor {
                 name: name.to_owned(),
                 shape: shape.to_vec(),
-                dtype: entry.dtype,
+                dtype,
                 // BORROW: copy the buffer-borrowed bytes so the hub outlives `self`.
                 data: data.to_vec(),
             });

@@ -33,6 +33,10 @@
 //! since every tensor is materialised before the writer runs. Streaming output
 //! is `ROADMAP.md` Phase 10.
 
+// `Cow` is used by the `bnb` (`to_bf16_bytes`) and `gguf` (`write_gguf_target`)
+// writers to borrow rather than copy; unused when neither feature is on.
+#[cfg(any(feature = "bnb", feature = "gguf"))]
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -528,20 +532,22 @@ fn read_safetensors(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
 /// name order for a deterministic output.
 #[cfg(feature = "npz")]
 fn read_npz(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
-    let map = crate::parse_npz_with_limits(path, limits)?;
-    let mut names: Vec<&String> = map.keys().collect();
+    let mut map = crate::parse_npz_with_limits(path, limits)?;
+    // Sort the (cheap) name keys, then move each tensor out of the owned map —
+    // draining avoids cloning every tensor's bytes (a full-model copy).
+    let mut names: Vec<String> = map.keys().cloned().collect();
     names.sort();
 
-    let mut tensors = Vec::with_capacity(map.len());
+    let mut tensors = Vec::with_capacity(names.len());
     for name in names {
-        let t = map.get(name).ok_or_else(|| AnamnesisError::Parse {
+        let t = map.remove(&name).ok_or_else(|| AnamnesisError::Parse {
             reason: format!("NPZ tensor `{name}` vanished mid-iteration"),
         })?;
         tensors.push(HubTensor {
-            name: name.clone(),
-            shape: t.shape.clone(),
+            name,
+            shape: t.shape,
             dtype: npz_dtype_to_hub(t.dtype),
-            data: t.data.clone(),
+            data: t.data,
         });
     }
     Ok(Hub {
@@ -702,13 +708,22 @@ fn write_gguf_target(
 
     // Source KV first, caller KV merged over it: an explicit `--gguf-kv` /
     // `--gguf-metadata` entry overrides the inherited value for the same key.
-    let mut metadata = hub.gguf_metadata.clone();
-    metadata.extend(
-        options
-            .gguf_metadata
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone())),
-    );
+    // When there is no caller KV — the common `gguf → gguf` case — the inherited
+    // map (which can carry a multi-thousand-entry tokenizer array) is borrowed
+    // straight through instead of deep-cloned.
+    let metadata: Cow<'_, HashMap<String, crate::GgufMetadataValue>> =
+        if options.gguf_metadata.is_empty() {
+            Cow::Borrowed(&hub.gguf_metadata)
+        } else {
+            let mut merged = hub.gguf_metadata.clone();
+            merged.extend(
+                options
+                    .gguf_metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            Cow::Owned(merged)
+        };
     write_gguf(output, &tensors, &metadata)?;
 
     Ok(ConvertStats {
@@ -727,8 +742,10 @@ fn write_gguf_target(
 fn write_bnb_nf4_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
     use crate::{classify_inputs, write_bnb_nf4_safetensors, BnbWriteInput};
 
-    let mut owned: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::with_capacity(hub.tensors.len());
+    let mut owned: Vec<(String, Vec<usize>, Cow<'_, [u8]>)> = Vec::with_capacity(hub.tensors.len());
     for t in &hub.tensors {
+        // BF16 tensors are borrowed straight from the hub (no copy); only
+        // F32/F16 allocate a converted buffer.
         let bf16 = to_bf16_bytes(&t.data, t.dtype, &t.name)?;
         owned.push((t.name.clone(), t.shape.clone(), bf16));
     }
@@ -738,7 +755,7 @@ fn write_bnb_nf4_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats>
         .map(|(name, shape, bf16)| BnbWriteInput {
             name: name.as_str(),
             shape: shape.as_slice(),
-            bf16_data: bf16.as_slice(),
+            bf16_data: bf16.as_ref(),
         })
         .collect();
 
@@ -1235,8 +1252,12 @@ fn hub_dtype_to_gguf(dtype: Dtype) -> crate::Result<crate::GgufType> {
 }
 
 /// Converts a float tensor's bytes to `BF16` for the `BnB-NF4` encoder.
-/// `BF16` input is returned unchanged; `F32` / `F16` are truncated to the upper
-/// 16 bits, matching the crate's `f32_bits_to_bf16_bits` convention.
+/// `BF16` input is **borrowed unchanged** (no copy); `F32` / `F16` are truncated
+/// to the upper 16 bits, matching the crate's `f32_bits_to_bf16_bits` convention.
+///
+/// Returns a [`Cow`] so the common already-`BF16` case (a `.pth` / plain-`BF16`
+/// source, or any tensor the hub already dequantised) does not allocate a
+/// second full-model-sized buffer alongside the hub.
 ///
 /// # Errors
 ///
@@ -1244,9 +1265,9 @@ fn hub_dtype_to_gguf(dtype: Dtype) -> crate::Result<crate::GgufType> {
 /// [`AnamnesisError::Parse`] if the byte count is not a whole number of
 /// elements.
 #[cfg(feature = "bnb")]
-fn to_bf16_bytes(data: &[u8], dtype: Dtype, name: &str) -> crate::Result<Vec<u8>> {
+fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<Cow<'a, [u8]>> {
     match dtype {
-        Dtype::BF16 => Ok(data.to_vec()),
+        Dtype::BF16 => Ok(Cow::Borrowed(data)),
         Dtype::F32 => {
             if !data.len().is_multiple_of(4) {
                 return Err(AnamnesisError::Parse {
@@ -1267,7 +1288,7 @@ fn to_bf16_bytes(data: &[u8], dtype: Dtype, name: &str) -> crate::Result<Vec<u8>
                 let bf16 = (bits >> 16) as u16;
                 out.extend_from_slice(&bf16.to_le_bytes());
             }
-            Ok(out)
+            Ok(Cow::Owned(out))
         }
         Dtype::F16 => {
             if !data.len().is_multiple_of(2) {
@@ -1289,7 +1310,7 @@ fn to_bf16_bytes(data: &[u8], dtype: Dtype, name: &str) -> crate::Result<Vec<u8>
                 let bf16 = (bits >> 16) as u16;
                 out.extend_from_slice(&bf16.to_le_bytes());
             }
-            Ok(out)
+            Ok(Cow::Owned(out))
         }
         Dtype::F8E4M3
         | Dtype::F8E5M2

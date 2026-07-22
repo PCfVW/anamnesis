@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Lower `convert` peak heap** (Phase 6.14 copy-elimination pass, no output
+  change). Measured with a `dhat` harness ([`tests/bench_convert_adhoc.rs`](tests/bench_convert_adhoc.rs)):
+  a `bnb-nf4` conversion peaks **−39 %** (the encoder no longer re-copies an
+  already-`BF16` hub), `NPZ → *` peaks **−49.6 %** (the reader moves tensors out
+  of the parse map instead of cloning), and `gguf → gguf` allocates **−20 %**
+  cumulative (the inherited source KV — a multi-thousand-entry tokenizer array —
+  is borrowed through, not deep-cloned, when there is no caller KV to merge).
+  Plus an `O(passthrough × N) → O(N)` dtype lookup in the hub for many-tensor
+  models. Full numbers in [`docs/perf-experiments.md`](docs/perf-experiments.md)
+  (Experiment 9).
+
 - **README restructured** around an audience-oriented "first window" — a *New to
   anamnesis?* routing block, *Try it*, *Library quick start*, a compact *Formats
   & quantization support* matrix, and a *What's next* roadmap teaser — with the
