@@ -519,7 +519,7 @@ impl ParsedModel {
     /// `Vec<u8>` so an embedder can load the dequantised model without a disk
     /// round-trip (e.g. candle-mi's quantized loader → `from_buffered_safetensors`).
     /// Completes the file/bytes pairing the crate's other serializers already
-    /// have ([`ParsedPth::to_safetensors_bytes`](crate::ParsedPth::to_safetensors_bytes),
+    /// have (`ParsedPth::to_safetensors_bytes` (requires `pth` feature),
     /// `write_bnb_nf4_safetensors_bytes`).
     ///
     /// # Errors

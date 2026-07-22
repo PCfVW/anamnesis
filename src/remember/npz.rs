@@ -3,8 +3,8 @@
 //! `NPZ` archive → safetensors conversion.
 //!
 //! Mirrors the lossless format-conversion role of
-//! [`pth_to_safetensors`](super::pth::pth_to_safetensors): `NPZ` tensors are
-//! already full-precision (`F32`, `F64`, `BF16`, `F16`, integer types), so
+//! `pth_to_safetensors` (the `.pth` sibling, behind the `pth` feature): `NPZ`
+//! tensors are already full-precision (`F32`, `F64`, `BF16`, `F16`, integer types), so
 //! no dequantisation happens. Tensor names, shapes, dtypes, and raw bytes
 //! are preserved exactly. Every [`NpzDtype`] variant has a direct
 //! `safetensors::Dtype` counterpart, so every `NPZ` archive round-trips

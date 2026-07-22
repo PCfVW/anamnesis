@@ -60,13 +60,13 @@
 //!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 7.5 through
 //!   the same writer scaffold. Behind the `gguf` feature.
 //! - `npz_to_safetensors` / `npz_to_safetensors_bytes` — lossless
-//!   `NPZ → safetensors` conversion. Every [`NpzDtype`] variant maps
+//!   `NPZ → safetensors` conversion. Every `NpzDtype` variant maps
 //!   directly to its `safetensors::Dtype` counterpart. Behind the
 //!   `npz` feature.
 //! - `write_bnb_nf4_safetensors` / `write_bnb_nf4_safetensors_bytes`
 //!   / `BnbWriteInput` / `classify_inputs` / `is_eligible_for_nf4`
 //!   — end-to-end `BF16 → BnB-NF4 safetensors file` path. Wraps the
-//!   [`encode_bnb4_compute_absmax`] kernel into the four-tensor
+//!   `encode_bnb4_compute_absmax` kernel into the four-tensor
 //!   on-disk companion layout (`weight`, `weight.absmax`,
 //!   `weight.quant_map`, `weight.quant_state.bitsandbytes__nf4`).
 //!   2-D tensors only; 1-D biases / norms / embeddings pass through

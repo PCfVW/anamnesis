@@ -42,7 +42,7 @@ pub const NF4_BLOCK_SIZE: usize = 64;
 
 /// A tensor going into [`write_bnb_nf4_safetensors`]. All payloads are
 /// `BF16` little-endian; non-`BF16` inputs must be converted by the caller
-/// (the CLI layer at [`src/cli.rs`](crate::cli) handles this).
+/// (the CLI layer, behind the `cli` feature, handles this).
 #[derive(Debug, Clone)]
 pub struct BnbWriteInput<'a> {
     /// Tensor name as it should appear in the output safetensors file
