@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- Last updated: 2026-06-25, anamnesis v0.6.8 -->
+<!-- Last updated: 2026-07-22, anamnesis v0.6.9 -->
 
 Every subcommand, flag, and output shape for the `anamnesis` / `amn` CLI. The
 [README](../README.md) has the quick tour; this is the complete reference.
@@ -108,40 +108,93 @@ Converting model.pth → model.safetensors
 
 ## `amn convert <file> --to <target>`
 
-Convert any supported input to a different format through a single dispatch
-(Phase 6, v0.6.0).
+Convert any supported input to a different format through a single dispatch.
+Every `(input × target)` pair routes through an in-memory **`BF16` hub** (Phase
+6.14, v0.6.9): the input is normalised to the hub — quantised tensors dequantised
+to `BF16`, scalar tensors kept in their original dtype — then written to the
+target. Quantised inputs **auto-chain** through `BF16` (no hand-staged temp file).
 
 | Flag | Description |
 |---|---|
 | `--to <target>` | **Required.** One of `safetensors` (alias `bf16`), `gguf`, `bnb-nf4` (aliases `bnb_nf4` / `nf4`). Case-insensitive. |
 | `--output`, `-o <path>` | Output path; derived from the input if omitted. |
+| `--gguf-metadata <FILE>` | JSON `GGUF` key/values to stamp on a `gguf` target (see [GGUF metadata](#gguf-metadata-flags)). |
+| `--gguf-kv <KEY=VALUE>` | Repeatable one-off `GGUF` metadata (string-valued). |
 
-### Conversion matrix (v0.6.0)
+### Conversion matrix (v0.6.9)
 
 | Input ↓ \ Target → | `safetensors` / `bf16` | `gguf` | `bnb-nf4` |
 |---|---|---|---|
-| **safetensors** | ✅ dequant or lossless passthrough | ✅ scalar passthrough¹ | ✅ encode NF4² |
-| **`.pth`** | ✅ | ✅¹ | ❌ `Unsupported` |
-| **`.npz`** | ✅ | ✅¹ | ❌ `Unsupported` |
-| **`.gguf`** | ✅ dequant to BF16 | ❌ `Unsupported`³ | ❌ `Unsupported` |
+| **safetensors** | ✅ dequant or lossless passthrough | ✅¹ | ✅² |
+| **`.pth`** | ✅ | ✅¹ | ✅² |
+| **`.npz`** | ✅ | ✅¹ | ✅² |
+| **`.gguf`** | ✅ dequant to BF16 | ✅ dequant-in-place³ | ✅² |
 
-¹ `gguf` target requires the `gguf` feature; writes an **unquantised** GGUF
-(quantised GGUF emit — `gguf-q4km`, … — is deferred to Phase 6.14 / 7.5 through
-the same dispatch). safetensors → gguf rejects a *quantised* safetensors input
-(dequantise to BF16 first).
-² `bnb-nf4` requires the `bnb` feature; 2-D F32/F16/BF16 tensors are encoded to
-NF4, biases / norms / embeddings pass through as BF16. Rejects a quantised input.
-³ `gguf → gguf` (dequantise-in-place) lands in **Phase 6.14**.
+Every current-target cell is wired. ¹ `gguf` target requires the `gguf` feature;
+writes an **unquantised** (scalar) GGUF — quantised GGUF emit (`gguf-q4km`, …)
+needs the Phase 8.5 encode kernels. A quantised safetensors / GGUF source is
+**dequantised automatically** through the hub (the old "dequantise first" error is
+gone).
+² `bnb-nf4` requires the `bnb` feature; 2-D float tensors (≥64 elements, a
+multiple of 64) are encoded to NF4, everything else passes through as `BF16`.
+³ `gguf → gguf` recovers precision and re-emits a scalar GGUF, **preserving the
+source's metadata KV** (architecture, tokenizer) so the result stays loadable;
+`--gguf-metadata` / `--gguf-kv` merge over it.
 
-Combinations marked ❌ return a clear `AnamnesisError::Unsupported` rather than
-silently falling through. A combination whose Cargo feature is disabled returns
-an `Unsupported` error naming the feature to rebuild with.
+Still out of scope until Phase 8.5: **quantised GGUF target columns**
+(`gguf-q4km`, FP8, IQ, TQ, MXFP4). A combination whose Cargo feature is disabled
+returns a clear `AnamnesisError::Unsupported` naming the feature to rebuild with.
 
 ```
 $ amn convert model.npz --to safetensors
-Converting model.npz -> model-bf16.safetensors (NPZ -> safetensors)
+Converting model.npz -> model-bf16.safetensors
   Wrote 5 tensors -> model-bf16.safetensors
+
+$ amn convert model-fp8.safetensors --to gguf   # quantised -> auto-chains through BF16
+Converting model-fp8.safetensors -> model-gguf.gguf
+  1 dequantized to BF16
+  Wrote 2 tensors -> model-gguf.gguf
 ```
+
+### GGUF metadata flags
+
+`--gguf-metadata` / `--gguf-kv` supply the key/value table a `gguf` target
+carries. anamnesis writes the KV **verbatim** — it attaches no meaning to keys and
+derives nothing from the tensors; producing model-correct KV (architecture
+hyper-parameters, the tokenizer arrays) from a source `config.json` /
+`tokenizer.json` is a packaging concern for a downstream tool.
+
+Precedence, lowest to highest: **inherited source KV** (a `GGUF` input) →
+**`--gguf-metadata` file** → **`--gguf-kv`**.
+
+- **`--gguf-kv key=value`** (repeatable) — always writes a `String`. Split on the
+  first `=`, so the value may contain `=`.
+- **`--gguf-metadata <FILE>`** — a JSON object. Each value is either a *plain* JSON
+  value (type inferred) or an *explicit* `{"type": …, "value": …}` object:
+
+  | JSON | `GGUF` type |
+  |---|---|
+  | `"llama"` / `true` | `String` / `Bool` |
+  | `32` (non-negative, fits `u32`) | `U32` |
+  | `-5` / a larger integer | `I64` / `U64` |
+  | `1e-5` | `F32` |
+  | `["a", "b"]` | `Array<String>` (typed from the first element) |
+  | `{"type": "i32", "value": 3}` | `I32` (any of `u8` `i8` `u16` `i16` `u32` `i32` `u64` `i64` `f32` `f64` `bool` `string`) |
+  | `{"type": "array", "item_type": "i32", "value": [1, 2]}` | `Array<I32>` |
+
+  The explicit form exists because inference cannot be right for every key —
+  `tokenizer.ggml.token_type` is `Array<I32>` by `llama.cpp` convention, but a JSON
+  array of non-negative integers infers `Array<U32>`. State the type rather than
+  have anamnesis special-case a key name.
+
+```
+$ amn convert model.safetensors --to gguf \
+    --gguf-metadata model-kv.json \
+    --gguf-kv general.name=my-model
+```
+
+The flags need the `gguf` feature; on a build without it, supplying either is a
+clear `Unsupported` error rather than a silent no-op.
 
 ---
 

@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-06-25, anamnesis v0.6.8 -->
+<!-- Last updated: 2026-07-22, anamnesis v0.6.9 -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -143,13 +143,13 @@ It is the estimated number of bytes of precision that quantization (Lethe) disca
 
 ### How do I convert between formats?
 
-`amn convert <file> --to <target>` dispatches through a single pipeline — `safetensors`, `gguf`, and `bnb-nf4` are the targets available today (v0.6.0):
+`amn convert <file> --to <target>` routes every input through one in-memory **BF16 hub**, so **every input reaches every current target** (`safetensors`/`bf16`, `gguf`, `bnb-nf4`). A quantized input dequantizes automatically — the old "dequantize first, then re-run" two-hop is gone — and `gguf → gguf` recovers precision in place while preserving the source's metadata KV so the result stays loadable.
 
 ```
-amn convert model.gguf --to safetensors -o model.safetensors
+amn convert model.gguf --to bnb-nf4     # dequantize + re-encode, one command
 ```
 
-Combinations not yet in the matrix return a clear `Unsupported` error rather than failing silently; the remaining encode-side targets light up in a later release. Today the `bnb-nf4` target needs a BF16 source, so dequantise a quantised input with `--to bf16` first — the error prints the exact command to run.
+Scalar dtypes are preserved (so `.pth → safetensors` and `NPZ`-`F32` → `GGUF` stay lossless); only quantized tensors become `BF16`. Stamp your own GGUF metadata with `--gguf-metadata <file.json>` / `--gguf-kv key=value` (anamnesis writes it verbatim). The full matrix, the metadata grammar, and what stays out of scope until the encode kernels land are in the [CLI reference](cli-reference.md#amn-convert-file---to-target).
 
 ## Parsing untrusted input
 

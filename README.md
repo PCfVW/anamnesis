@@ -189,16 +189,19 @@ The per-version hardening history is in [Validation → robustness timeline](doc
 
 | Format | Inspect | Parse | Dequantize → BF16 | Quantize | Convert to |
 |---|:---:|:---:|---|---|---|
-| **safetensors** | ✓ | ✓ | ✓ FP8 · GPTQ · AWQ · BitsAndBytes | ✓ BnB-NF4 (Lethe) | gguf · bnb-nf4 |
-| **GGUF** | ✓ | ✓ | ✓ all 22 block types | — | safetensors |
-| **NPZ** | ✓ | ✓ | — *(already full precision)* | — | safetensors · gguf |
-| **PyTorch `.pth`** | ✓ | ✓ | — | — | safetensors · gguf |
+| **safetensors** | ✓ | ✓ | ✓ FP8 · GPTQ · AWQ · BitsAndBytes | ✓ BnB-NF4 (Lethe) | safetensors · gguf · bnb-nf4 |
+| **GGUF** | ✓ | ✓ | ✓ all 22 block types | — | safetensors · gguf · bnb-nf4 |
+| **NPZ** | ✓ | ✓ | — *(already full precision)* | — | safetensors · gguf · bnb-nf4 |
+| **PyTorch `.pth`** | ✓ | ✓ | — | — | safetensors · gguf · bnb-nf4 |
 
 Every dequant and quant kernel is **bit-exact (0 ULP)** against the canonical
 library's *own* code (`bitsandbytes`, AutoAWQ, GPTQModel, PyTorch's fp8 cast,
 `gguf-py`) — not a hand-rolled oracle. Header-only inspection works over any
 reader (in-memory, HTTP-range, custom transport): safetensors needs only `Read`;
-the ZIP/GGUF formats need `Read + Seek`. Non-safetensors formats and each scheme
+the ZIP/GGUF formats need `Read + Seek`. `amn convert` routes every
+`(input × target)` pair through an in-memory **BF16 hub**, so a quantised input
+auto-dequantises on the way to any target and `gguf → gguf` recovers precision in
+place (preserving the source metadata KV). Non-safetensors formats and each scheme
 are feature-gated (`gguf`, `npz`, `pth`, `gptq`, `awq`, `bnb`).
 
 → Full tested-model tables, per-kernel speeds, conversion benchmarks, and

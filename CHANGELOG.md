@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Convert-matrix completion via a `BF16` hub** (Phase 6.14). `amn convert` /
+  the new library `anamnesis::convert` route every `(input × target)` pair through
+  one in-memory `BF16` hub (`src/convert.rs`, publicly re-exported), so every
+  input reaches every current target (`safetensors`/`bf16`, `gguf`, `bnb-nf4`):
+  the `bnb-nf4` target now accepts NPZ / `.pth` / GGUF / quantized-safetensors
+  sources, `gguf → gguf` dequantizes in place (preserving the source metadata KV),
+  and a quantized input **auto-chains** through `BF16` (the "dequantize first"
+  two-hop is gone). Scalar dtypes are preserved end to end. New `--gguf-metadata
+  <file.json>` / `--gguf-kv key=value` pass a typed `GGUF` KV table (inference +
+  an explicit `{"type","value"}` escape hatch), merged as source → file → flag.
+  `ParsedGguf::metadata()` is used to inherit source KV. No new kernels; quantized
+  GGUF target columns still need Phase 8.5.
+
+
 - **`docs/validation.md`** and **`docs/cli-reference.md`** — the validation
   evidence (cross-validation tables, per-kernel speeds, conversion benchmarks,
   peak-heap assertions, robustness hardening timeline) and the complete CLI
