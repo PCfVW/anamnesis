@@ -35,6 +35,7 @@ between formats — all hardened for untrusted input.
 > **New to anamnesis?**
 > - **I have a model file and want to see inside it** → [`amn inspect`](#cli-commands), or the [Inspect before you parse](docs/tutorials/inspect-before-you-parse.md) tutorial — format, tensors, shapes, dtypes, size, header-only.
 > - **I want to recover full precision from a quantized model** → [Dequantize a GGUF model to BF16](docs/tutorials/dequantize-a-gguf-model.md): a k-quant becomes standard `BF16` safetensors, loadable in candle / burn / tch.
+> - **I want to move a model to another format** → [Convert a model between formats](docs/tutorials/convert-between-formats.md): any input → `safetensors` / `gguf` / `bnb-nf4` in one command, quantized inputs auto-chained through `BF16`.
 > - **I'm parsing untrusted / user-uploaded files on a server** → [Parsing untrusted input](#parsing-untrusted-input): the `inspect → check → parse-under-limits` recipe — typed errors, no panic, no `SIGBUS`.
 > - **I'm calling anamnesis from Rust** → [Library quick start](#library-quick-start).
 > - **I'm waiting for Python** → `pip install anamnesis` lands in **v0.8.0** ([What's next](#whats-next)); the [interop contract](docs/python-interop.md) is already frozen.
@@ -232,13 +233,13 @@ and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 | [Validation & tested models](docs/validation.md) | Cross-validation tables, per-kernel speeds, conversion benchmarks, peak-heap assertions, hardening timeline |
 | [Tutorial: Inspect before you parse](docs/tutorials/inspect-before-you-parse.md) | The `inspect → check → parse` safety pattern; rejecting a hostile file; bounding memory with `ParseLimits` |
 | [Tutorial: Dequantize a GGUF model to BF16](docs/tutorials/dequantize-a-gguf-model.md) | `inspect` → `remember` → verify: a GGUF k-quant becomes standard `BF16` safetensors |
+| [Tutorial: Convert a model between formats](docs/tutorials/convert-between-formats.md) | `amn convert --to`: any input → `safetensors` / `gguf` / `bnb-nf4` through the BF16 hub, with GGUF-KV stamping |
 | [Python interop contract](docs/python-interop.md) | The frozen v0.8.0 binding contract: panic-safety, the NumPy/BF16 ownership model |
 | [Performance experiments](docs/perf-experiments.md) | Measured perf hypotheses, methods, and outcomes (incl. rejected ones) |
 
 ## What's next
 
-- **Phase 6.14 — convert-matrix completion (v0.6.9):** `gguf → gguf` dequantise-in-place + auto-chained two-hop conversions, and a `--gguf-metadata` pass-through.
-- **Phase 7 — CPU SIMD pass (v0.7.0):** runtime AVX2/NEON dispatch on the shared writer.
+- **Phase 7 — CPU SIMD pass (v0.7.0):** runtime AVX2/NEON dispatch on the shared `BF16` writer, so a distributed wheel delivers AVX2 throughput without a `target-cpu=native` build.
 - **Phase 8 — Python bindings (v0.8.0):** `pip install anamnesis` — typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen.
 
 Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).

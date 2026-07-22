@@ -79,7 +79,7 @@ They are the project's names for the two directions of precision change. **Remem
 
 ### Is it stable? What does a `0.6.x` version mean?
 
-`0.6.x` is pre-`1.0`: the format coverage and dequantization correctness are production-grade (bit-exact against each canonical library), but the public API may still evolve before `1.0`. The `0.6.x` line specifically completed a security-hardening pass for untrusted input; new feature work resumes at `0.7.0`. Pin a version in `Cargo.toml` and read `CHANGELOG.md` before upgrading.
+`0.6.x` is pre-`1.0`: the format coverage and dequantization correctness are production-grade (bit-exact against each canonical library), but the public API may still evolve before `1.0`. The `0.6.x` line centered on a security-hardening pass for untrusted input, capped by the convert-matrix completion in `0.6.9`; the next major track — a CPU SIMD pass — lands at `0.7.0`. Pin a version in `Cargo.toml` and read `CHANGELOG.md` before upgrading.
 
 ## Installation
 

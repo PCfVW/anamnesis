@@ -4,7 +4,7 @@
 
 *~950 words · about 4 min read*
 
-<!-- Last updated: 2026-06-21, anamnesis v0.6.7 -->
+<!-- Last updated: 2026-07-22, anamnesis v0.6.9 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -121,4 +121,4 @@ let vb = VarBuilder::from_mmaped_safetensors(&["smol-bf16.safetensors"], DType::
 - A `Q4_K_M` file is a mix of block types, and the tensors GGUF left in `F32` simply pass through untouched.
 - Dequantization trades size for compatibility (here 99 MB → 257 MB), so check the numbers up front.
 
-For the safety angle — what to do when the file came from somewhere you don't trust — see [Inspect before you parse (untrusted input)](inspect-before-you-parse.md) and the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). For the other input formats (FP8 / GPTQ / AWQ / BitsAndBytes safetensors), the same `amn remember` command applies — only the source scheme differs.
+For the safety angle — what to do when the file came from somewhere you don't trust — see [Inspect before you parse (untrusted input)](inspect-before-you-parse.md) and the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). For the other input formats (FP8 / GPTQ / AWQ / BitsAndBytes safetensors), the same `amn remember` command applies — only the source scheme differs. And to change *container* rather than just recover precision — GGUF → `bnb-nf4`, or writing a scalar GGUF with your own metadata — see [Convert a model between formats](convert-between-formats.md).
